@@ -170,20 +170,105 @@ double estimateTimingTolerance(
                     config.maximum_timing_tolerance_scale);
 }
 
+// Every surviving path used to own a private copy of the symbols it had
+// already decoded, and the beam copies paths relentlessly: each mark expands
+// every path into two successors, each gap into three. The decoded-symbol
+// vector therefore travelled along with every one of those copies, so a single
+// decode cost time proportional to the square of the observation count. That
+// is what made a long transmission expensive to close rather than a short one,
+// and it is the growth an operator sees as the application going jerky after
+// the station has been running for a while.
+//
+// A symbol is immutable the moment a path emits it, so the history can be
+// shared instead of copied. Paths hold one index into this chain; emitting
+// appends at most one node and copying a path copies one integer.
+//
+// Sharing alone is not enough, because the beam also has to tell two paths
+// apart, and it used to do that by rebuilding a description of the whole
+// decoded history as a string and comparing it character by character for
+// every surviving path at every pruning step -- the same quadratic shape in a
+// second guise. The chain therefore merges equal histories as it is built: a
+// symbol appended to a given node returns the node that already holds it if
+// one exists, so two paths that agree on every decoded symbol end up holding
+// the same index, and one integer comparison decides what the two strings used
+// to decide.
+//
+// What counts as the same symbol is exactly what the old description encoded:
+// the rendered text for a decoded character, the raw elements for an unknown
+// span, the observation the symbol starts and ends on, and whether a word
+// boundary follows. The elements behind a decoded character were deliberately
+// not part of it, and are still not.
+class SymbolChain {
+ public:
+  // The empty history. Node zero is a sentinel and is never read back.
+  static constexpr std::size_t kEmpty = 0U;
+
+  SymbolChain() { nodes_.emplace_back(); }
+
+  [[nodiscard]] std::size_t append(const std::size_t parent,
+                                   CwLatticeSymbol symbol) {
+    const std::size_t first_child = nodes_[parent].first_child;
+    for (std::size_t child = first_child; child != kEmpty;
+         child = nodes_[child].next_sibling) {
+      if (sameSymbol(nodes_[child].symbol, symbol)) return child;
+    }
+    nodes_.push_back({.parent = parent,
+                      .next_sibling = first_child,
+                      .first_child = kEmpty,
+                      .symbol = std::move(symbol)});
+    const std::size_t index = nodes_.size() - 1U;
+    nodes_[parent].first_child = index;
+    return index;
+  }
+
+  [[nodiscard]] std::vector<CwLatticeSymbol> collect(
+      const std::size_t node) const {
+    std::vector<CwLatticeSymbol> symbols;
+    for (std::size_t index = node; index != kEmpty;
+         index = nodes_[index].parent) {
+      symbols.push_back(nodes_[index].symbol);
+    }
+    std::ranges::reverse(symbols);
+    return symbols;
+  }
+
+ private:
+  struct Node {
+    std::size_t parent{kEmpty};
+    std::size_t next_sibling{kEmpty};
+    std::size_t first_child{kEmpty};
+    CwLatticeSymbol symbol;
+  };
+
+  static bool sameSymbol(const CwLatticeSymbol& left,
+                         const CwLatticeSymbol& right) noexcept {
+    return left.known == right.known &&
+           left.word_boundary_after == right.word_boundary_after &&
+           left.first_observation_id == right.first_observation_id &&
+           left.last_observation_id == right.last_observation_id &&
+           (left.known ? left.symbol == right.symbol
+                       : left.elements == right.elements);
+  }
+
+  // Siblings are threaded through the nodes themselves, so growing the chain
+  // never allocates anything beyond this one vector.
+  std::vector<Node> nodes_;
+};
+
 struct Path {
-  std::vector<CwLatticeSymbol> symbols;
+  std::size_t symbols_node{SymbolChain::kEmpty};
   std::string pending_elements;
   std::uint64_t pending_first_observation_id{0};
   std::uint64_t pending_last_observation_id{0};
   double cost{0.0};
 };
 
-void emitSymbol(Path& path, const bool word_boundary,
+void emitSymbol(Path& path, SymbolChain& chain, const bool word_boundary,
                 const std::uint64_t last_observation_id,
                 const bool force_unknown = false) {
   if (path.pending_elements.empty()) return;
   const auto decoded = decodeElements(path.pending_elements);
-  path.symbols.push_back({
+  path.symbols_node = chain.append(path.symbols_node, {
       .symbol = decoded && !force_unknown ? std::string(*decoded)
                                            : std::string{},
       .elements = path.pending_elements,
@@ -195,27 +280,6 @@ void emitSymbol(Path& path, const bool word_boundary,
   path.pending_elements.clear();
 }
 
-std::string pathKey(const Path& path) {
-  std::string key;
-  for (const auto& symbol : path.symbols) {
-    if (symbol.known) {
-      key += symbol.symbol;
-    } else {
-      key += "<UNKNOWN:";
-      key += symbol.elements;
-      key += '>';
-    }
-    key += '@';
-    key += std::to_string(symbol.first_observation_id);
-    key += ':';
-    key += std::to_string(symbol.last_observation_id);
-    key += symbol.word_boundary_after ? ' ' : '|';
-  }
-  key += '/';
-  key += path.pending_elements;
-  return key;
-}
-
 void prune(std::vector<Path>& paths, const std::size_t beam_width) {
   std::stable_sort(paths.begin(), paths.end(),
                    [](const Path& left, const Path& right) {
@@ -223,12 +287,15 @@ void prune(std::vector<Path>& paths, const std::size_t beam_width) {
                    });
   std::vector<Path> unique;
   unique.reserve(std::min(paths.size(), beam_width));
-  std::vector<std::string> keys;
-  keys.reserve(std::min(paths.size(), beam_width));
   for (auto& path : paths) {
-    const std::string key = pathKey(path);
-    if (std::find(keys.begin(), keys.end(), key) != keys.end()) continue;
-    keys.push_back(key);
+    // Identity is the decoded history plus the elements not yet committed to a
+    // symbol, exactly as before; only its representation changed.
+    const bool duplicate = std::ranges::any_of(
+        unique, [&path](const Path& kept) {
+          return kept.symbols_node == path.symbols_node &&
+                 kept.pending_elements == path.pending_elements;
+        });
+    if (duplicate) continue;
     unique.push_back(std::move(path));
     if (unique.size() >= beam_width) break;
   }
@@ -456,6 +523,7 @@ CwEventLatticeResult CwEventLattice::decode(
                 static_cast<float>(effective_tolerance),
             0.0F, 1.0F);
 
+  SymbolChain chain;
   std::vector<Path> paths(1);
   for (std::size_t observation_index = first_observation;
        observation_index < observations_.size(); ++observation_index) {
@@ -539,11 +607,11 @@ CwEventLatticeResult CwEventLattice::decode(
       if (character_is_known) {
         Path unknown_character_path = character_path;
         unknown_character_path.cost += config_.unknown_symbol_cost;
-        emitSymbol(unknown_character_path, false, observation.observation_id,
-                   true);
+        emitSymbol(unknown_character_path, chain, false,
+                   observation.observation_id, true);
         expanded.push_back(std::move(unknown_character_path));
       }
-      emitSymbol(character_path, false, observation.observation_id);
+      emitSymbol(character_path, chain, false, observation.observation_id);
       expanded.push_back(std::move(character_path));
 
       Path word_path = path;
@@ -555,10 +623,11 @@ CwEventLatticeResult CwEventLattice::decode(
       if (word_is_known) {
         Path unknown_word_path = word_path;
         unknown_word_path.cost += config_.unknown_symbol_cost;
-        emitSymbol(unknown_word_path, true, observation.observation_id, true);
+        emitSymbol(unknown_word_path, chain, true,
+                   observation.observation_id, true);
         expanded.push_back(std::move(unknown_word_path));
       }
-      emitSymbol(word_path, true, observation.observation_id);
+      emitSymbol(word_path, chain, true, observation.observation_id);
       expanded.push_back(std::move(word_path));
     }
     prune(expanded, config_.beam_width);
@@ -573,13 +642,13 @@ CwEventLatticeResult CwEventLattice::decode(
         decodeElements(path.pending_elements).has_value()) {
       Path unknown_path = path;
       unknown_path.cost += config_.unknown_symbol_cost;
-      emitSymbol(unknown_path, false,
+      emitSymbol(unknown_path, chain, false,
                  unknown_path.pending_last_observation_id, true);
       finalized.push_back(std::move(unknown_path));
     }
     if (mode == CwLatticeDecodeMode::Flush &&
         !path.pending_elements.empty()) {
-      emitSymbol(path, false, path.pending_last_observation_id);
+      emitSymbol(path, chain, false, path.pending_last_observation_id);
     }
     finalized.push_back(std::move(path));
   }
@@ -590,7 +659,7 @@ CwEventLatticeResult CwEventLattice::decode(
   result.alternatives.reserve(count);
   for (std::size_t index = 0; index < count; ++index) {
     result.alternatives.push_back({
-        .symbols = std::move(paths[index].symbols),
+        .symbols = chain.collect(paths[index].symbols_node),
         .provisional_elements = std::move(paths[index].pending_elements),
         .provisional_first_observation_id =
             paths[index].pending_first_observation_id,

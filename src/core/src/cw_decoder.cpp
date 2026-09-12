@@ -1514,7 +1514,9 @@ void CwMultiSpeedDecoder::refreshLattice(const CwLatticeDecodeMode mode) {
   }
   if (!std::isfinite(candidate_wpm) || candidate_wpm <= 0.0) return;
 
-  auto decoded = event_lattice_.decode(1'200.0 / candidate_wpm, mode);
+  const double baseline_dot_ms = 1'200.0 / candidate_wpm;
+  CwEventLatticeResult decoded;
+  bool decoded_ready = false;
   // Only a completed semantic turn may re-evaluate timing. The live and
   // fixed-lag paths remain unchanged and append-only. Every alternative uses
   // the same immutable physical runs; filter-width retries require a separate
@@ -1536,19 +1538,41 @@ void CwMultiSpeedDecoder::refreshLattice(const CwLatticeDecodeMode mode) {
     for (const auto& hypothesis : hypotheses_)
       add_pass(hypothesis.decoder.currentUpdate().wpm);
     if (pass_count > 1U) {
+      // The candidate speed is offered to the refinement first, so unless the
+      // speed range rejected it outright, pass zero decodes exactly what this
+      // function's own baseline decode would produce: same immutable runs,
+      // same dot length, same mode, and decode has no state of its own.
+      // Running both cost a second complete walk over every observation of the
+      // transmission for an identical answer, so the baseline is taken from
+      // the refinement instead, and decoded here only when the speed range did
+      // reject the candidate and pass zero is some other hypothesis.
+      const bool baseline_is_first_pass = passes.front().wpm == candidate_wpm;
+      if (!baseline_is_first_pass) {
+        decoded = event_lattice_.decode(baseline_dot_ms, mode);
+        decoded_ready = true;
+      }
       auto refinement = refineCwEventLattice(
           event_lattice_, std::span(passes).first(pass_count), mode);
       if (refinement.selection.accepted &&
           cwLatticeCleanlyExtendsCommit(
               refinement.decoded, lattice_committed_observation_id_)) {
         decoded = std::move(refinement.decoded);
+        decoded_ready = true;
         // This local value labels the selected lattice alternatives below. It
         // does not replace the decoder's live WPM or the completed sender's
         // independently measured cadence.
         candidate_wpm = refinement.selected_wpm;
+      } else if (!decoded_ready) {
+        // A selection that was made but then refused by the commit boundary
+        // leaves pass zero in `baseline`; a selection that was never made
+        // leaves it in `decoded`. Either way this is the baseline decode.
+        decoded = refinement.selection.accepted
+            ? std::move(refinement.baseline) : std::move(refinement.decoded);
+        decoded_ready = true;
       }
     }
   }
+  if (!decoded_ready) decoded = event_lattice_.decode(baseline_dot_ms, mode);
   if (mode == CwLatticeDecodeMode::Flush &&
       decoded.alternatives.size() > 1U) {
     std::vector<CwContextAlternative> contextual;

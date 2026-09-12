@@ -225,6 +225,7 @@ CwLatticeRefinementResult refineCwEventLattice(
   result.selection = selectCwAcousticRefinement(candidates, config);
   const std::size_t selected = result.selection.accepted
       ? result.selection.selected_index : 0U;
+  if (selected != 0U) result.baseline = std::move(decoded_passes.front());
   result.decoded = std::move(decoded_passes[selected]);
   result.selected_wpm = passes[selected].wpm;
   return result;

@@ -1,5 +1,7 @@
 #include "cwassistant/core/cw_event_lattice.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -455,6 +457,60 @@ void testIsolatedOutlierDoesNotInflateTolerance() {
          "one timing outlier cannot inflate the segment tolerance");
 }
 
+void testDecodeCostFollowsObservationsNotTheirSquare() {
+  // A decode used to carry each surviving path's whole decoded history along
+  // with every copy the beam makes of it, and to rebuild a text description of
+  // that history for every path at every pruning step. Both made one decode
+  // cost time proportional to the square of the observation count, so closing
+  // a long transmission cost far more than twice closing one half its length.
+  // That is the shape an operator experiences as the application stalling once
+  // a station has been transmitting for a while, and it is the shape this test
+  // guards. It deliberately measures the ratio between two sizes rather than
+  // any absolute duration, so it means the same thing on a slow machine as on
+  // a fast one.
+  const auto measure = [](const std::size_t target_observations) {
+    CwEventLattice lattice({.maximum_observations = 512, .beam_width = 16});
+    while (lattice.observationCount() < target_observations) {
+      appendText(lattice, "EA1EYL", 60.0, 3.0);
+      appendRun(lattice, false, 7.0 * 60.0);
+    }
+    double best_seconds = std::numeric_limits<double>::infinity();
+    for (int attempt = 0; attempt < 7; ++attempt) {
+      const auto started = std::chrono::steady_clock::now();
+      for (int repeat = 0; repeat < 4; ++repeat) {
+        const auto result = lattice.decode(
+            60.0, cwassistant::core::CwLatticeDecodeMode::Flush);
+        expect(!result.alternatives.empty(),
+               "the timed decode produces candidates");
+      }
+      const std::chrono::duration<double> elapsed =
+          std::chrono::steady_clock::now() - started;
+      best_seconds = std::min(best_seconds, elapsed.count());
+    }
+    // The fastest attempt is the one least disturbed by whatever else the
+    // machine was doing, which is what keeps this usable under a loaded
+    // continuous-integration runner.
+    return best_seconds;
+  };
+
+  const double small = measure(64U);
+  const double large = measure(256U);
+  expect(small > 0.0, "the small decode is measurable");
+  // Four times the observations. Cost proportional to the observations lands
+  // near four, and this implementation measures about four and a half; the
+  // implementation it replaced measured close to nine. The bound sits between
+  // the two with room on both sides, and taking the fastest of several
+  // attempts at each size is what keeps a busy machine from moving the ratio
+  // far enough to matter.
+  const double ratio = large / small;
+  if (ratio >= 6.0) {
+    std::cerr << "decode cost ratio for four times the observations: "
+              << ratio << '\n';
+  }
+  expect(ratio < 6.0,
+         "decode cost follows the observation count, not its square");
+}
+
 }  // namespace
 
 int main() {
@@ -473,5 +529,6 @@ int main() {
   testLowConfidenceIsExplicitAndFlattensRanking();
   testHandSentVarianceIsBoundedAndVisible();
   testIsolatedOutlierDoesNotInflateTolerance();
+  testDecodeCostFollowsObservationsNotTheirSquare();
   std::cout << "cw_event_lattice_tests: PASS\n";
 }

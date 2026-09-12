@@ -85,6 +85,13 @@ struct CwLatticeTimingPass {
 
 struct CwLatticeRefinementResult {
   CwEventLatticeResult decoded;
+  // Pass zero's own decode, retained only when a later pass was selected over
+  // it. A caller can reject the selection on evidence this function cannot
+  // see -- an append-only commit boundary, for one -- and would then have to
+  // decode the baseline all over again, which is a full pass over every
+  // observation of the transmission. Empty whenever `decoded` already is pass
+  // zero, so nothing is copied when nothing was displaced.
+  CwEventLatticeResult baseline;
   double selected_wpm{0.0};
   CwAcousticRefinementSelection selection;
   std::size_t evaluated_passes{0};

@@ -172,6 +172,51 @@ void testLatticeRetryImprovesWrongTimingBaseline() {
          "completed-turn timing retry improves a wrong acoustic baseline");
 }
 
+void testRejectedSelectionHandsBackThePassZeroDecode() {
+  // A caller decides whether it may keep the selected pass on evidence the
+  // refinement cannot see, and when it refuses it needs pass zero again. Pass
+  // zero has already been decoded here, and one decode is a complete walk over
+  // every observation of the transmission, so it is handed back rather than
+  // left for the caller to repeat.
+  cwassistant::core::CwEventLattice lattice;
+  std::uint64_t now_ns = 1U;
+  appendRun(lattice, true, 60.0, now_ns);
+  appendRun(lattice, false, 60.0, now_ns);
+  appendRun(lattice, true, 180.0, now_ns);
+  appendRun(lattice, false, 120.0, now_ns);
+  appendRun(lattice, true, 60.0, now_ns);
+  const std::array passes{
+      cwassistant::core::CwLatticeTimingPass{12.0, 100.0},
+      cwassistant::core::CwLatticeTimingPass{20.0, 60.0}};
+  const auto pass_zero = lattice.decode(
+      passes.front().dot_ms,
+      cwassistant::core::CwLatticeDecodeMode::Flush);
+  const auto refined = cwassistant::core::refineCwEventLattice(
+      lattice, passes, cwassistant::core::CwLatticeDecodeMode::Flush,
+      {.minimum_normalized_cost_improvement = 0.005,
+       .minimum_relative_cost_improvement = 0.05});
+  expect(refined.selection.accepted && refined.selection.selected_index != 0U,
+         "the fixture still selects a pass other than the baseline");
+  expect(!refined.baseline.alternatives.empty(),
+         "a displaced baseline decode is returned, not discarded");
+  expect(refined.baseline.alternatives.front().text() ==
+             pass_zero.alternatives.front().text() &&
+         refined.baseline.alternatives.front().acoustic_cost ==
+             pass_zero.alternatives.front().acoustic_cost &&
+         refined.baseline.observations.size() == pass_zero.observations.size(),
+         "the returned baseline is exactly what decoding pass zero produces");
+
+  // Nothing was displaced here, so the selected result already is pass zero
+  // and there is no second copy to carry.
+  const std::array single_pass{passes.front()};
+  const auto unrefined = cwassistant::core::refineCwEventLattice(
+      lattice, single_pass, cwassistant::core::CwLatticeDecodeMode::Flush);
+  expect(!unrefined.selection.accepted &&
+             unrefined.baseline.alternatives.empty() &&
+             unrefined.baseline.observations.empty(),
+         "an unrefined turn carries no duplicate of its own baseline");
+}
+
 void testCommittedBoundaryRejectsCrossingRefinement() {
   using cwassistant::core::CwEventLatticeResult;
   using cwassistant::core::CwLatticeAlternative;
@@ -218,6 +263,7 @@ int main() {
   testPassBudgetIsHard();
   testInvalidBaselineCannotBeHidden();
   testLatticeRetryImprovesWrongTimingBaseline();
+  testRejectedSelectionHandsBackThePassZeroDecode();
   testCommittedBoundaryRejectsCrossingRefinement();
   std::cout << "cw_acoustic_refinement_tests: PASS\n";
   return EXIT_SUCCESS;
