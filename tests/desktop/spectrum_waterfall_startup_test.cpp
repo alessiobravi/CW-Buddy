@@ -1,3 +1,4 @@
+#include <QColor>
 #include <QGuiApplication>
 #include <QSGNode>
 #include <QTemporaryFile>
@@ -5,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <iterator>
 #include <numbers>
 #include <span>
@@ -542,8 +544,183 @@ int testDroppedFramesDoNotPadTheWaterfall() {
   return 0;
 }
 
+namespace {
+
+struct LabColor {
+  double lightness{0.0};
+  double a{0.0};
+  double b{0.0};
+  // Relative luminance, which is what decides whether a marker is visible
+  // against a near-black spectrum at all.
+  double luminance{0.0};
+};
+
+// sRGB to CIE L*a*b* (D65). The test measures in L*a*b* rather than comparing
+// hex strings because the requirement is perceptual: two colors are far enough
+// apart when an operator can tell them apart, and the distance that answers
+// that question is not a distance between byte triples.
+[[nodiscard]] LabColor labOf(const QColor& color) {
+  const auto expand = [](const double channel) {
+    return channel <= 0.04045 ? channel / 12.92
+                              : std::pow((channel + 0.055) / 1.055, 2.4);
+  };
+  const double red = expand(color.redF());
+  const double green = expand(color.greenF());
+  const double blue = expand(color.blueF());
+  const double x =
+      (0.4124564 * red + 0.3575761 * green + 0.1804375 * blue) / 0.95047;
+  const double y = 0.2126729 * red + 0.7151522 * green + 0.0721750 * blue;
+  const double z =
+      (0.0193339 * red + 0.1191920 * green + 0.9503041 * blue) / 1.08883;
+  const auto compand = [](const double value) {
+    return value > 216.0 / 24'389.0 ? std::cbrt(value)
+                                    : (841.0 / 108.0) * value + 4.0 / 29.0;
+  };
+  const double fx = compand(x);
+  const double fy = compand(y);
+  const double fz = compand(z);
+  return {116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz), y};
+}
+
+[[nodiscard]] double perceptualDistance(const LabColor& left,
+                                        const LabColor& right) {
+  const double lightness = left.lightness - right.lightness;
+  const double a = left.a - right.a;
+  const double b = left.b - right.b;
+  return std::sqrt(lightness * lightness + a * a + b * b);
+}
+
+}  // namespace
+
+// The generated track palette, which replaced 24 hand-written hex strings that
+// were setting the decoder's track capacity between them.
+//
+// Everything here has to hold for an arbitrary seed, not for one inspected
+// table, because the seed is drawn afresh at every launch. That is a stronger
+// contract than the fixed palette could offer: a hand-written table is checked
+// once by eye, while a generator has to be right for every palette it can
+// produce. Thresholds below are set from the measured worst case over the seeds
+// tried, with margin.
+int testGeneratedChannelPalette() {
+  using cwassistant::desktop::ChannelColorPalette;
+  constexpr std::uint32_t capacity =
+      static_cast<std::uint32_t>(cwassistant::core::kCwMaximumTrackCapacity);
+  // The default track cap. Separation has to be comfortable at the number of
+  // tracks an operator will actually see, and merely adequate at the ceiling.
+  constexpr std::uint32_t working_set = 64;
+
+  double worst_distance_working_set = 1e9;
+  double worst_distance_capacity = 1e9;
+  double dimmest = 1e9;
+  double palest = 1e9;
+  double brightest = 0.0;
+
+  for (std::uint32_t trial = 0; trial < 32U; ++trial) {
+    // Spread over the 64-bit seed space, including zero, which is the one seed
+    // a weak mixer is most likely to degenerate on.
+    const std::uint64_t seed =
+        trial == 0U ? 0U : 0x9e37'79b9'7f4a'7c15ULL * trial;
+    const ChannelColorPalette palette{seed};
+    if (palette.seed() != seed) return 100;
+
+    // Stable for the life of the run, and reconstructible from the seed alone.
+    // `color_identity_retention_seconds` holds a color against a frequency for
+    // five minutes so a station heard again is recognisable; a color that
+    // changed under a live track would break that, and would make one track
+    // look like a new station on every redraw.
+    const ChannelColorPalette twin{seed};
+    std::vector<LabColor> measured;
+    measured.reserve(capacity);
+    for (std::uint32_t index = 0; index < capacity; ++index) {
+      const QString color = palette.color(index);
+      if (color != palette.color(index)) return 101;
+      if (color != twin.color(index)) return 102;
+      // The format the QML reads. Anything else silently draws nothing.
+      if (color.size() != 7 || !color.startsWith(QLatin1Char('#')) ||
+          !QColor::isValidColorName(color)) {
+        return 103;
+      }
+      const LabColor lab = labOf(QColor(color));
+      dimmest = std::min(dimmest, lab.luminance);
+      brightest = std::max(brightest, lab.luminance);
+      palest = std::min(palest, std::hypot(lab.a, lab.b));
+      measured.push_back(lab);
+    }
+
+    for (std::uint32_t first = 0; first < capacity; ++first) {
+      for (std::uint32_t second = first + 1; second < capacity; ++second) {
+        const double distance =
+            perceptualDistance(measured[first], measured[second]);
+        worst_distance_capacity = std::min(worst_distance_capacity, distance);
+        if (first < working_set && second < working_set) {
+          worst_distance_working_set =
+              std::min(worst_distance_working_set, distance);
+        }
+      }
+    }
+  }
+
+  // Readable over a dark waterfall. A just-noticeable difference in this metric
+  // is about 2.3, so both bounds are several times a difference an operator
+  // could only just see.
+  if (worst_distance_working_set < 5.0) return 104;
+  if (worst_distance_capacity < 3.0) return 105;
+  // Not too dark to see against a near-black spectrum, and not so bright it
+  // reads as the white grid. Relative luminance, so this is a statement about
+  // light reaching the eye rather than about a channel byte.
+  if (dimmest < 0.20 || brightest > 0.92) return 106;
+  // Not washed out: a generated color that lost all its chroma would be one of
+  // the greys the unverified marker already uses.
+  if (palest < 15.0) return 107;
+
+  // A different seed is a different palette. Without this the whole generator
+  // could be seed-independent and every other assertion here would still pass.
+  const ChannelColorPalette first_palette{1U};
+  const ChannelColorPalette second_palette{2U};
+  std::uint32_t differing = 0;
+  for (std::uint32_t index = 0; index < working_set; ++index) {
+    if (first_palette.color(index) != second_palette.color(index)) ++differing;
+  }
+  if (differing < working_set / 2U) return 108;
+
+  // The color a track is actually drawn in comes from the palette it is given,
+  // with no table wrap in between: index 200 is a color, not index 200 modulo
+  // a table length. That wrap is what used to tie capacity to the palette.
+  cwassistant::core::CwChannelSnapshot snapshot{
+      .id = 7,
+      .color_index = 200,
+      .frequency_hz = 900.0,
+      .presentation_frequency_hz = 900.0,
+      .verified_cw = true,
+  };
+  const auto model_of = [&snapshot](const ChannelColorPalette& used) {
+    return cwassistant::desktop::decoderChannelModel(
+               std::span<const cwassistant::core::CwChannelSnapshot>{&snapshot,
+                                                                     1},
+               {}, used)
+        .front()
+        .toMap()
+        .value(QStringLiteral("color"))
+        .toString();
+  };
+  if (model_of(first_palette) != first_palette.color(200)) return 109;
+  if (model_of(first_palette) == model_of(second_palette)) return 110;
+
+  // An unverified track stays neutral whatever the palette says, because it is
+  // a carrier the decoder has not vouched for and a color would present it as a
+  // station.
+  snapshot.verified_cw = false;
+  if (model_of(first_palette) != QStringLiteral("#8d9aaa")) return 111;
+
+  return 0;
+}
+
 int main(int argc, char* argv[]) {
   QGuiApplication application(argc, argv);
+  if (const int palette_failure = testGeneratedChannelPalette();
+      palette_failure != 0) {
+    return palette_failure;
+  }
   if (const int dropped_pad_failure = testDroppedFramesDoNotPadTheWaterfall();
       dropped_pad_failure != 0) {
     return dropped_pad_failure;

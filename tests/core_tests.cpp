@@ -3717,6 +3717,723 @@ void test_decoding_cost_does_not_grow_with_session_length() {
          std::to_string(late) + " us, ratio " + std::to_string(ratio) + ")");
 }
 
+// A stream that decoded and named its station keeps its region on the display
+// about twice as long as one that never identified.
+//
+// The two fixtures key identically: CQ DE DK7SS and CQ DE QK7SS are the same
+// elements bar one, decode equally cleanly and both verify. They differ only
+// in whether the decoded call names a country that exists, so the only thing
+// under test here is identification, not decode quality.
+//
+// The longer hold lives in the display's retained observation, not in track
+// expiry. A track owns a decoder, a slot in the bounded bank and a frequency
+// cell that a genuinely new station must be able to take over; holding an
+// identified track alive twice as long stops that takeover and breaks the
+// identity inheritance asserted in the replacement fixture above. The region
+// the operator asked to keep already outlives the track by design, so that is
+// where the extra time belongs.
+void test_identified_stream_holds_its_region_longer() {
+  using cwassistant::core::CwChannelBank;
+  constexpr double sample_rate = 8'000.0;
+  constexpr double retention_seconds = 10.0;
+
+  struct Region {
+    std::size_t published_while_sending{0};
+    std::string live_callsign;
+    std::size_t published_after_silence{0};
+    std::string callsign_after_silence;
+  };
+
+  const auto region_after_silence =
+      [&](const std::string_view first_call_character,
+          const double silence_seconds) -> Region {
+    CwChannelBank bank({.empty_track_retention_seconds = 0.5,
+                        .decoded_track_retention_seconds = retention_seconds,
+                        // Fabricated spectra are driven faster than the
+                        // detector cadence, and the exact lifecycle is what is
+                        // being asserted, so cadence decimation is disabled.
+                        .detector_frame_interval_seconds = 0.0,
+                        .minimum_spectral_observations = 1,
+                        .minimum_verification_symbols = 0,
+                        .verification_enter_seconds = 0.0,
+                        .verification_exit_seconds = 0.0});
+    std::vector<float> bins(201, -110.0F);
+    std::uint64_t now = 0;
+    double phase = 0.0;
+    const auto step = [&](const bool keyed) {
+      bins.assign(bins.size(), -110.0F);
+      if (keyed) bins[60] = -55.0F;
+      static_cast<void>(bank.updateSpectrum(now, 0.0, 1'000.0, bins));
+      cwassistant::core::RealtimeSampleBlock block;
+      block.stream.sample_rate_hz = sample_rate;
+      block.timestamp_ns = now;
+      block.sample_count = 80;
+      for (std::size_t index = 0; index < block.sample_count; ++index) {
+        block.samples[index] = {
+            keyed ? 0.40F * static_cast<float>(std::sin(phase)) : 0.0F, 0.0F};
+        phase += 2.0 * std::numbers::pi * 300.0 / sample_rate;
+      }
+      static_cast<void>(bank.processSamples(block));
+      now += 10'000'000;
+    };
+    const auto gap = [&](const int steps) {
+      for (int index = 0; index < steps; ++index) step(false);
+    };
+    const auto character = [&](const std::string_view elements) {
+      for (std::size_t index = 0; index < elements.size(); ++index) {
+        for (int repeat = 0; repeat < (elements[index] == '.' ? 6 : 18);
+             ++repeat) {
+          step(true);
+        }
+        if (index + 1U < elements.size()) gap(6);
+      }
+      gap(18);
+    };
+    const auto word_gap = [&] { gap(24); };
+    character("-.-.");  // C
+    character("--.-");  // Q
+    word_gap();
+    character("-..");  // D
+    character(".");    // E
+    word_gap();
+    character(first_call_character);  // D (allocated) or Q (no such country)
+    character("-.-");                 // K
+    character("--...");               // 7
+    character("...");                 // S
+    character("...");                 // S
+    word_gap();
+    character(".");  // Close the preceding callsign token.
+
+    Region region;
+    const auto live = bank.channels();
+    region.published_while_sending = live.size();
+    if (!live.empty()) region.live_callsign = live.front().callsign;
+
+    // The carrier stops. One frame at the far end of the silence is enough:
+    // expiry reads the elapsed time, not the number of frames, and a flat
+    // spectrum offers no peak that could start a new track.
+    bins.assign(bins.size(), -110.0F);
+    const auto silent_now =
+        now + static_cast<std::uint64_t>(silence_seconds * 1'000'000'000.0);
+    static_cast<void>(bank.updateSpectrum(silent_now, 0.0, 1'000.0, bins));
+    const auto& remaining = bank.channels();
+    region.published_after_silence = remaining.size();
+    if (!remaining.empty())
+      region.callsign_after_silence = remaining.front().callsign;
+    return region;
+  };
+
+  const Region named_early =
+      region_after_silence("-..", retention_seconds * 0.6);
+  const Region anonymous_early =
+      region_after_silence("--.-", retention_seconds * 0.6);
+  expect(named_early.published_while_sending == 1 &&
+             named_early.live_callsign == "DK7SS",
+         "the identified fixture names its station while it is sending");
+  expect(anonymous_early.published_while_sending == 1 &&
+             anonymous_early.live_callsign.empty(),
+         "the control fixture decodes and publishes but never names a station");
+  expect(named_early.published_after_silence == 1 &&
+             anonymous_early.published_after_silence == 1,
+         "both streams keep their region for the standard retention");
+
+  // Past the standard retention, only the identified stream is still there,
+  // and it is still wearing the label that makes it worth keeping.
+  const Region named_late =
+      region_after_silence("-..", retention_seconds * 1.5);
+  const Region anonymous_late =
+      region_after_silence("--.-", retention_seconds * 1.5);
+  expect(anonymous_late.published_after_silence == 0,
+         "an unidentified stream gives up its region on the standard "
+         "retention");
+  expect(named_late.published_after_silence == 1 &&
+             named_late.callsign_after_silence == "DK7SS",
+         "an identified stream keeps its labelled region past the standard "
+         "retention");
+
+  // Longer, not permanent.
+  const Region named_expired =
+      region_after_silence("-..", retention_seconds * 2.5);
+  expect(named_expired.published_after_silence == 0,
+         "the longer hold is bounded: an identified stream gives up its "
+         "region once the extended retention passes");
+}
+
+// A station that has identified more than once keeps its name through a spell
+// of poor copy, and gives it up only to a rival that identifies as often.
+//
+// The fault this covers was reported from a live station: track 3090 on
+// 7,015,005 Hz read EH3ST cleanly eight times in a minute, and EH3S, EH3SN,
+// EHSMST and EG7S once each in between. The stream's name followed every one
+// of them, because it was recomputed from the current text window on every
+// snapshot and written straight over whatever had been established. Neither
+// the transcript nor the callsign scoring changes here; only which of the
+// readings gets to name the stream.
+void test_stream_label_hysteresis() {
+  using cwassistant::core::CwStreamLabel;
+  using cwassistant::core::cwApplyStreamLabelReading;
+  using cwassistant::core::cwCountCallsignOccurrences;
+
+  expect(cwCountCallsignOccurrences("CQ DE EH3ST EH3ST K", "EH3ST") == 2,
+         "a call sent twice counts as two readings");
+  expect(cwCountCallsignOccurrences("VEH3STK", "EH3ST") == 0 &&
+             cwCountCallsignOccurrences("EH3ST/P", "EH3ST") == 0,
+         "a call embedded in a longer token is a different decode, not "
+         "another reading of this one");
+
+  {
+    // Below the bar the name still follows the newest reading. An operator
+    // wants the call the moment it is first copied; it is keeping the name
+    // that has to be earned.
+    CwStreamLabel provisional;
+    provisional = cwApplyStreamLabelReading(std::move(provisional), "EH3ST",
+                                            "CQ DE EH3ST ", "");
+    expect(provisional.callsign == "EH3ST" && provisional.support == 1,
+           "one clean identification names the stream immediately");
+    provisional = cwApplyStreamLabelReading(std::move(provisional), "EG7S",
+                                            "CQ DE EG7S ", "");
+    expect(provisional.callsign == "EG7S",
+           "a provisional name follows the newest reading");
+  }
+
+  {
+    // The literal and the refined path are two readings of one transmission.
+    // Counting both would let a single identification establish a name and
+    // freeze the first thing copied, however wrong.
+    CwStreamLabel parallel;
+    parallel = cwApplyStreamLabelReading(std::move(parallel), "EH3ST",
+                                         "CQ DE EH3ST ", "CQ DE EH3ST ");
+    expect(parallel.support == 1,
+           "the two decoded paths corroborate a name once between them, not "
+           "once each");
+  }
+
+  CwStreamLabel label;
+  label = cwApplyStreamLabelReading(std::move(label), "EH3ST",
+                                    "EH3ST CQ CQ EH3ST ", "");
+  expect(label.callsign == "EH3ST" && label.support >= 2,
+         "a call read twice establishes the stream's name");
+
+  label = cwApplyStreamLabelReading(std::move(label), std::string_view{}, "",
+                                    "");
+  expect(label.callsign == "EH3ST",
+         "silence is not evidence that a different station has arrived");
+
+  label = cwApplyStreamLabelReading(std::move(label), "EG7S",
+                                    "EH3ST CQ CQ EH3ST E EG7S ", "");
+  expect(label.callsign == "EH3ST" && label.challenger == "EG7S" &&
+             label.challenger_support == 1,
+         "a single divergent reading challenges an established name instead "
+         "of replacing it");
+
+  label = cwApplyStreamLabelReading(std::move(label), "EH3ST",
+                                    "EH3ST CQ CQ EH3ST E EG7S EH3ST ", "");
+  expect(label.challenger.empty() && label.challenger_support == 0,
+         "the station identifying again answers the challenge against it");
+
+  label = cwApplyStreamLabelReading(std::move(label), "EG7S", "EG7S EG7S ", "");
+  expect(label.callsign == "EG7S" && label.challenger.empty(),
+         "a rival read as often as the incumbent takes the stream over");
+
+  // The same rule, driven by real keyed audio through the whole bank.
+  //
+  // The fixture keys DK7SS bare twice, which is how a station answering a call
+  // identifies, and then a single CQ DE DL7SS UP. DL7SS is one element away
+  // from DK7SS, opens on an allocated prefix, and its split-runner context
+  // outscores bare repetition outright, so the callsign scoring prefers it on
+  // that one reading: exactly the single-reading misdecode that used to
+  // rename the stream.
+  using cwassistant::core::CwChannelBank;
+  constexpr double sample_rate = 8'000.0;
+  CwChannelBank bank({.empty_track_retention_seconds = 0.5,
+                      .decoded_track_retention_seconds = 10.0,
+                      // Fabricated spectra are driven faster than the detector
+                      // cadence and the exact per-frame label is the subject,
+                      // so cadence decimation is disabled.
+                      .detector_frame_interval_seconds = 0.0,
+                      .minimum_spectral_observations = 1,
+                      .minimum_verification_symbols = 0,
+                      .verification_enter_seconds = 0.0,
+                      .verification_exit_seconds = 0.0});
+  std::vector<float> bins(201, -110.0F);
+  std::uint64_t now = 0;
+  double phase = 0.0;
+  const auto step = [&](const bool keyed) {
+    bins.assign(bins.size(), -110.0F);
+    if (keyed) bins[60] = -55.0F;
+    static_cast<void>(bank.updateSpectrum(now, 0.0, 1'000.0, bins));
+    cwassistant::core::RealtimeSampleBlock block;
+    block.stream.sample_rate_hz = sample_rate;
+    block.timestamp_ns = now;
+    block.sample_count = 80;
+    for (std::size_t index = 0; index < block.sample_count; ++index) {
+      block.samples[index] = {
+          keyed ? 0.40F * static_cast<float>(std::sin(phase)) : 0.0F, 0.0F};
+      phase += 2.0 * std::numbers::pi * 300.0 / sample_rate;
+    }
+    static_cast<void>(bank.processSamples(block));
+    now += 10'000'000;
+  };
+  const auto gap = [&](const int steps) {
+    for (int index = 0; index < steps; ++index) step(false);
+  };
+  const auto character = [&](const std::string_view elements) {
+    for (std::size_t index = 0; index < elements.size(); ++index) {
+      for (int repeat = 0; repeat < (elements[index] == '.' ? 6 : 18); ++repeat)
+        step(true);
+      if (index + 1U < elements.size()) gap(6);
+    }
+    gap(18);
+  };
+  const auto word_gap = [&] { gap(24); };
+  const auto label_now = [&]() -> std::string {
+    const auto channels = bank.channels();
+    return channels.empty() ? std::string{} : channels.front().callsign;
+  };
+  const auto text_now = [&]() -> std::string {
+    const auto channels = bank.channels();
+    return channels.empty() ? std::string{} : channels.front().text;
+  };
+  const auto send_dk7ss = [&] {
+    character("-..");    // D
+    character("-.-");    // K
+    character("--...");  // 7
+    character("...");    // S
+    character("...");    // S
+    word_gap();
+  };
+  const auto send_dl7ss = [&] {
+    character("-..");    // D
+    character(".-..");   // L
+    character("--...");  // 7
+    character("...");    // S
+    character("...");    // S
+    word_gap();
+  };
+
+  send_dk7ss();
+  send_dk7ss();
+  const std::string established = label_now();
+  expect(established == "DK7SS",
+         "the fixture establishes DK7SS from two bare identifications");
+
+  character("-.-.");  // C
+  character("--.-");  // Q
+  word_gap();
+  character("-..");  // D
+  character(".");    // E
+  word_gap();
+  send_dl7ss();
+  character("..-");   // U
+  character(".--.");  // P
+  word_gap();
+  const std::string after_rival = label_now();
+  const std::string transcript = text_now();
+  expect(after_rival == "DK7SS",
+         "one better-placed reading of a different callsign does not rename "
+         "an established stream");
+  expect(transcript.find("DL7SS") != std::string::npos,
+         "refusing the rename leaves the decoded transcript untouched");
+
+  // Changeable, not frozen. A rival that identifies as often as the incumbent
+  // did is a station, not a misdecode, and takes the stream over.
+  send_dl7ss();
+  expect(label_now() == "DL7SS",
+         "a rival that identifies twice takes an established stream over");
+}
+
+
+// ---------------------------------------------------------------------------
+// One keyer or several? A channel that holds several publishes occupancy.
+// ---------------------------------------------------------------------------
+
+const char* keyerFixtureMorse(const char symbol) {
+  switch (symbol) {
+    case 'A': return ".-";    case 'B': return "-...";  case 'C': return "-.-.";
+    case 'D': return "-..";   case 'E': return ".";     case 'F': return "..-.";
+    case 'G': return "--.";   case 'H': return "....";  case 'I': return "..";
+    case 'J': return ".---";  case 'K': return "-.-";   case 'L': return ".-..";
+    case 'M': return "--";    case 'N': return "-.";    case 'O': return "---";
+    case 'P': return ".--.";  case 'Q': return "--.-";  case 'R': return ".-.";
+    case 'S': return "...";   case 'T': return "-";     case 'U': return "..-";
+    case 'V': return "...-";  case 'W': return ".--";   case 'X': return "-..-";
+    case 'Y': return "-.--";  case 'Z': return "--..";  case '0': return "-----";
+    case '1': return ".----"; case '2': return "..---"; case '3': return "...--";
+    case '4': return "....-"; case '5': return "....."; case '6': return "-....";
+    case '7': return "--..."; case '8': return "---.."; case '9': return "----.";
+    default: return "";
+  }
+}
+
+// One station's keying as (seconds, key-down) runs.
+std::vector<std::pair<double, bool>> keyerFixtureRuns(
+    const std::string_view message, const double wpm) {
+  const double dot = 1.2 / wpm;
+  std::vector<std::pair<double, bool>> runs;
+  for (const char symbol : message) {
+    if (symbol == ' ') {
+      if (!runs.empty()) runs.back().first += 4.0 * dot;
+      continue;
+    }
+    for (const char* element = keyerFixtureMorse(symbol); *element != '\0';
+         ++element) {
+      runs.push_back({*element == '-' ? 3.0 * dot : dot, true});
+      runs.push_back({dot, false});
+    }
+    if (!runs.empty()) runs.back().first = 3.0 * dot;
+  }
+  return runs;
+}
+
+// Adds one keyed carrier, repeating its message for the whole buffer.
+// `start_fraction` rotates the message so two stations sharing a fixture are
+// not keyed in lockstep, which is what a real pileup is not.
+void addKeyerFixtureCarrier(std::vector<float>& audio, const double sample_rate,
+                            const double tone_hz, const double wpm,
+                            const float amplitude,
+                            const std::string_view message,
+                            const double start_fraction) {
+  const auto runs = keyerFixtureRuns(message, wpm);
+  if (runs.empty()) return;
+  constexpr double rise = 0.004;
+  double phase = 0.0;
+  std::size_t run =
+      static_cast<std::size_t>(start_fraction *
+                               static_cast<double>(runs.size())) %
+      runs.size();
+  std::size_t index = 0;
+  while (index < audio.size()) {
+    const auto length = static_cast<std::size_t>(runs[run].first * sample_rate);
+    for (std::size_t step = 0; step < length && index < audio.size();
+         ++step, ++index) {
+      double envelope = 0.0;
+      if (runs[run].second) {
+        const double into = static_cast<double>(step) / sample_rate;
+        const double from_end =
+            (static_cast<double>(length) / sample_rate) - into;
+        const double attack =
+            into < rise ? 0.5 - 0.5 * std::cos(std::numbers::pi * into / rise)
+                        : 1.0;
+        const double decay =
+            from_end < rise
+                ? 0.5 - 0.5 * std::cos(std::numbers::pi * from_end / rise)
+                : 1.0;
+        envelope = std::min(attack, decay);
+      }
+      phase += 2.0 * std::numbers::pi * tone_hz / sample_rate;
+      audio[index] +=
+          static_cast<float>(amplitude * envelope * std::sin(phase));
+    }
+    run = (run + 1U) % runs.size();
+  }
+}
+
+// Deterministic across standard libraries: normal_distribution's mapping is
+// not standardized, a sum of twelve uniform draws is.
+void addKeyerFixtureNoise(std::vector<float>& audio, const float level,
+                          const unsigned seed) {
+  std::mt19937 generator(seed);
+  for (float& sample : audio) {
+    double sum = 0.0;
+    for (int draw = 0; draw < 12; ++draw)
+      sum += static_cast<double>(generator()) / 4'294'967'296.0;
+    sample += level * static_cast<float>(sum - 6.0);
+  }
+}
+
+// What the bank made of one band of the fixture. The window matters: two
+// carriers 60 Hz apart are two tracks, either of which may be the one the
+// bank keeps live, so every assertion is made about the window rather than
+// about one nominal frequency.
+struct KeyerFixtureOutcome {
+  bool tracked{false};
+  // Strongest divergence between the wide- and narrow-filter speed estimates
+  // seen on any live track in the window.
+  float speed_ratio{0.0F};
+  bool unresolved{false};
+  // A live, currently matched carrier in the window that is published with its
+  // frequency and key state but without text.
+  bool occupancy_published{false};
+  double occupancy_frequency_hz{0.0};
+  // Any channel in the window still publishing open-ended text.
+  bool text_published{false};
+  std::string text;
+  std::string callsign;
+  std::size_t unresolved_track_count{0};
+  std::size_t separation_candidate_count{0};
+  std::uint8_t neighbours{0};
+  // Block indices, for the hysteresis assertion: when the measured ratio first
+  // exceeded the configured limit, and when the standing verdict first
+  // followed it.
+  std::size_t first_ratio_over_limit_block{0};
+  std::size_t first_verdict_block{0};
+};
+
+KeyerFixtureOutcome runKeyerFixture(
+    const std::vector<float>& audio, const double sample_rate,
+    const double window_center_hz, const double window_hz,
+    const cwassistant::core::CwChannelBankConfig& config) {
+  using namespace cwassistant::core;
+  SpectrumAnalyzer analyzer({.audio_upper_frequency_hz = 3'000.0});
+  CwChannelBank bank(config);
+  RealtimeSampleBlock block;
+  block.stream.sample_rate_hz = sample_rate;
+  KeyerFixtureOutcome outcome;
+  std::size_t position = 0;
+  std::size_t blocks = 0;
+  std::uint64_t now = 0;
+  while (position < audio.size()) {
+    const std::size_t take =
+        std::min<std::size_t>(1'024, audio.size() - position);
+    block.sample_count = take;
+    block.timestamp_ns = now;
+    for (std::size_t index = 0; index < take; ++index)
+      block.samples[index] = {audio[position + index], 0.0F};
+    for (const auto& frame : analyzer.process(block)) {
+      static_cast<void>(bank.updateSpectrum(
+          frame.timestamp_ns, frame.lower_frequency_hz,
+          frame.upper_frequency_hz, frame.instantaneous_bins_dbfs, false));
+    }
+    static_cast<void>(bank.processSamples(block));
+    ++blocks;
+    for (const auto& diagnostic : bank.allTrackDiagnostics()) {
+      if (std::abs(diagnostic.frequency_hz - window_center_hz) > window_hz)
+        continue;
+      outcome.tracked = true;
+      outcome.speed_ratio =
+          std::max(outcome.speed_ratio, diagnostic.keyer_speed_ratio);
+      outcome.unresolved =
+          outcome.unresolved || diagnostic.keyer_overlap_unresolved;
+      outcome.neighbours =
+          std::max(outcome.neighbours, diagnostic.overlap_neighbour_count);
+      if (outcome.first_ratio_over_limit_block == 0 &&
+          diagnostic.keyer_speed_ratio >
+              config.maximum_single_keyer_speed_ratio) {
+        outcome.first_ratio_over_limit_block = blocks;
+      }
+      if (outcome.first_verdict_block == 0 &&
+          diagnostic.keyer_overlap_unresolved) {
+        outcome.first_verdict_block = blocks;
+      }
+    }
+    position += take;
+    now += static_cast<std::uint64_t>(static_cast<long double>(take) *
+                                      1'000'000'000.0L / sample_rate);
+  }
+  const auto diagnostics = bank.verificationDiagnostics();
+  outcome.unresolved_track_count = diagnostics.unresolved_overlap_tracks;
+  outcome.separation_candidate_count = diagnostics.joint_separation_candidates;
+  for (const auto& channel : bank.channels()) {
+    if (std::abs(channel.frequency_hz - window_center_hz) > window_hz) continue;
+    if (!channel.text.empty()) {
+      outcome.text_published = true;
+      outcome.text = channel.text;
+    }
+    if (!channel.callsign.empty()) outcome.callsign = channel.callsign;
+    if (channel.active &&
+        channel.verification_state ==
+            cwassistant::core::CwTrackState::Verified &&
+        channel.verification_reason ==
+            cwassistant::core::CwVerificationReason::UnresolvedKeyerOverlap &&
+        channel.text.empty()) {
+      outcome.occupancy_published = true;
+      outcome.occupancy_frequency_hz = channel.frequency_hz;
+    }
+  }
+  return outcome;
+}
+
+void test_overlapping_keyers_publish_occupancy_not_text() {
+  using namespace cwassistant::core;
+  constexpr double sample_rate = 8'000.0;
+  constexpr double carrier_hz = 700.0;
+  // 60 Hz, the closest spacing the operator's pileup capture contains and
+  // narrower than any filter that still passes a keyed carrier.
+  constexpr double neighbour_hz = 760.0;
+  constexpr double wpm = 20.0;
+  constexpr double seconds = 30.0;
+  const auto count = static_cast<std::size_t>(seconds * sample_rate);
+  constexpr float noise = 0.02F;
+  // 20 dB in the 120 Hz reference bandwidth the bank measures against.
+  const float amplitude =
+      noise * std::sqrt(std::pow(10.0F, 2.0F) /
+                        static_cast<float>(sample_rate / 2.0 / 120.0));
+
+  std::vector<float> alone(count, 0.0F);
+  addKeyerFixtureCarrier(alone, sample_rate, carrier_hz, wpm, amplitude,
+                         "CQ CQ DE IU0LFQ IU0LFQ K ", 0.0);
+  addKeyerFixtureNoise(alone, noise, 11U);
+  const auto single = runKeyerFixture(alone, sample_rate, carrier_hz, 25.0, {});
+
+  expect(single.tracked && single.speed_ratio > 0.0F &&
+             single.speed_ratio <= 1.5F,
+         "one keyer reads nearly the same speed at the narrowest and the "
+         "widest analysis filter");
+  expect(!single.unresolved && single.text_published,
+         "a channel holding one keyer keeps publishing its decoded text");
+
+  // The same station with one neighbour 60 Hz away at a similar level. Their
+  // envelopes sum; the sum is not Morse.
+  std::vector<float> crowded(count, 0.0F);
+  addKeyerFixtureCarrier(crowded, sample_rate, carrier_hz, wpm, amplitude,
+                         "CQ CQ DE IU0LFQ IU0LFQ K ", 0.0);
+  addKeyerFixtureCarrier(crowded, sample_rate, neighbour_hz, wpm * 1.07,
+                         amplitude * 0.9F, "TEST DE DL2ABC PSE K ", 0.37);
+  addKeyerFixtureNoise(crowded, noise, 11U);
+  // One window covering both carriers. Which of two stations 60 Hz apart stays
+  // the live track is a matter of which ridge wins, and the requirement is
+  // about the crowd rather than about either of them by name.
+  const auto crowded_outcome =
+      runKeyerFixture(crowded, sample_rate, 0.5 * (carrier_hz + neighbour_hz),
+                      60.0, {});
+
+  expect(crowded_outcome.tracked && crowded_outcome.speed_ratio > 1.5F,
+         "several superimposed keyers read far faster through a wide filter "
+         "than through a narrow one");
+  expect(crowded_outcome.unresolved,
+         "a channel that reads as several keyers is marked unresolved");
+
+  // Silenced, not deleted. Everything an operator tunes by survives: the
+  // marker, its frequency, its verified carrier state and its key activity.
+  expect(crowded_outcome.occupancy_published &&
+             crowded_outcome.occupancy_frequency_hz >= carrier_hz - 25.0 &&
+             crowded_outcome.occupancy_frequency_hz <= neighbour_hz + 25.0,
+         "an unresolved track stays published, active and verified at its own "
+         "frequency, naming the overlap as the reason its text is withheld");
+  expect(!crowded_outcome.text_published && crowded_outcome.callsign.empty(),
+         "no channel in a crowded window publishes open-ended text or a "
+         "station name");
+  expect(crowded_outcome.unresolved_track_count >= 1,
+         "the bank counts unresolved tracks so an operator-facing diagnostic "
+         "can say how much of a window is occupancy rather than copy");
+  // The evidence a later, more expensive separation stage needs to choose
+  // which refused tracks are worth attempting. Two carriers is a problem such
+  // a stage can condition; the dense centre of a real pileup is not.
+  expect(crowded_outcome.separation_candidate_count >= 1 &&
+             crowded_outcome.neighbours >= 1,
+         "an unresolved track records a sparse enough neighbourhood to be "
+         "offered to a later separation stage");
+
+  // The gate, and nothing else, is what withheld the text: the same audio
+  // through a bank that does not run the test decodes as before.
+  const auto ungated =
+      runKeyerFixture(crowded, sample_rate, 0.5 * (carrier_hz + neighbour_hz),
+                      60.0, {.resolve_overlapping_keyers = false});
+  expect(!ungated.unresolved && ungated.text_published,
+         "disabling the resolution test restores the open-ended transcript "
+         "the gate was withholding");
+
+  // Hysteresis. The verdict follows sustained evidence, never one
+  // measurement: a pileup thinning for a word, or a DX pausing, must not flip
+  // a stream between publishing text and withholding it.
+  expect(crowded_outcome.first_ratio_over_limit_block > 0 &&
+             crowded_outcome.first_verdict_block >
+                 crowded_outcome.first_ratio_over_limit_block + 5,
+         "the standing verdict lags the first measurement that crosses the "
+         "limit by several further measurements");
+}
+
+// The bank used to hold 24 carriers, and the 24 was not a decision: the
+// display had 24 hand-written colors, the color-lease array was sized to the
+// palette, and the track cap was sized to the leases. An operator capture of a
+// real DX pileup holds about 50 stations inside a 6 kHz window at a median
+// spacing of 70 Hz, all of them further apart than `minimum_separation_hz`, so
+// half of that band was carriers this bank could resolve and had no room for.
+// The cap falsified its own diagnostics while it held, too: every live record
+// read `tracks: 24` exactly, which reads as a busy band and was saturation.
+void test_channel_bank_follows_a_pileup() {
+  using namespace cwassistant::core;
+  constexpr double sample_rate = 12'000.0;
+  constexpr double upper_hz = 6'000.0;
+  constexpr std::size_t bin_count = 601;  // 10 Hz per bin across the window
+  constexpr std::size_t carriers = 40;
+  constexpr double first_carrier_hz = 400.0;
+  // Well clear of `minimum_separation_hz`, so every carrier here is one the
+  // detector is meant to resolve and the only thing that can lose them is the
+  // cap itself.
+  constexpr double spacing_hz = 120.0;
+  static_assert(first_carrier_hz + spacing_hz * (carriers - 1) < upper_hz);
+  static_assert(carriers > 24,
+                "the point of the fixture is to exceed the old cap");
+
+  // Only the evidence thresholds are relaxed, so a deterministic test reaches
+  // a verified verdict in seconds of audio rather than a minute of it. The
+  // track cap is deliberately left at its default: that is what is under test.
+  CwChannelBank bank({.minimum_spectral_observations = 1,
+                      .minimum_verification_symbols = 0});
+
+  std::vector<float> bins(bin_count, -110.0F);
+  std::array<double, carriers> phase{};
+  std::array<int, carriers> remaining{};
+  std::array<bool, carriers> keyed{};
+  std::uint64_t now = 0;
+  std::uint32_t random_state = 12'345U;
+  // A plain linear congruential step rather than <random>, so the fixture is
+  // the same sequence on every standard library the project builds against.
+  const auto next_element = [&random_state]() {
+    random_state = random_state * 1'664'525U + 1'013'904'223U;
+    return (random_state >> 16) % 3U;
+  };
+  const auto carrier_hz = [](const std::size_t index) {
+    return first_carrier_hz + spacing_hz * static_cast<double>(index);
+  };
+  for (int step = 0; step < 900; ++step) {
+    bins.assign(bin_count, -110.0F);
+    for (std::size_t index = 0; index < carriers; ++index) {
+      if (remaining[index] <= 0) {
+        keyed[index] = !keyed[index];
+        // Dits, dahs and the gaps between them, at independent phases per
+        // carrier, so the bank sees forty separately keyed envelopes.
+        remaining[index] = keyed[index] && next_element() == 0U ? 18 : 6;
+      }
+      --remaining[index];
+      if (!keyed[index]) continue;
+      bins[static_cast<std::size_t>(carrier_hz(index) / upper_hz *
+                                    static_cast<double>(bin_count - 1))] =
+          -55.0F;
+    }
+    static_cast<void>(bank.updateSpectrum(now, 0.0, upper_hz, bins));
+    RealtimeSampleBlock block;
+    block.stream.sample_rate_hz = sample_rate;
+    block.timestamp_ns = now;
+    block.sample_count = 120;
+    for (std::size_t sample = 0; sample < block.sample_count; ++sample) {
+      float value = 0.0F;
+      for (std::size_t index = 0; index < carriers; ++index) {
+        if (keyed[index]) {
+          value += 0.10F * static_cast<float>(std::sin(phase[index]));
+        }
+        phase[index] +=
+            2.0 * std::numbers::pi * carrier_hz(index) / sample_rate;
+      }
+      block.samples[sample] = {value, 0.0F};
+    }
+    static_cast<void>(bank.processSamples(block));
+    now += 10'000'000ULL;
+  }
+
+  const auto tracked = bank.allTrackDiagnostics();
+  expect(tracked.size() > 24,
+         "the channel bank follows more simultaneous carriers than the old "
+         "24-color display palette allowed");
+  const auto& published = bank.channels();
+  expect(published.size() > 24,
+         "every carrier the bank follows past the old cap is reported, so a "
+         "diagnostic reading of the track count is the band and not the cap");
+
+  // The lease table has to have grown with the cap, not stayed at the palette
+  // size. If it had not, every lease would be taken as soon as the bank filled
+  // and `assignOrRefreshColor` would fall through to its modulo fallback,
+  // handing carriers 120 Hz apart the same color.
+  std::vector<std::uint8_t> colors;
+  colors.reserve(published.size());
+  for (const auto& channel : published) colors.push_back(channel.color_index);
+  std::sort(colors.begin(), colors.end());
+  expect(std::adjacent_find(colors.begin(), colors.end()) == colors.end(),
+         "every concurrently published track holds its own color index past "
+         "the old 24-lease limit");
+}
+
 int main() {
   test_ring_buffer();
   test_scheduler();
@@ -3724,6 +4441,8 @@ int main() {
   test_cw_channel_bank();
   test_established_cw_track_reserves_its_carrier_ridge();
   test_cw_channel_bank_state_reason_consistency();
+  test_overlapping_keyers_publish_occupancy_not_text();
+  test_channel_bank_follows_a_pileup();
   test_operator_selected_cw_probe();
   test_cw_channel_presentation_frequency_model();
   test_cw_channel_bank_implausible_character_distribution();
@@ -3737,6 +4456,8 @@ int main() {
   test_cw_callsign_prefix_table();
   test_cw_context_rescorer();
   test_decoding_cost_does_not_grow_with_session_length();
+  test_identified_stream_holds_its_region_longer();
+  test_stream_label_hysteresis();
   test_presented_speed_requires_evidence();
   test_spectrum_settings();
   test_wav_replay_source();

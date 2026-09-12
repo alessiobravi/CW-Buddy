@@ -78,6 +78,74 @@ std::string suppressFragmentRuns(const std::string_view text) {
 
 
 constexpr std::array<double, 3> kNarrowbandWidthsHz{60.0, 120.0, 240.0};
+// The two widths the keyer-resolution test compares. They are the narrowest
+// and widest the bank already filters every track at, so the measurement costs
+// no extra signal path: only the two power sums that are computed anyway are
+// read a second time. The pair is also the one the capture evidence behind
+// `maximum_single_keyer_speed_ratio` was measured with.
+constexpr std::size_t kKeyerNarrowWidthIndex = 0;
+constexpr std::size_t kKeyerWideWidthIndex = 2;
+// Mark power must exceed space power by this factor before a width's run
+// history is believed. A two-level model fitted to one population of noise
+// always finds some split; without this bar an idle channel reads as fast
+// chatter at both widths, and because the wide filter chatters four times as
+// fast as the narrow one, silence alone would look exactly like a pileup.
+//
+// Fourteen decibels, and it cannot simply be raised further: the tracker it
+// reads is deliberately asymmetric, so on real keying the separation it
+// reports is optimistic, while two superimposed carriers keep the channel
+// energised through the beat and report a separation that is pessimistic.
+// Measured on the synthetic fixtures, raising this to 18 dB stopped
+// recognising genuine two-keyer channels at every speed and simultaneously
+// produced a new false reading on a clean 40 WPM one. The level guard below
+// carries the weak-signal case instead.
+constexpr float kKeyerRunLevelSeparation = 25.0F;
+// Fraction of recent evidence frames on which the NARROW width must have shown
+// a believable two-level split before the comparison is allowed to refuse a
+// track.
+//
+// The ratio only means something if the reference half of it was measurable.
+// Noise fragments the wide filter as readily as a neighbour does, so on a
+// channel too weak or too damaged for even the narrowest filter to see clean
+// keying, the two causes cannot be told apart at all and the honest answer is
+// no answer. Measured on the synthetic fixtures: the two clean single keyers
+// that were misread as several -- 16 WPM at 12 and at 10 dB -- showed narrow
+// duties of 0.58 and 0.49, while every clean channel that read correctly and
+// every genuine two-keyer channel down to 12 dB sat at 0.62 or above. A
+// genuine pileup keeps this high precisely because its own carrier is still
+// dominant inside 60 Hz, where a neighbour 60 Hz away is more than twenty
+// decibels down.
+//
+// Known limit, stated rather than hidden: this leaves one case standing. A
+// clean 16 WPM carrier at 12 dB still reads as several keyers, because its
+// duty crosses the bar for long enough to carry a verdict. Raising the bar to
+// 0.65 does not remove it and starts costing genuine two-keyer channels, and
+// on the decoder surface benchmark the case costs nothing measurable -- the
+// same 26 correct and 7 wrong callsigns, and a per-seed-set character error
+// within a hundredth of the pre-gate build. It stays on the list.
+constexpr float kKeyerMinimumNarrowDuty = 0.60F;
+// A noise excursion smaller than this fraction of the keying separation does
+// not open or close a run. Real fragmentation from a superimposed neighbour
+// swings the whole separation; this only stops the envelope chattering across
+// its own midpoint. Applied symmetrically so it biases neither mark nor space.
+constexpr float kKeyerRunHysteresisFraction = 0.15F;
+// Evidence frames between verdict evaluations, and how many consecutive
+// evaluations must agree before the standing verdict changes. Half a second at
+// the default evidence rate, so three of them is about one and a half seconds
+// of consistent evidence -- long enough that a pileup thinning for one word,
+// or a DX pausing mid-transmission, cannot flip a track between publishing
+// text and withholding it.
+constexpr std::uint16_t kKeyerEvaluationFrames = 250;
+constexpr std::uint8_t kKeyerVerdictEvaluations = 3;
+// Frequency radius inside which a later stage would have to solve carriers
+// jointly, and the largest number of sources such a solve stays conditioned
+// for. Both come from the separation experiment on the operator's capture:
+// neighbours within about 220 Hz were solved together, three to six sources
+// worked, and the dense centre of the pileup -- six or more stations at 50 to
+// 70 Hz spacing -- did not. Recorded here only to mark which refused tracks
+// are worth that work; nothing in this file attempts the solve.
+constexpr double kJointSeparationRadiusHz = 220.0;
+constexpr std::size_t kJointSeparationMaximumSources = 5;
 constexpr double kCandidateMatchHoldSeconds = 0.75;
 constexpr double kManualSelectionReuseToleranceHz = 12.0;
 constexpr double kCharacterRefinementEvidenceSeconds = 3.0;
@@ -175,8 +243,30 @@ const char* cwVerificationReasonName(
       return "implausible-character-distribution";
     case CwVerificationReason::Verified: return "verified";
     case CwVerificationReason::SignalLost: return "signal-lost";
+    case CwVerificationReason::UnresolvedKeyerOverlap:
+      return "unresolved-keyer-overlap";
   }
   return "needs-spectral-persistence";
+}
+
+double cwKeyingSpeedFromRuns(const std::span<const std::uint16_t> run_frames,
+                             const double frame_rate_hz) noexcept {
+  if (run_frames.empty() || !(frame_rate_hz > 0.0)) return 0.0;
+  // Bounded and on the stack: this runs inside the evidence path, and the
+  // caller's window is a fixed ring far smaller than this.
+  constexpr std::size_t kMaximumRuns = 256;
+  std::array<std::uint16_t, kMaximumRuns> ordered{};
+  const std::size_t count = std::min(run_frames.size(), kMaximumRuns);
+  std::copy_n(run_frames.begin(), count, ordered.begin());
+  const std::size_t middle = count / 2;
+  std::nth_element(ordered.begin(),
+                   ordered.begin() + static_cast<std::ptrdiff_t>(middle),
+                   ordered.begin() + static_cast<std::ptrdiff_t>(count));
+  const double element_frames = static_cast<double>(ordered[middle]);
+  if (!(element_frames > 0.0)) return 0.0;
+  // PARIS: one word is fifty elements per minute-normalised unit, so a speed
+  // in words per minute is 1.2 divided by the element length in seconds.
+  return 1.2 / (element_frames / frame_rate_hz);
 }
 
 bool isCharacterDistributionImplausible(
@@ -193,6 +283,80 @@ bool isCharacterDistributionImplausible(
   return letters > 0 &&
          static_cast<float>(simple) / static_cast<float>(letters) >
              maximum_simple_character_fraction;
+}
+
+std::uint32_t cwCountCallsignOccurrences(
+    const std::string_view text, const std::string_view callsign) noexcept {
+  if (callsign.empty() || text.size() < callsign.size()) return 0;
+  // Slash is part of a callsign token (F/DK7SS, DK7SS/P), so a match that
+  // touches one is a match inside a longer call, not a reading of this one.
+  const auto token_character = [](const char symbol) noexcept {
+    return (symbol >= '0' && symbol <= '9') ||
+           (symbol >= 'A' && symbol <= 'Z') ||
+           (symbol >= 'a' && symbol <= 'z') || symbol == '/';
+  };
+  std::uint32_t occurrences = 0;
+  for (std::size_t index = text.find(callsign); index != std::string_view::npos;
+       index = text.find(callsign, index + 1U)) {
+    const std::size_t end = index + callsign.size();
+    if ((index == 0U || !token_character(text[index - 1U])) &&
+        (end == text.size() || !token_character(text[end]))) {
+      ++occurrences;
+    }
+  }
+  return occurrences;
+}
+
+CwStreamLabel cwApplyStreamLabelReading(CwStreamLabel label,
+                                        const std::string_view reading,
+                                        const std::string_view primary_text,
+                                        const std::string_view refined_text,
+                                        const std::uint32_t corroborations) {
+  // Silence is not evidence of a new station, and neither is a stretch of copy
+  // too poor to read a call out of. Both arrive here as an empty reading, and
+  // both leave the stream wearing the name it already had.
+  if (reading.empty()) return label;
+  // A caller asking for no corroboration at all is asking for the name to
+  // follow every reading; zero would instead establish an empty name.
+  const std::uint32_t bar = std::max<std::uint32_t>(corroborations, 1U);
+  const std::uint32_t support = std::max<std::uint32_t>(
+      {1U, cwCountCallsignOccurrences(primary_text, reading),
+       cwCountCallsignOccurrences(refined_text, reading)});
+
+  if (reading == label.callsign) {
+    label.support = std::max(label.support, support);
+    // The station said its name again. Whatever was arguing that this is
+    // somebody else has just been answered, so it starts over rather than
+    // keeping credit earned against a name that is still being confirmed.
+    label.challenger.clear();
+    label.challenger_support = 0;
+    return label;
+  }
+  if (label.support < bar) {
+    // Provisional. One clean identification is enough to name a stream -- an
+    // operator wants the call the moment it is copied -- it is only enough to
+    // *keep* the name that has to be earned twice.
+    label.callsign.assign(reading);
+    label.support = support;
+    label.challenger.clear();
+    label.challenger_support = 0;
+    return label;
+  }
+  if (reading == label.challenger) {
+    label.challenger_support = std::max(label.challenger_support, support);
+  } else {
+    label.challenger.assign(reading);
+    label.challenger_support = support;
+  }
+  if (label.challenger_support >= bar) {
+    // A rival that cleared the same bar is a station identifying, not a
+    // misdecode, so it takes the stream over with the evidence it brought.
+    label.callsign = std::move(label.challenger);
+    label.support = label.challenger_support;
+    label.challenger.clear();
+    label.challenger_support = 0;
+  }
+  return label;
 }
 
 CwChannelBank::Track::Track(const std::uint64_t track_id,
@@ -277,6 +441,11 @@ void CwChannelBank::sanitizeConfig() noexcept {
                  config_.empty_track_retention_seconds, 300.0);
   config_.unverified_track_retention_seconds =
       std::clamp(config_.unverified_track_retention_seconds, 0.2, 5.0);
+  // One is "no extra hold at all", which a caller must be able to ask for; the
+  // upper bound keeps a remembered region from outstaying the operator's
+  // memory of the station that made it.
+  config_.identified_stream_retention_multiplier =
+      std::clamp(config_.identified_stream_retention_multiplier, 1.0, 4.0);
   config_.color_identity_retention_seconds =
       std::clamp(config_.color_identity_retention_seconds, 300.0, 3'600.0);
   config_.parked_track_retention_seconds =
@@ -289,8 +458,8 @@ void CwChannelBank::sanitizeConfig() noexcept {
       config_.noise_reference_offset_hz, kNarrowbandWidthsHz.back(), 2'000.0);
   config_.evidence_rate_hz =
       std::clamp(config_.evidence_rate_hz, 100.0, 2'000.0);
-  config_.maximum_tracks =
-      std::clamp<std::size_t>(config_.maximum_tracks, 1, 64);
+  config_.maximum_tracks = std::clamp<std::size_t>(
+      config_.maximum_tracks, 1, kCwMaximumTrackCapacity);
   if (!std::isfinite(config_.detector_averaging_seconds)) {
     config_.detector_averaging_seconds = 0.05;
   }
@@ -348,6 +517,16 @@ void CwChannelBank::sanitizeConfig() noexcept {
                  config_.verification_enter_seconds, 15.0);
   config_.decoder_recovery_seconds =
       std::clamp(config_.decoder_recovery_seconds, 0.5, 15.0);
+  if (!std::isfinite(config_.maximum_single_keyer_speed_ratio)) {
+    config_.maximum_single_keyer_speed_ratio = 1.5F;
+  }
+  // Below 1.25 the clean carrier the default was measured against (1.19) would
+  // itself be silenced once noise moved it a little; above 4.0 nothing in that
+  // capture, whose worst carrier read 3.50, would ever be refused. Outside
+  // that range the setting no longer expresses a judgement, so it is not
+  // offered. `resolve_overlapping_keyers` is the way to turn the test off.
+  config_.maximum_single_keyer_speed_ratio =
+      std::clamp(config_.maximum_single_keyer_speed_ratio, 1.25F, 4.0F);
 }
 
 void CwChannelBank::parkTracksOutsideBand(
@@ -434,7 +613,7 @@ void CwChannelBank::setMonitorTracks(
       std::isfinite(reference_tone_hz)
           ? std::clamp(reference_tone_hz, 200.0, 1'500.0)
           : 700.0;
-  std::array<std::uint64_t, kColorLeaseCount> sanitized_tracks{};
+  std::array<std::uint64_t, kCwMaximumTrackCapacity> sanitized_tracks{};
   std::size_t sanitized_count = 0;
   if (mode == CwMonitorMode::SelectedTrack) {
     for (const std::uint64_t track_id : track_ids) {
@@ -1197,6 +1376,8 @@ const std::vector<CwChannelSnapshot>& CwChannelBank::processSamples(
       1.0 - std::exp(-1.0 / std::max(1.0, 1.5 * sample_rate_hz)));
   std::complex<float> advanced_monitor_oscillator = monitor_oscillator_;
 
+  measureTrackNeighbourhoods();
+
   for (auto& track : tracks_) {
     const bool monitored_track = is_monitored(track.id);
     // A track that will not be decoded needs no baseband at all. Everything
@@ -1341,6 +1522,18 @@ const std::vector<CwChannelSnapshot>& CwChannelBank::processSamples(
             10.0F *
             std::log10(std::max(center_power, kPowerFloor) /
                        std::max(reference_power * noise_scale, kPowerFloor));
+      }
+      // How many keyers is this channel carrying? One keyer reads nearly the
+      // same speed however wide the filter around it is; several closer
+      // together than any usable filter do not, because the wider filter
+      // admits the neighbours and their runs fragment. Both widths are already
+      // filtered and their levels already computed above, so the question
+      // costs two scalar trackers rather than a second signal path.
+      if (config_.resolve_overlapping_keyers) {
+        updateKeyerResolution(track, width_snr[kKeyerNarrowWidthIndex],
+                              width_snr[kKeyerWideWidthIndex],
+                              sample_rate_hz /
+                                  static_cast<double>(evidence_samples));
       }
       const float center_localization_ratio =
           track.center_power_sums[2] > kPowerFloor
@@ -1758,6 +1951,12 @@ CwVerificationDiagnostics CwChannelBank::verificationDiagnostics() const {
             config_.minimum_verification_timing_quality) {
       ++result.pattern_verified_tracks;
     }
+    if (track.verification_state == CwTrackState::Verified &&
+        track.keyer_overlap_unresolved) {
+      ++result.unresolved_overlap_tracks;
+      if (track.overlap_neighbour_count + 1U <= kJointSeparationMaximumSources)
+        ++result.joint_separation_candidates;
+    }
     result.best_narrowband_coherence =
         std::max(result.best_narrowband_coherence, track.narrowband_coherence);
   }
@@ -1829,6 +2028,14 @@ void CwChannelBank::resetFilter(Track& track) noexcept {
   track.keying_level_explained_variation = 0.0F;
   track.robust_keying_level_anchor_active = false;
   track.keying_envelope_initialized = false;
+  // The run histories describe what the filters were hearing, so they go with
+  // the filters. The standing verdict deliberately does not: a receiver retune
+  // or a stream change moves the signal path, not the stations, and a track
+  // that was in the middle of a pileup before the dial moved is still in one
+  // after it. Clearing the verdict here would republish a window of noise
+  // transcripts on every retune until the evidence rebuilt.
+  for (auto& runs : track.keyer_runs) runs = {};
+  track.keyer_evaluation_countdown = 0;
   track.filter_initialized = false;
 }
 
@@ -1878,6 +2085,152 @@ void CwChannelBank::shiftTrackedFrequencies(
   rebuildSnapshots(expected_sample_timestamp_ns_);
 }
 
+void CwChannelBank::measureTrackNeighbourhoods() noexcept {
+  for (Track& track : tracks_) {
+    std::size_t neighbours = 0;
+    double nearest_hz = 0.0;
+    for (const Track& other : tracks_) {
+      if (other.id == track.id) continue;
+      const double separation =
+          std::abs(other.frequency_hz - track.frequency_hz);
+      if (separation > kJointSeparationRadiusHz) continue;
+      ++neighbours;
+      if (nearest_hz == 0.0 || separation < nearest_hz) nearest_hz = separation;
+    }
+    track.overlap_neighbour_count =
+        static_cast<std::uint8_t>(std::min<std::size_t>(neighbours, 255));
+    track.nearest_neighbour_separation_hz = nearest_hz;
+  }
+}
+
+void CwChannelBank::updateKeyerResolution(
+    Track& track, const float narrow_snr_db, const float wide_snr_db,
+    const double evidence_frame_rate_hz) noexcept {
+  // One evidence frame folded into one width's two-level model and run
+  // history. Nothing here decides anything about the decode; it only counts
+  // how often this width's envelope crosses between its own two levels.
+  const auto observe = [](Track::KeyingRuns& runs, const float snr_db) {
+    const float power = std::pow(10.0F, 0.1F * snr_db);
+    if (!runs.initialized) {
+      runs.space_power = power;
+      runs.mark_power = power * 4.0F;
+      runs.initialized = true;
+      return;
+    }
+    const float space_amplitude = std::sqrt(std::max(runs.space_power, 0.0F));
+    const float mark_amplitude = std::sqrt(std::max(runs.mark_power, 0.0F));
+    const float amplitude = std::sqrt(std::max(power, 0.0F));
+    const float middle_amplitude = 0.5F * (space_amplitude + mark_amplitude);
+    // Same asymmetric assignment the decoder's own level tracker uses: each
+    // observation moves only the level it belongs to, quickly when it is
+    // beyond that level and slowly when it is inside, so the two stay apart
+    // instead of one envelope chasing both. No separation floor, though --
+    // levels that collapse together are the signal that this channel is not
+    // being keyed at all, and the admission test below reads exactly that.
+    if (amplitude < middle_amplitude) {
+      runs.space_power +=
+          (power < runs.space_power ? 0.30F : 0.02F) *
+          (power - runs.space_power);
+    } else {
+      runs.mark_power +=
+          (power > runs.mark_power ? 0.30F : 0.02F) * (power - runs.mark_power);
+    }
+    if (runs.mark_power < runs.space_power) {
+      // The assignment above cannot reorder the levels on real keying, but a
+      // collapsed model can cross them on noise. Keeping the order defined
+      // costs nothing and keeps the separation test below meaningful.
+      std::swap(runs.mark_power, runs.space_power);
+    }
+    const bool believable =
+        runs.mark_power >= runs.space_power * kKeyerRunLevelSeparation;
+    runs.believable_duty +=
+        0.002F * ((believable ? 1.0F : 0.0F) - runs.believable_duty);
+    if (!believable) {
+      // Not keyed, or not keyed clearly enough to time. Discard the window
+      // rather than pausing it, so an estimate is only ever made from one
+      // continuous stretch of believable keying.
+      //
+      // Stitching a window together across the gaps mattered, and measurably:
+      // a weak clean signal loses and regains a believable split many times a
+      // second, and the moments it is believable are precisely its loudest
+      // noise peaks, so a stitched window is assembled from the least
+      // representative frames it saw. Measured on the synthetic fixtures, that
+      // read a clean 16 WPM carrier at 12 dB as several keyers. The standing
+      // verdict is separate state and is not cleared here, so a station that
+      // simply stops sending keeps whatever was last decided about it.
+      runs.run_frames = 0;
+      return;
+    }
+    const float half_span_amplitude =
+        std::max(0.5F * (mark_amplitude - space_amplitude), 1.0e-9F);
+    const float hysteresis = kKeyerRunHysteresisFraction * half_span_amplitude;
+    const bool key_down =
+        runs.key_down ? amplitude > middle_amplitude - hysteresis
+                      : amplitude > middle_amplitude + hysteresis;
+    if (runs.run_frames != 0U && key_down != runs.key_down) {
+      runs.run_history[runs.run_index] = static_cast<std::uint16_t>(
+          std::min<std::uint32_t>(runs.run_frames, 65'535U));
+      runs.run_index =
+          (runs.run_index + 1U) % Track::KeyingRuns::kRunHistorySize;
+      runs.run_count = std::min(runs.run_count + 1U,
+                                Track::KeyingRuns::kRunHistorySize);
+      runs.run_frames = 0;
+    }
+    runs.key_down = key_down;
+    if (runs.run_frames < 65'535U) ++runs.run_frames;
+  };
+  observe(track.keyer_runs[0], narrow_snr_db);
+  observe(track.keyer_runs[1], wide_snr_db);
+
+  if (track.keyer_evaluation_countdown < kKeyerEvaluationFrames) {
+    ++track.keyer_evaluation_countdown;
+    return;
+  }
+  track.keyer_evaluation_countdown = 0;
+  const auto& narrow = track.keyer_runs[0];
+  const auto& wide = track.keyer_runs[1];
+  // Both windows full, or there is no measurement -- only an opinion formed
+  // from a handful of runs. A partly filled window is not evidence, and the
+  // safe reading of no evidence is the status quo, which is to publish.
+  if (narrow.run_count < Track::KeyingRuns::kRunHistorySize ||
+      wide.run_count < Track::KeyingRuns::kRunHistorySize) {
+    return;
+  }
+  const double narrow_wpm = cwKeyingSpeedFromRuns(
+      {narrow.run_history.data(), narrow.run_count}, evidence_frame_rate_hz);
+  const double wide_wpm = cwKeyingSpeedFromRuns(
+      {wide.run_history.data(), wide.run_count}, evidence_frame_rate_hz);
+  if (!(narrow_wpm > 0.0) || !(wide_wpm > 0.0)) return;
+  track.keyer_speed_ratio = static_cast<float>(wide_wpm / narrow_wpm);
+  // The ratio is recorded either way, because it is evidence a later stage can
+  // read, but it may only refuse a track when its reference half was solid.
+  if (narrow.believable_duty < kKeyerMinimumNarrowDuty) {
+    track.keyer_overlap_evaluations = 0;
+    track.keyer_single_evaluations = 0;
+    return;
+  }
+
+  const bool overlapping =
+      track.keyer_speed_ratio > config_.maximum_single_keyer_speed_ratio;
+  if (overlapping) {
+    track.keyer_single_evaluations = 0;
+    if (track.keyer_overlap_evaluations < kKeyerVerdictEvaluations)
+      ++track.keyer_overlap_evaluations;
+  } else {
+    track.keyer_overlap_evaluations = 0;
+    if (track.keyer_single_evaluations < kKeyerVerdictEvaluations)
+      ++track.keyer_single_evaluations;
+  }
+  if (overlapping &&
+      track.keyer_overlap_evaluations >= kKeyerVerdictEvaluations) {
+    track.keyer_overlap_unresolved = true;
+  }
+  if (!overlapping &&
+      track.keyer_single_evaluations >= kKeyerVerdictEvaluations) {
+    track.keyer_overlap_unresolved = false;
+  }
+}
+
 void CwChannelBank::updateVerification(Track& track,
                                        const std::uint64_t timestamp_ns) {
   const bool was_verified = track.verification_state == CwTrackState::Verified;
@@ -1890,7 +2243,18 @@ void CwChannelBank::updateVerification(Track& track,
           ? track.update.text.substr(track.update.text.size() -
                                      plausibility_window)
           : track.update.text;
-  if (isCharacterDistributionImplausible(
+  // A track already judged to hold several keyers is exempt from this gate.
+  // The gate demotes a track whose text reads as timing noise, on the grounds
+  // that a transcript like that is better explained by noise than by a
+  // station. For this track that question is already settled and settled the
+  // other way: the carrier is real, several stations are keying it, and the
+  // implausible text is the arithmetic of their sum rather than evidence about
+  // the carrier. Demoting on it would strip the marker, the frequency and the
+  // key-state occupancy from precisely the signal the operator is trying to
+  // see -- measured, it removes the published channel outright -- and it would
+  // protect nobody, because the text is withheld either way.
+  if (!track.keyer_overlap_unresolved &&
+      isCharacterDistributionImplausible(
           recent_text, config_.minimum_plausibility_check_characters,
           config_.maximum_simple_character_fraction)) {
     track.verification_state = CwTrackState::Candidate;
@@ -2015,6 +2379,19 @@ void CwChannelBank::updateVerification(Track& track,
     }
   }
 
+  // A verified track that could not be resolved to a single keyer is still a
+  // verified keyed carrier -- it has the persistence, the edges, the cadence
+  // and the coherence -- so it keeps the Verified state, its marker and its
+  // occupancy. What changes is the reason it reports, and that is what
+  // withholds its text downstream. Reusing the state machine rather than
+  // running a second one beside it means the silence follows the same
+  // acquisition, retention, colour and identity rules as everything else.
+  const auto verified_reason = [&track]() {
+    return track.keyer_overlap_unresolved
+               ? CwVerificationReason::UnresolvedKeyerOverlap
+               : CwVerificationReason::Verified;
+  };
+
   const auto enter_samples = static_cast<std::uint16_t>(std::clamp(
       std::lround(config_.verification_enter_seconds *
                   config_.evidence_rate_hz),
@@ -2029,7 +2406,7 @@ void CwChannelBank::updateVerification(Track& track,
       if (track.verification_fail_samples < exit_samples)
         ++track.verification_fail_samples;
       if (track.verification_fail_samples < exit_samples) {
-        track.verification_reason = CwVerificationReason::Verified;
+        track.verification_reason = verified_reason();
         return;
       }
     }
@@ -2042,7 +2419,7 @@ void CwChannelBank::updateVerification(Track& track,
   track.verification_fail_samples = 0;
   if (config_.minimum_verification_symbols == 0) {
     track.verification_state = CwTrackState::Verified;
-    track.verification_reason = CwVerificationReason::Verified;
+    track.verification_reason = verified_reason();
     if (!track.ever_verified)
       reanchorPresentationOnFirstVerification(track, timestamp_ns);
     track.ever_verified = true;
@@ -2064,7 +2441,7 @@ void CwChannelBank::updateVerification(Track& track,
 
   track.verification_pass_samples = enter_samples;
   track.verification_state = CwTrackState::Verified;
-  track.verification_reason = CwVerificationReason::Verified;
+  track.verification_reason = verified_reason();
   if (!track.ever_verified)
     reanchorPresentationOnFirstVerification(track, timestamp_ns);
   track.ever_verified = true;
@@ -2320,8 +2697,8 @@ void CwChannelBank::assignOrRefreshColor(
     }
   }
 
-  // With at most 24 tracked carriers and 24 palette entries, a free color is
-  // always expected. Keep a deterministic fallback for defensive robustness.
+  // There is one lease per addressable track slot, so a free color is always
+  // expected. Keep a deterministic fallback for defensive robustness.
   if (selected == kColorLeaseCount) {
     selected = static_cast<std::size_t>((track.id - 1U) % kColorLeaseCount);
   }
@@ -2432,6 +2809,15 @@ std::vector<CwTrackDiagnostic> CwChannelBank::allTrackDiagnostics() const {
             track.keying_level_explained_variation,
         .robust_keying_level_anchor_active =
             track.robust_keying_level_anchor_active,
+        .keyer_speed_ratio = track.keyer_speed_ratio,
+        .keyer_overlap_unresolved = track.keyer_overlap_unresolved,
+        .overlap_neighbour_count = track.overlap_neighbour_count,
+        .nearest_neighbour_separation_hz =
+            track.nearest_neighbour_separation_hz,
+        .joint_separation_candidate =
+            track.keyer_overlap_unresolved &&
+            track.overlap_neighbour_count + 1U <=
+                kJointSeparationMaximumSources,
         .text = suppressFragmentRuns(track.update.text),
         .refined_text = suppressFragmentRuns(track.update.refined_text),
         .acoustic_alternatives = track.update.acoustic_alternatives,
@@ -2549,20 +2935,29 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
         static_cast<long double>(timestamp_ns - track.last_candidate_match_ns) /
                 1'000'000'000.0L <=
             kCandidateMatchHoldSeconds;
+    // What this channel holds is a real signal the operator can see and tune
+    // to; what the decoder made of it is the sum of several keyers, which is
+    // not Morse. Publish the one and withhold the other. Everything that makes
+    // the track visible -- identity, colour, frequency, level, key state --
+    // survives untouched, and only the text and the station name it would have
+    // carried are held back.
+    const bool withhold_text = track.keyer_overlap_unresolved;
     std::string callsign;
     // Reconcile the independent literal and append-only refined paths. Shared
     // evidence settles disagreement; refinement remains usable when the
     // literal path's timing gate fails, but degluing a prosign cannot create a
     // stream label without an exact refined token.
     const std::string_view primary_for_callsign =
-        track.update.timing_quality >=
-                config_.minimum_verification_timing_quality
+        !withhold_text && track.update.timing_quality >=
+                              config_.minimum_verification_timing_quality
             ? std::string_view(track.update.text)
             : std::string_view{};
-    callsign = CallsignPolicy::best_complete_in_parallel_texts(
-                   primary_for_callsign, track.update.refined_text,
-                   operator_role_, config_.own_callsign)
-                   .value_or(std::string{});
+    callsign = withhold_text
+                   ? std::string{}
+                   : CallsignPolicy::best_complete_in_parallel_texts(
+                         primary_for_callsign, track.update.refined_text,
+                         operator_role_, config_.own_callsign)
+                         .value_or(std::string{});
     // Never label a stream with the operator's own callsign. It appears in
     // received text whenever somebody calls the operator, and a caller that
     // sends it repeatedly without ever completing its own would otherwise take
@@ -2621,23 +3016,40 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
         .mean_character_confidence = track.update.mean_character_confidence,
         .narrowband_coherence = track.narrowband_coherence,
         .key_transitions = track.update.key_transitions,
-        .characters = track.update.characters,
-        .text = suppressFragmentRuns(track.update.text),
-        .refined_text = suppressFragmentRuns(track.update.refined_text),
-        .acoustic_alternatives = track.update.acoustic_alternatives,
-        .provisional_text = track.update.provisional_text,
-        .pending_elements = track.update.pending_elements,
-        .transmissions = track.update.transmissions,
-        .sender_cadences = track.update.sender_cadences,
+        .characters = withhold_text ? std::vector<CwCharacterEvidence>{}
+                                    : track.update.characters,
+        .text = withhold_text ? std::string{}
+                              : suppressFragmentRuns(track.update.text),
+        .refined_text =
+            withhold_text ? std::string{}
+                          : suppressFragmentRuns(track.update.refined_text),
+        .acoustic_alternatives = withhold_text
+                                     ? std::vector<CwAcousticAlternative>{}
+                                     : track.update.acoustic_alternatives,
+        .provisional_text =
+            withhold_text ? std::string{} : track.update.provisional_text,
+        .pending_elements =
+            withhold_text ? std::string{} : track.update.pending_elements,
+        .transmissions = withhold_text ? std::vector<CwTransmissionTurn>{}
+                                       : track.update.transmissions,
+        .sender_cadences = withhold_text ? std::vector<CwSenderCadence>{}
+                                         : track.update.sender_cadences,
         .active_transmission_sequence =
-            track.update.active_transmission_sequence,
-        .current_sender_callsign = track.update.current_sender_callsign,
-        .current_sender_wpm = track.update.current_sender_wpm,
-        .contextual_text = track.update.contextual_text,
+            withhold_text ? 0U : track.update.active_transmission_sequence,
+        .current_sender_callsign =
+            withhold_text ? std::string{}
+                          : track.update.current_sender_callsign,
+        .current_sender_wpm =
+            withhold_text ? 0.0 : track.update.current_sender_wpm,
+        .contextual_text =
+            withhold_text ? std::string{} : track.update.contextual_text,
         .callsign = callsign,
         .qso_participants =
-            allocatedParticipants(
-                CallsignPolicy::qso_participants_in_text(track.update.text)),
+            withhold_text
+                ? std::vector<std::string>{}
+                : allocatedParticipants(
+                      CallsignPolicy::qso_participants_in_text(
+                          track.update.text)),
     };
 
     auto retained = std::find_if(
@@ -2667,7 +3079,11 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
       }
     }
     if (retained == retained_observations_.end()) {
-      if (retained_observations_.size() >= kColorLeaseCount) {
+      // One remembered region per addressable track slot. Sized by the track
+      // capacity rather than by the color-lease count, which happens to be the
+      // same number: what bounds this list is how many distinct streams can
+      // have existed, not how many colors there are to draw them in.
+      if (retained_observations_.size() >= kCwMaximumTrackCapacity) {
         retained = std::min_element(
             retained_observations_.begin(), retained_observations_.end(),
             [](const RetainedObservation& left,
@@ -2681,7 +3097,7 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
       }
       retained->source_track_id = track.id;
       retained->inherited_text_prefix.clear();
-      retained->confirmed_callsign.clear();
+      retained->label = {};
       retained->confirmed_qso_participants.clear();
     } else if (replacement) {
       // A replacement tracker at the same retained identity starts with a
@@ -2695,20 +3111,41 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
       // acoustic station identity. The replacement decoder must establish a
       // callsign from its own suffix; otherwise a different station appearing
       // on the same frequency inherits the predecessor's label indefinitely.
-      retained->confirmed_callsign.clear();
+      // The corroboration behind the old name goes with it: a successor must
+      // not have to out-argue evidence that was never about it.
+      retained->label = {};
     }
-    if (snapshot.callsign.empty()) {
-      snapshot.callsign = retained->confirmed_callsign;
-    } else {
-      retained->confirmed_callsign = snapshot.callsign;
-    }
-    if (snapshot.qso_participants.empty()) {
+    // Hysteresis, not a fresh verdict every frame. The reading above is
+    // recomputed from whatever text the window holds at this instant, so on
+    // its own it hands the stream's name to any momentary misdecode and takes
+    // it away again a frame later. A real capture read EH3ST eight times in a
+    // minute and EH3S, EH3SN, EHSMST and EG7S once each, and the operator saw
+    // the name change to each of them in turn. Folding the reading into the
+    // name already earned keeps the majority verdict and makes a rival pay the
+    // same price the incumbent paid.
+    retained->label = cwApplyStreamLabelReading(
+        std::move(retained->label), snapshot.callsign, primary_for_callsign,
+        track.update.refined_text);
+    // A withheld track keeps what it had earned but stops presenting it. The
+    // evidence is remembered rather than destroyed, so a station that is
+    // buried by a pileup and later heard clear again returns under its own
+    // name instead of as a new stream; but while it cannot be resolved, the
+    // name and the frozen predecessor text are exactly the parts an operator
+    // would act on, and neither is supported by what the channel is carrying
+    // now.
+    snapshot.callsign =
+        withhold_text ? std::string{} : retained->label.callsign;
+    if (withhold_text) {
+      snapshot.qso_participants.clear();
+    } else if (snapshot.qso_participants.empty()) {
       snapshot.qso_participants = retained->confirmed_qso_participants;
     } else {
       retained->confirmed_qso_participants = snapshot.qso_participants;
     }
     snapshot.text =
-        composePresentationText(retained->inherited_text_prefix, snapshot.text);
+        withhold_text ? std::string{}
+                      : composePresentationText(
+                            retained->inherited_text_prefix, snapshot.text);
     retained->snapshot = std::move(snapshot);
     retained->last_seen_ns = track.last_detected_ns;
     retained->refreshed = true;
@@ -2719,7 +3156,23 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
     const long double age_seconds =
         static_cast<long double>(timestamp_ns - observation.last_seen_ns) /
         1'000'000'000.0L;
-    return age_seconds > config_.decoded_track_retention_seconds;
+    // A stream that decoded and named its station is worth remembering longer
+    // than one that never said who it was: the operator is still looking for
+    // it, and the region carries a label they can act on. An anonymous or
+    // poorly copied stream leaves nothing to come back to, so it keeps the
+    // standard time.
+    //
+    // The identified test reads the latched callsign rather than the live
+    // verification state, because verification decays during the silence this
+    // rule exists to survive -- by the time expiry matters no track is still
+    // verified, and a present-state rule would grant the longer hold to
+    // nobody.
+    const double retention =
+        observation.label.callsign.empty()
+            ? config_.decoded_track_retention_seconds
+            : config_.decoded_track_retention_seconds *
+                  config_.identified_stream_retention_multiplier;
+    return age_seconds > static_cast<long double>(retention);
   };
   std::erase_if(retained_observations_, observation_expired);
 

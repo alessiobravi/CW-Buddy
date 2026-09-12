@@ -36,10 +36,29 @@ enum class CwVerificationReason : std::uint8_t {
   ImplausibleCharacterDistribution,
   Verified,
   SignalLost,
+  // A real keyed carrier that holds more than one keyer, and that the ordinary
+  // per-signal filter cannot separate. The track keeps its detection,
+  // frequency, marker and key-state occupancy; only its open-ended text is
+  // withheld, because the sum of two keyers is not Morse and a transcript of
+  // it misleads the operator about what is on the frequency.
+  //
+  // This is a statement about the effort spent so far, not a permanent
+  // verdict. Carriers this close cannot be separated by narrowing a filter --
+  // measured, a 30 Hz filter makes the timing statistics plausible again and
+  // leaves the text noise -- but they can be separated by solving neighbouring
+  // carriers jointly, which is expensive and belongs in the signal path rather
+  // than here. A track refused here therefore also carries, in its diagnostic,
+  // how crowded its neighbourhood is and by how much its speed estimate
+  // diverged, so a later stage can pick the ones worth that work.
+  //
+  // Appended after SignalLost rather than filed next to the other post-Morse
+  // gates on purpose: the replay model reconstructs a reason from its stored
+  // ordinal, so no existing value's index may move.
+  UnresolvedKeyerOverlap,
 };
 
 inline constexpr std::size_t kCwVerificationReasonCount =
-    static_cast<std::size_t>(CwVerificationReason::SignalLost) + 1U;
+    static_cast<std::size_t>(CwVerificationReason::UnresolvedKeyerOverlap) + 1U;
 
 [[nodiscard]] const char* cwTrackStateName(CwTrackState state) noexcept;
 // Whether decoded text contains a token distinctive enough that its presence is
@@ -74,6 +93,92 @@ inline constexpr std::size_t kCwVerificationReasonCount =
 [[nodiscard]] bool isCharacterDistributionImplausible(
     const std::string& text, std::uint16_t minimum_characters,
     float maximum_simple_character_fraction) noexcept;
+
+// Keying speed, in words per minute, implied by a window of observed key-run
+// lengths measured in evidence frames.
+//
+// The median run is read as one element. In ordinary Morse the one-unit runs
+// -- the dits and the gaps between elements inside a character -- outnumber
+// every longer run, so the median lands on an element rather than between the
+// element lengths, and a minority of runs that a noise excursion split or
+// merged cannot move it. A mean can, which is the whole reason for taking the
+// median: this measure exists to be compared against itself at another filter
+// width, so it has to answer the same way about the same keying twice.
+//
+// Returns zero for an empty window or a non-positive frame rate, which callers
+// read as "no estimate" rather than as a slow signal.
+[[nodiscard]] double cwKeyingSpeedFromRuns(
+    std::span<const std::uint16_t> run_frames, double frame_rate_hz) noexcept;
+
+// How many times a callsign must have been read before the name it gives a
+// stream stops following the newest reading and starts resisting it.
+//
+// Two, because that is the smallest number that separates the two populations
+// an operator actually sees. A station identifies repeatedly -- a captured
+// minute of one real stream read EH3ST eight times -- while the misdecodes
+// around it (EH3S, EH3SN, EHSMST, EG7S) each appeared once and never again.
+// One reading cannot tell those apart; two already can.
+inline constexpr std::uint32_t kCwStreamLabelCorroborations = 2;
+
+// Whole-token occurrences of `callsign` in `text`, where a token is bounded by
+// anything that is not a letter, digit or slash. Substring matching would
+// count the DK7SS inside a glued VDK7SSK, which is a different decode, not
+// another reading of the same one.
+[[nodiscard]] std::uint32_t cwCountCallsignOccurrences(
+    std::string_view text, std::string_view callsign) noexcept;
+
+// The evidence behind the name one stream currently wears.
+//
+// `support` is the strongest corroboration seen for `callsign` for as long as
+// that name stands, so it never falls back while the name holds. That is what
+// makes the name survive its own transmission scrolling out of the live text
+// window: the evidence is remembered, not re-derived from the text on screen.
+struct CwStreamLabel {
+  std::string callsign;
+  std::string challenger;
+  std::uint32_t support{0};
+  std::uint32_t challenger_support{0};
+};
+
+// Folds one reading of a stream's station name into the name it already wears.
+//
+// The reading must already have been vetted -- complete, not the operator's
+// own call, and opening on an allocated prefix -- because this function only
+// weighs evidence and never judges a callsign's plausibility.
+//
+// Hysteresis, in three rules. An empty reading changes nothing at all: a
+// station that has stopped sending, or a few seconds of copy too poor to read
+// a call out of, is not evidence that a different station has arrived. Below
+// `corroborations` the name is provisional and simply follows the newest
+// reading, which is how a stream gets named the moment it first identifies.
+// At or above it the name is established, and a disagreeing reading becomes a
+// challenger that has to reach the same bar itself before it takes over; any
+// reading that agrees with the established name discards the challenger
+// outright.
+//
+// Support comes from the strongest of the two decoded paths rather than their
+// sum, because the literal and refined texts are two readings of one
+// transmission and counting both would let a single identification establish a
+// name on its own.
+[[nodiscard]] CwStreamLabel cwApplyStreamLabelReading(
+    CwStreamLabel label, std::string_view reading,
+    std::string_view primary_text, std::string_view refined_text,
+    std::uint32_t corroborations = kCwStreamLabelCorroborations);
+
+// Hard ceiling on `CwChannelBankConfig::maximum_tracks`, and the size of every
+// fixed array the bank indexes by track slot or by color index.
+//
+// It is not the default: the default is a processor budget (see
+// `maximum_tracks`), while this is the point past which the fixed storage
+// itself stops being reasonable. Two independent limits fix it. A track's
+// `color_index` is a `std::uint8_t`, so no more than 256 distinct colors can
+// ever be addressed; and the arrays sized by this constant are members of the
+// bank, so a value in the thousands would put hundreds of kilobytes on a
+// structure that an audio thread touches. 128 leaves an operator with a large
+// machine roughly twice the measured default to spend, which is more headroom
+// than any capture in the corpus has asked for, and costs about three
+// kilobytes of leases and one of monitor slots.
+inline constexpr std::size_t kCwMaximumTrackCapacity = 128;
 
 struct CwChannelBankConfig {
   // The operator's own callsign, normalized, or empty when unset. A stream is
@@ -111,6 +216,21 @@ struct CwChannelBankConfig {
   double empty_track_retention_seconds{2.0};
   double decoded_track_retention_seconds{30.0};
   double unverified_track_retention_seconds{0.75};
+  // A stream that decoded well enough to name its station keeps its place in
+  // the display for this multiple of the decoded retention above. Every other
+  // stream keeps the plain value, so a poor or anonymous decode fades on the
+  // standard clock.
+  //
+  // This multiplies the display's retained-observation lifetime and nothing
+  // else. It is deliberately not part of track expiry: a Track owns a decoder,
+  // a slot in the bounded bank and a frequency cell that a genuinely new
+  // station has to be able to take over, and a real new signal on a frequency
+  // is better evidence than the memory of an old one. An earlier attempt that
+  // held an identified track alive twice as long stopped exactly that takeover
+  // and silently broke identity inheritance. What outlives the signal is the
+  // remembered region on the waterfall, which is a display concern and already
+  // has its own lifetime.
+  double identified_stream_retention_multiplier{2.0};
   // How long a track carried out of the processed passband by a receiver
   // retune is held before it is given up.
   //
@@ -130,7 +250,51 @@ struct CwChannelBankConfig {
   double narrowband_width_hz{120.0};
   double noise_reference_offset_hz{300.0};
   double evidence_rate_hz{500.0};
-  std::size_t maximum_tracks{24};
+  // How many carriers the bank follows at once, clamped to
+  // `kCwMaximumTrackCapacity`.
+  //
+  // This was 24 for no measured reason: the display palette happened to hold
+  // 24 hand-written colors, the color-lease array was sized to match it, and
+  // the track cap was sized to match that. So the number of stations the
+  // decoder could follow was set by the length of a table of hex strings.
+  //
+  // What it has to cover is a pileup. An operator capture of a real one holds
+  // about 50 stations inside a 6 kHz window, at a median spacing of 70 Hz and
+  // a minimum of 52 Hz -- both above `minimum_separation_hz`, so every one of
+  // them is a carrier this bank can resolve and would have to drop. The cap
+  // also silently falsified its own diagnostics while it was in force: every
+  // live record read `tracks: 24` exactly, which looks like a busy band and
+  // was the bank saturated against the cap.
+  //
+  // 64 is where that demand meets a processor budget. Measured on this machine
+  // with an optimized core, driving the bank with the capture's own geometry
+  // -- a 6 kHz analyzed window, carriers 58 Hz apart, 10 ms blocks -- over
+  // repeated twenty-second runs, the whole bank costs 2.0 to 2.1% of one core
+  // at 24 tracks, 3.6 to 3.7% at 48, 4.9 to 5.1% at 64 and 7.2 to 7.5% at 96.
+  // Per track that is 0.086%, 0.076%, 0.078% and 0.078%: flat above 24, so the
+  // cost is simply linear in the cap and the cap is simply a budget. The worst
+  // single block in any run was 1.7 ms at 24 tracks, 1.8 ms at 48, 2.0 ms at 64
+  // and 3.4 ms at 96, against a 10 ms block period.
+  //
+  // The budget held here is a twentieth of one core, and no observed block over
+  // a fifth of its own period -- so the audio thread, the display and the
+  // optional character model still have a machine to run on, and no block
+  // approaches its deadline. 64 tracks sits at both limits, covers the
+  // 50-station pileup with room above it, and costs two and a half times what
+  // 24 did on a load 24 could not carry at all. 96 was measured and rejected:
+  // it breaks both limits by half, and buys capacity no capture in the corpus
+  // has ever asked for.
+  //
+  // The same measurement unoptimized, for comparison with the figure this
+  // replaces: 20% of one core at 24 tracks and 51% at 64. A debug build costs
+  // about ten times a release one here, which is worth knowing before reading
+  // a profile taken from one.
+  //
+  // Deliberately configurable in both directions rather than fixed, because
+  // the measurement is one machine's. An operator on a small one lowers it and
+  // pays in stations; one on a large one raises it to
+  // `kCwMaximumTrackCapacity`.
+  std::size_t maximum_tracks{64};
   // Keep the fast per-frame level tracker anchored to two robust modes from a
   // short history. Exposed to the core benchmark so the production path can
   // be compared with its exact pre-anchor baseline on identical audio; normal
@@ -188,6 +352,35 @@ struct CwChannelBankConfig {
   double verification_enter_seconds{0.50};
   double verification_exit_seconds{6.0};
   double decoder_recovery_seconds{3.0};
+  // Judge whether each track holds one keyer or several, and withhold the
+  // open-ended text of the ones that hold several. Exposed so the production
+  // path can be measured against its exact pre-gate baseline on identical
+  // audio; normal application configurations leave this enabled.
+  bool resolve_overlapping_keyers{true};
+  // Above this ratio of the keying-speed estimate at the widest analysis
+  // filter to the estimate at the narrowest, the channel is judged to hold
+  // more than one keyer.
+  //
+  // One keyer reads nearly the same speed at both widths, because widening the
+  // filter admits more noise but no more keying. Several keyers closer
+  // together than any usable filter do not: the wider filter admits the
+  // neighbours, their sum beats and their runs fragment, and the estimate
+  // roughly doubles.
+  //
+  // The evidence is one operator capture of a real DX pileup -- about fifty
+  // stations in six kilohertz, median spacing 70 Hz, minimum 52 Hz. Of the
+  // twenty-one carriers measured in it exactly one read as a single keyer, and
+  // it is the one that decodes cleanly: 20.6 WPM at 60 Hz against 24.4 WPM at
+  // 240 Hz, a ratio of 1.19. The next-nearest carrier ratio was 1.83 and the
+  // rest ran to 3.50. The default sits in that gap, nearer the population that
+  // must keep decoding than the one that must be silenced.
+  //
+  // One clean carrier in one capture is thin evidence for a constant, which is
+  // why this is configurable rather than compiled in. The clamp keeps it
+  // inside the range where it can still mean something: below about 1.25 a
+  // clean but noisy signal would be silenced, and above 4 nothing measured
+  // here would ever fire.
+  float maximum_single_keyer_speed_ratio{1.5F};
 };
 
 struct CwVerificationDiagnostics {
@@ -202,6 +395,14 @@ struct CwVerificationDiagnostics {
   // has never been needed; a non-zero count on air is the evidence that it is
   // worth keeping.
   std::size_t pattern_verified_tracks{0};
+  // Verified tracks currently judged to hold more than one keyer, whose text
+  // is therefore withheld while their occupancy is still published. In a
+  // pileup this is most of the window; on a quiet band it should be zero.
+  std::size_t unresolved_overlap_tracks{0};
+  // Of those, the ones whose neighbourhood is sparse enough that a later joint
+  // separation stage could be conditioned. This is the work queue that stage
+  // would read; the remainder are genuinely too crowded to attempt.
+  std::size_t joint_separation_candidates{0};
   std::uint32_t maximum_decoded_symbols{0};
   std::uint32_t maximum_key_transitions{0};
   float best_timing_quality{0.0F};
@@ -292,6 +493,26 @@ struct CwTrackDiagnostic {
   float keying_level_separation_db{0.0F};
   float keying_level_explained_variation{0.0F};
   bool robust_keying_level_anchor_active{false};
+  // Keying speed measured at the widest analysis filter divided by the same
+  // measure at the narrowest. Zero until both widths have carried enough
+  // keying to answer. One keyer holds near unity; several superimposed run to
+  // two or three.
+  float keyer_speed_ratio{0.0F};
+  // The standing verdict that ratio produced, after hysteresis. True means
+  // "not resolved by the effort spent so far", not "unresolvable".
+  bool keyer_overlap_unresolved{false};
+  // The evidence a later, more expensive separation stage needs in order to
+  // choose which refused tracks are worth attempting: how many other tracked
+  // carriers sit inside the neighbourhood such a stage would have to solve
+  // jointly, and how far away the closest of them is. Joint estimation is
+  // conditioned by the number of sources, so these say whether the problem is
+  // a three-source one worth solving or a seven-source one that is not.
+  std::uint8_t overlap_neighbour_count{0};
+  double nearest_neighbour_separation_hz{0.0};
+  // An unresolved track whose neighbourhood is sparse enough for joint
+  // estimation to be conditioned. Withheld text either way; this only marks it
+  // as worth a second attempt rather than written off.
+  bool joint_separation_candidate{false};
   std::string text;
   std::string refined_text;
   std::vector<CwAcousticAlternative> acoustic_alternatives;
@@ -532,6 +753,50 @@ class CwChannelBank {
     float keying_level_explained_variation{0.0F};
     bool robust_keying_level_anchor_active{false};
 
+    // One analysis width's key-run history, kept only to estimate how fast
+    // this channel appears to be keyed when heard through that width.
+    //
+    // The two-level tracker here is deliberately cruder than the decoder's.
+    // The decoder wants the best possible decision about each element; this
+    // wants to count how often the envelope crosses between its own two
+    // levels, and a soft decision would blur exactly the fragmentation being
+    // measured. It also carries no minimum separation floor, unlike the
+    // decoder's: a model that collapses onto one point means the channel is
+    // not keyed at all right now, and that is the honest answer to admit
+    // rather than a state to be prevented.
+    struct KeyingRuns {
+      float space_power{0.0F};
+      float mark_power{0.0F};
+      bool initialized{false};
+      bool key_down{false};
+      // Fraction of recent frames on which this width showed a believable
+      // two-level split. Smoothed over about a second, so an ordinary word gap
+      // barely moves it while a channel that only occasionally looks keyed
+      // cannot pretend otherwise.
+      float believable_duty{0.0F};
+      std::uint32_t run_frames{0};
+      static constexpr std::size_t kRunHistorySize = 64;
+      std::array<std::uint16_t, kRunHistorySize> run_history{};
+      std::size_t run_count{0};
+      std::size_t run_index{0};
+    };
+    // Index 0 is the narrowest analysis width, index 1 the widest.
+    std::array<KeyingRuns, 2> keyer_runs{};
+    std::uint16_t keyer_evaluation_countdown{0};
+    float keyer_speed_ratio{0.0F};
+    bool keyer_overlap_unresolved{false};
+    // Consecutive ratio evaluations agreeing with each verdict. A verdict only
+    // changes once one of these reaches the required run, so a single
+    // measurement -- a pileup momentarily thinning, a DX pausing mid-word --
+    // cannot flip the track between publishing text and withholding it.
+    std::uint8_t keyer_overlap_evaluations{0};
+    std::uint8_t keyer_single_evaluations{0};
+    // How crowded this carrier's neighbourhood is, refreshed once per audio
+    // block from the other live tracks. Recorded for every track, not only
+    // refused ones, so the figure is available the moment a verdict changes.
+    std::uint8_t overlap_neighbour_count{0};
+    double nearest_neighbour_separation_hz{0.0};
+
     std::array<std::array<std::complex<float>, 3>, 3> center_filters{};
     std::array<std::complex<float>, 3> lower_filter{};
     std::array<std::complex<float>, 3> upper_filter{};
@@ -585,13 +850,41 @@ class CwChannelBank {
     // through callsign scoring or appended again on the next refresh.
     std::uint64_t source_track_id{0};
     std::string inherited_text_prefix;
-    std::string confirmed_callsign;
+    // The station name this observation earned, latched for as long as one
+    // source track owns the slot, together with the evidence that earned it
+    // and whatever is currently arguing against it. It is also what marks the
+    // observation as identified for retention: a callsign only lands here
+    // after a verified track decoded a complete, allocated call, and it
+    // survives the call scrolling out of the live text window -- which a rule
+    // keyed on the present verification state cannot, because verification
+    // decays while a station is not sending. Replacement below resets the
+    // whole label, so a successor neither wears the predecessor's name, nor
+    // inherits its longer hold, nor has to out-argue evidence that was never
+    // about itself.
+    CwStreamLabel label;
     std::vector<std::string> confirmed_qso_participants;
     std::uint64_t last_seen_ns{0};
     bool refreshed{false};
   };
 
-  static constexpr std::size_t kColorLeaseCount = 24;
+  // One color lease per addressable track slot, not per palette entry.
+  //
+  // It used to be 24 because the display held 24 hand-written colors, and the
+  // track cap was then sized down to it. Now the display generates a color for
+  // any index, so the palette imposes no limit and the question is only what
+  // the lease table is for. It is what stops two concurrently published tracks
+  // from wearing the same color, and it is what remembers a color for a
+  // frequency across `color_identity_retention_seconds`. Both jobs need one
+  // slot per track that can exist at once; with fewer, `assignOrRefreshColor`
+  // would find every lease taken as soon as the bank filled, fall through to
+  // its modulo fallback, and hand neighbouring carriers matching colors --
+  // exactly when the operator needs them apart.
+  //
+  // Letting colors repeat instead was the alternative, and it is the wrong
+  // trade here: repeating costs nothing while two stations sharing a color sit
+  // kilohertz apart, but nothing keeps them apart, and the readability this
+  // buys back is worth four bytes per slot.
+  static constexpr std::size_t kColorLeaseCount = kCwMaximumTrackCapacity;
 
   [[nodiscard]] float estimateNoise(std::span<const float> bins_dbfs) const;
   [[nodiscard]] float spectralSnr(const Track& track, double lower_frequency_hz,
@@ -616,6 +909,17 @@ class CwChannelBank {
   // the IQ decoder window, so the two cannot disagree about what "out of band"
   // means.
   void parkTracksOutsideBand(std::uint64_t timestamp_ns) noexcept;
+  // Folds one evidence frame's narrow- and wide-filter levels into the
+  // keying-speed estimates, and periodically turns the pair into a standing
+  // verdict about how many keyers this channel holds.
+  void updateKeyerResolution(Track& track, float narrow_snr_db,
+                             float wide_snr_db,
+                             double evidence_frame_rate_hz) noexcept;
+  // Records, for every track, how many other tracked carriers a joint
+  // separation stage would have to solve alongside it and how close the
+  // nearest of them is. Run once per audio block rather than per track,
+  // because it is one pass over a list every track shares.
+  void measureTrackNeighbourhoods() noexcept;
   void updateVerification(Track& track, std::uint64_t timestamp_ns);
   void recoverRejectedDecoder(Track& track);
   void assignOrRefreshColor(Track& track, std::uint64_t timestamp_ns) noexcept;
@@ -638,7 +942,13 @@ class CwChannelBank {
   std::array<ColorLease, kColorLeaseCount> color_leases_{};
   std::uint64_t next_track_id_{1};
   CwMonitorMode monitor_mode_{CwMonitorMode::Off};
-  std::array<std::uint64_t, kColorLeaseCount> monitored_track_ids_{};
+  // One monitor slot per addressable track slot, so every track the bank can
+  // hold is a track the operator can put in the headphones. Sized by the track
+  // capacity rather than by the color-lease count it used to borrow: the two
+  // numbers are equal, but a monitor array has nothing to do with colors, and
+  // taking its size from them is how the track cap came to be set by a palette
+  // in the first place.
+  std::array<std::uint64_t, kCwMaximumTrackCapacity> monitored_track_ids_{};
   std::size_t monitored_track_count_{0};
   double monitor_reference_tone_hz_{700.0};
   std::complex<float> monitor_oscillator_{1.0F, 0.0F};
