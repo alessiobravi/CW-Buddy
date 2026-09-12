@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include "cwassistant/core/iq_replay_source.hpp"
 #include "cwassistant/core/iq_writer.hpp"
 #include "cwassistant/core/sample_block.hpp"
 
@@ -435,6 +436,417 @@ void testMalformedInputIsRefused() {
   remove_recording(second);
 }
 
+// ---------------------------------------------------------------------------
+// IqReplaySource -- the inverse of the writer above. Without it a capture is
+// write-only: the application can record an off-air pileup but cannot feed one
+// back through the decoder, so every regression measurement is confined to the
+// single-station WAV corpus.
+// ---------------------------------------------------------------------------
+
+// The writer's own rounding, duplicated here on purpose. If it and the reader
+// ever disagree about the scale, this test must be the thing that notices.
+std::int16_t quantize_i16(const float value) {
+  const float clamped = std::clamp(value, -1.0F, 1.0F);
+  return static_cast<std::int16_t>(std::lround(clamped * 32'767.0F));
+}
+
+float dequantize_i16(const std::int16_t value) {
+  return static_cast<float>(value) / 32'767.0F;
+}
+
+std::vector<std::complex<float>> testSignal(const std::size_t count) {
+  std::vector<std::complex<float>> samples;
+  samples.reserve(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    const auto phase = static_cast<float>(index) * 0.037F;
+    samples.push_back({0.8F * std::sin(phase), 0.8F * std::cos(phase * 1.3F)});
+  }
+  return samples;
+}
+
+// Records `samples` through IqWriter in live-sized blocks, so the fixture is
+// produced by exactly the code path an operator capture goes through.
+bool writeRecording(const std::filesystem::path& path,
+                    const cwassistant::core::IqCaptureMetadata& metadata,
+                    const std::vector<std::complex<float>>& samples) {
+  using namespace cwassistant::core;
+  IqWriter writer;
+  if (!writer.open(path.string(), metadata)) return false;
+  RealtimeSampleBlock block;
+  block.stream = {.kind = StreamKind::ComplexIq,
+                  .sample_rate_hz = metadata.sample_rate_hz,
+                  .center_frequency_hz = metadata.center_frequency_hz,
+                  .channel_count = 1};
+  const std::size_t capacity = block.samples.size();
+  for (std::size_t offset = 0; offset < samples.size(); offset += capacity) {
+    const std::size_t count = std::min(capacity, samples.size() - offset);
+    block.sample_count = count;
+    for (std::size_t index = 0; index < count; ++index) {
+      block.samples[index] = samples[offset + index];
+    }
+    if (!writer.writeBlock(block)) return false;
+  }
+  writer.close();
+  return true;
+}
+
+void write_text(const std::filesystem::path& path, const std::string& text) {
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file.write(text.data(), static_cast<std::streamsize>(text.size()));
+}
+
+// The contract in one test: whatever the writer recorded, the reader returns,
+// at the writer's own scale, with the stream the sidecar describes. It is also
+// the mutation proof for the format details -- the byte order, the interleave
+// and the 32767 scale all fail here together if any of them is changed.
+void testReplayRoundTripsTheWriter() {
+  using namespace cwassistant::core;
+  const auto path = scratch_path("cwa_iq_replay_roundtrip.sigmf-data");
+  remove_recording(path);
+
+  auto metadata = metadataFor(IqSampleFormat::Ci16Le, 62'500.0, 14'025'000.0);
+  metadata.hardware = "Reference receiver";
+  metadata.description = "Contest pileup fixture";
+  const auto samples = testSignal(9'000);
+  expect(writeRecording(path, metadata, samples),
+         "the fixture recording is written");
+
+  IqReplaySource source;
+  expect(source.open(path.string(), {.kind = StreamKind::ComplexIq}),
+         std::string("the recording opens: ") + source.last_error());
+  expect(source.stream_descriptor().kind == StreamKind::ComplexIq,
+         "replay presents a complex-IQ stream, not a downmixed audio one");
+  expect(source.stream_descriptor().sample_rate_hz == 62'500.0,
+         "the sample rate comes from the sidecar");
+  expect(source.stream_descriptor().center_frequency_hz == 14'025'000.0,
+         "the centre frequency comes from the sidecar");
+  expect(source.total_frames() == samples.size(),
+         "every recorded sample is available for replay");
+  expect(!source.ends_mid_sample(),
+         "a cleanly closed recording does not end mid-sample");
+  expect(source.capture_metadata().hardware == "Reference receiver",
+         "the receiver description survives the round trip");
+  expect(std::abs(source.duration_seconds() - 0.144) < 1e-9,
+         "the duration follows from the sample count and the sidecar rate");
+
+  expect(source.start(), "replay starts");
+  RealtimeSampleBlock block;
+  std::vector<std::complex<float>> replayed;
+  std::vector<std::size_t> counts;
+  std::uint64_t expected_sequence = 0;
+  bool sequence_ok = true;
+  bool stream_ok = true;
+  while (source.read(block, std::chrono::milliseconds(0))) {
+    if (block.sequence != expected_sequence++) sequence_ok = false;
+    if (block.stream.kind != StreamKind::ComplexIq ||
+        block.stream.sample_rate_hz != 62'500.0 ||
+        block.stream.center_frequency_hz != 14'025'000.0) {
+      stream_ok = false;
+    }
+    counts.push_back(block.sample_count);
+    for (std::size_t index = 0; index < block.sample_count; ++index) {
+      replayed.push_back(block.samples[index]);
+    }
+  }
+
+  expect(replayed.size() == samples.size(),
+         "replay returns exactly the recorded sample count");
+  bool identical = replayed.size() == samples.size();
+  for (std::size_t index = 0; index < replayed.size() && identical; ++index) {
+    const std::complex<float> want{
+        dequantize_i16(quantize_i16(samples[index].real())),
+        dequantize_i16(quantize_i16(samples[index].imag()))};
+    if (replayed[index] != want) identical = false;
+  }
+  expect(identical,
+         "every sample returns at the writer's own ci16 scale, both "
+         "components, in interleaved order");
+  expect(counts.size() == 3 && counts[0] == 4'096 && counts[1] == 4'096 &&
+             counts[2] == 808,
+         "the recording is delivered in fixed-capacity blocks like a live SDR");
+  expect(sequence_ok,
+         "block sequence numbers increase from zero as the live path's do");
+  expect(stream_ok, "every block carries the recorded stream descriptor");
+  expect(!source.read(block, std::chrono::milliseconds(0)),
+         "replay stops at the end of the recording");
+
+  remove_recording(path);
+}
+
+// cf32 exists for the case where the scaling itself is under investigation, so
+// its round trip must be bit-exact -- including the over-unity samples an
+// overloaded front end produces, which are the evidence such a capture is
+// made to preserve.
+void testReplayIsBitExactForComplexFloat() {
+  using namespace cwassistant::core;
+  const auto path = scratch_path("cwa_iq_replay_cf32.sigmf-data");
+  remove_recording(path);
+
+  const std::vector<std::complex<float>> samples{
+      {0.0F, 0.5F},   {0.25F, -0.25F},  {-0.5F, 0.0F},
+      {1.5F, -1.25F}, {0.125F, 0.75F},  {-0.937'5F, 0.062'5F}};
+  expect(writeRecording(
+             path, metadataFor(IqSampleFormat::Cf32Le, 48'000.0, 7'030'000.0),
+             samples),
+         "a cf32 fixture is written");
+
+  IqReplaySource source;
+  expect(source.open(path.string(), {.kind = StreamKind::ComplexIq}),
+         std::string("the cf32 recording opens: ") + source.last_error());
+  expect(source.capture_metadata().format == IqSampleFormat::Cf32Le,
+         "the sample format comes from the sidecar, not from a default");
+  expect(source.total_frames() == samples.size(),
+         "cf32 costs eight bytes per complex sample and the count reflects it");
+  expect(source.start(), "cf32 replay starts");
+
+  RealtimeSampleBlock block;
+  std::vector<std::complex<float>> replayed;
+  while (source.read(block, std::chrono::milliseconds(0))) {
+    for (std::size_t index = 0; index < block.sample_count; ++index) {
+      replayed.push_back(block.samples[index]);
+    }
+  }
+  expect(replayed == samples,
+         "cf32 replay is bit-exact, over-unity samples included");
+
+  remove_recording(path);
+}
+
+// A capture the operator stops, or one a power loss ends, can stop part way
+// through a sample. Every whole sample before that point is a real
+// measurement; discarding the recording over a few trailing bytes would throw
+// away the entire off-air capture.
+void testTruncatedRecordingReplaysEveryWholeSample() {
+  using namespace cwassistant::core;
+  const auto path = scratch_path("cwa_iq_replay_truncated.sigmf-data");
+  remove_recording(path);
+
+  const auto samples = testSignal(10);
+  expect(writeRecording(
+             path, metadataFor(IqSampleFormat::Ci16Le, 96'000.0, 3'573'000.0),
+             samples),
+         "a short fixture is written");
+
+  // Nine whole ci16 samples plus half of the tenth.
+  std::error_code error;
+  std::filesystem::resize_file(path, 9 * 4 + 2, error);
+  expect(!error, "the fixture can be truncated mid-sample");
+
+  IqReplaySource source;
+  expect(source.open(path.string(), {.kind = StreamKind::ComplexIq}),
+         std::string("a truncated recording still opens: ") +
+             source.last_error());
+  expect(source.total_frames() == 9,
+         "replay covers every whole sample before the truncation");
+  expect(source.ends_mid_sample(),
+         "the partial trailing sample is reported, not silently ignored");
+  expect(source.declared_sample_count() == 10,
+         "the sidecar still claims what the writer believed it had written");
+  expect(source.start(), "a truncated recording replays");
+
+  RealtimeSampleBlock block;
+  std::size_t returned = 0;
+  bool identical = true;
+  while (source.read(block, std::chrono::milliseconds(0))) {
+    for (std::size_t index = 0; index < block.sample_count; ++index) {
+      const std::complex<float> want{
+          dequantize_i16(quantize_i16(samples[returned].real())),
+          dequantize_i16(quantize_i16(samples[returned].imag()))};
+      if (block.samples[index] != want) identical = false;
+      ++returned;
+    }
+  }
+  expect(returned == 9, "exactly the whole samples are handed on");
+  expect(identical, "the surviving samples are unchanged by the truncation");
+  expect(!source.read(block, std::chrono::milliseconds(0)),
+         "replay ends cleanly at the last whole sample");
+
+  remove_recording(path);
+}
+
+// The sidecar is the only record of the rate, the centre frequency and the
+// sample format. A reader that guessed any of them when the file failed to
+// state it would replay a capture at a rate nobody recorded it at, or report
+// every station in it on the wrong frequency, while looking entirely healthy.
+void testMalformedMetadataIsRefused() {
+  using namespace cwassistant::core;
+  const auto path = scratch_path("cwa_iq_replay_malformed.sigmf-data");
+  const std::filesystem::path metadata_path(
+      IqWriter::metadataPathFor(path.string()));
+  remove_recording(path);
+
+  expect(writeRecording(
+             path, metadataFor(IqSampleFormat::Ci16Le, 62'500.0, 14'025'000.0),
+             testSignal(4)),
+         "a valid recording is written to damage");
+  const std::string good = read_text(metadata_path);
+  expect(!good.empty(), "the sidecar is readable");
+
+  const auto refuse = [&](const std::string& sidecar,
+                          const std::string_view expected_fragment,
+                          const std::string_view why) {
+    write_text(metadata_path, sidecar);
+    IqReplaySource source;
+    const bool opened =
+        source.open(path.string(), {.kind = StreamKind::ComplexIq});
+    expect(!opened, why);
+    expect(contains(source.last_error(), expected_fragment),
+           std::string("the refusal says why (wanted \"") +
+               std::string(expected_fragment) + "\", got \"" +
+               source.last_error() + "\")");
+    // Nothing is left behind that a caller could mistake for a real stream.
+    expect(source.stream_descriptor().sample_rate_hz == 0.0 &&
+               source.total_frames() == 0,
+           "a refused recording exposes no guessed sample rate or length");
+  };
+
+  const auto replaced = [&](const std::string_view from,
+                            const std::string_view to) {
+    std::string text = good;
+    const auto position = text.find(from);
+    if (position != std::string::npos) {
+      text.replace(position, from.size(), to);
+    }
+    return text;
+  };
+
+  refuse(good.substr(0, good.size() / 2), "not valid JSON",
+         "a half-written sidecar is refused");
+  refuse(replaced("\"ci16_le\"", "\"cu8\""), "Unsupported SigMF datatype",
+         "an unsupported datatype is refused rather than decoded as ci16");
+  refuse(replaced("\"core:sample_rate\"", "\"core:sample_rat\""),
+         "core:sample_rate", "a missing sample rate is refused");
+  refuse(replaced("\"core:frequency\"", "\"core:frequencx\""),
+         "core:frequency", "a capture segment without a centre frequency is refused");
+  refuse(replaced("\"core:datatype\"", "\"core:datatyp\""), "core:datatype",
+         "a missing datatype is refused");
+  refuse(replaced("\"captures\"", "\"capture\""), "capture segment",
+         "a sidecar with no captures array is refused");
+  refuse(replaced("\"core:sample_rate\": ",
+                  "\"core:sample_rate\": 48000,\n    \"core:sample_rate\": "),
+         "duplicate member name",
+         "a sidecar stating two different sample rates is refused, not "
+         "silently resolved to one of them");
+  refuse(good + "}", "trailing content",
+         "trailing content after the document is refused");
+  refuse(replaced("\"core:sample_rate\": 62500", "\"core:sample_rate\": 06250"),
+         "leading zero",
+         "a number that is not valid JSON is refused rather than read "
+         "digit by digit");
+
+  std::error_code error;
+  std::filesystem::remove(metadata_path, error);
+  IqReplaySource orphan;
+  expect(!orphan.open(path.string(), {.kind = StreamKind::ComplexIq}),
+         "a recording with no sidecar at all is refused");
+  expect(contains(orphan.last_error(), "metadata"),
+         "the missing sidecar is named as the reason");
+
+  remove_recording(path);
+}
+
+// The decoder measures element lengths in nanoseconds, so a replayed capture
+// only behaves as it would live if the timestamps advance at exactly the
+// recorded rate. 62.5 kS/s is the rate of the reference off-air capture.
+void testBlockTimestampsAdvanceAtTheSampleRate() {
+  using namespace cwassistant::core;
+  const auto path = scratch_path("cwa_iq_replay_timing.sigmf-data");
+  remove_recording(path);
+
+  constexpr std::uint64_t kSampleRate = 62'500;
+  expect(writeRecording(path,
+                        metadataFor(IqSampleFormat::Ci16Le,
+                                    static_cast<double>(kSampleRate),
+                                    14'025'000.0),
+                        testSignal(9'000)),
+         "a timing fixture is written");
+
+  IqReplaySource source;
+  expect(source.open(path.string(), {.kind = StreamKind::ComplexIq}),
+         std::string("the timing fixture opens: ") + source.last_error());
+  expect(source.start(), "timing replay starts");
+
+  RealtimeSampleBlock block;
+  std::uint64_t consumed = 0;
+  std::uint64_t previous = 0;
+  bool first = true;
+  bool exact = true;
+  bool monotonic = true;
+  std::size_t blocks = 0;
+  while (source.read(block, std::chrono::milliseconds(0))) {
+    const std::uint64_t expected_ns =
+        consumed * 1'000'000'000ULL / kSampleRate;
+    if (block.timestamp_ns != expected_ns) exact = false;
+    if (!first && block.timestamp_ns <= previous) monotonic = false;
+    first = false;
+    previous = block.timestamp_ns;
+    consumed += block.sample_count;
+    ++blocks;
+  }
+  expect(blocks == 3, "the fixture is delivered as three blocks");
+  expect(exact,
+         "each block is stamped at its own first sample, derived from the "
+         "recorded sample rate");
+  expect(monotonic, "timestamps increase from block to block");
+  // 4096 samples at 62.5 kS/s is 65.536 ms exactly; a reader that stamped
+  // blocks by arrival, or at a nominal rate, would not land here.
+  expect(consumed == 9'000, "the whole fixture is consumed");
+
+  remove_recording(path);
+}
+
+// The writer starts a new SigMF capture segment when the operator retunes, so
+// a recording that spans a frequency change stays self-describing. A block
+// that straddled that boundary would carry one centre frequency for samples
+// received on two, and every spot derived from the later half would be
+// reported on the wrong frequency.
+void testRetuneEndsTheBlock() {
+  using namespace cwassistant::core;
+  const auto path = scratch_path("cwa_iq_replay_retune.sigmf-data");
+  remove_recording(path);
+
+  {
+    IqWriter writer;
+    expect(writer.open(path.string(),
+                       metadataFor(IqSampleFormat::Ci16Le, 48'000.0,
+                                   14'025'000.0)),
+           "a retune fixture opens");
+    auto first = iqBlock(48'000.0, 14'025'000.0, 100);
+    expect(writer.writeBlock(first), "the pre-retune samples are written");
+    auto second = iqBlock(48'000.0, 14'031'000.0, 60);
+    expect(writer.writeBlock(second), "the post-retune samples are written");
+    writer.close();
+  }
+
+  IqReplaySource source;
+  expect(source.open(path.string(), {.kind = StreamKind::ComplexIq}),
+         std::string("the retune fixture opens: ") + source.last_error());
+  expect(source.capture_segments().size() == 2,
+         "both capture segments are recovered from the sidecar");
+  expect(source.capture_segments().size() == 2 &&
+             source.capture_segments()[1].sample_start == 100,
+         "the retune is placed at the sample it happened on");
+  expect(source.start(), "retune replay starts");
+
+  RealtimeSampleBlock block;
+  std::vector<std::pair<std::size_t, double>> delivered;
+  while (source.read(block, std::chrono::milliseconds(0))) {
+    delivered.emplace_back(block.sample_count,
+                           block.stream.center_frequency_hz);
+  }
+  expect(delivered.size() == 2,
+         "a block never spans a retune, even though both fit in one block");
+  expect(delivered.size() == 2 && delivered[0].first == 100 &&
+             delivered[0].second == 14'025'000.0,
+         "the samples before the retune carry the frequency they were "
+         "received on");
+  expect(delivered.size() == 2 && delivered[1].first == 60 &&
+             delivered[1].second == 14'031'000.0,
+         "the samples after the retune carry the new frequency");
+
+  remove_recording(path);
+}
+
 }  // namespace
 
 int main() {
@@ -446,6 +858,12 @@ int main() {
   testCi16ScalingClampsRatherThanWraps();
   testLevelTelemetryIsDiagnostic();
   testMalformedInputIsRefused();
+  testReplayRoundTripsTheWriter();
+  testReplayIsBitExactForComplexFloat();
+  testTruncatedRecordingReplaysEveryWholeSample();
+  testMalformedMetadataIsRefused();
+  testBlockTimestampsAdvanceAtTheSampleRate();
+  testRetuneEndsTheBlock();
   if (failures == 0) {
     std::cout << "All IQ writer tests passed\n";
   }
