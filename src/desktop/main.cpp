@@ -707,6 +707,30 @@ int main(int argc, char* argv[]) {
       [&diagnostics_server](const QJsonObject& record) {
         diagnostics_server.publish(record);
       });
+  // Receive audio out, on the same terms as the records beside it. The
+  // controller relays it on the DSP worker's thread and the audio plane
+  // discards it in one atomic load when nobody has subscribed, so the whole
+  // path costs a station with no observer nothing at all.
+  QObject::connect(
+      &replay_controller,
+      &cwassistant::desktop::ReplayController::receiveAudioProduced,
+      &diagnostics_server,
+      [&diagnostics_server](const QByteArray& float_mono_audio,
+                            const double sample_rate_hz) {
+        diagnostics_server.publishAudio(float_mono_audio, sample_rate_hz);
+      });
+  // And the other direction: whether anybody is actually being sent audio
+  // right now, so the region is demodulated for a listener who exists rather
+  // than for a permission that was granted once. The diagnostics service is
+  // the only thing that knows, and the decoder has no business asking it, so
+  // the application tells the controller and the controller tells the worker.
+  QObject::connect(&diagnostics_server,
+                   &cwassistant::desktop::DiagnosticsServer::stateChanged,
+                   &replay_controller,
+                   [&diagnostics_server, &replay_controller] {
+                     replay_controller.setRemoteAudioSubscribed(
+                         diagnostics_server.audioSubscriberCount() > 0);
+                   });
   apply_diagnostics_server();
 
   qmlRegisterType<cwassistant::desktop::SpectrumWaterfallItem>(

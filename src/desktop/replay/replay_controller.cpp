@@ -984,6 +984,8 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
           &LiveAudioDspWorker::setOperatorRole);
   connect(this, &ReplayController::liveMonitorConfigureRequested, dsp_worker,
           &LiveAudioDspWorker::setMonitor);
+  connect(this, &ReplayController::liveRemoteAudioSubscribedRequested,
+          dsp_worker, &LiveAudioDspWorker::setRemoteAudioSubscribed);
   connect(this, &ReplayController::liveSdrDecoderWindowRequested, dsp_worker,
           &LiveAudioDspWorker::setSdrDecoderWindow);
   connect(this, &ReplayController::liveCharacterFrontendEnabledRequested,
@@ -1146,8 +1148,23 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
             verification_diagnostics_ = diagnostics;
             emit decoderChanged();
           });
+  // Acknowledged as it is played, exactly as a spectrum frame is acknowledged
+  // as it is drawn. Region audio is the one monitor mode whose producer is
+  // bounded, and without this the in-flight count only rises: the bound would
+  // stop region listening dead after eight buffers instead of only while the
+  // thread that plays is actually behind.
   connect(dsp_worker, &LiveAudioDspWorker::monitorAudioProduced, this,
-          &ReplayController::writeMonitorAudio);
+          [this, dsp_worker](const QByteArray& audio,
+                             const double sample_rate_hz) {
+            writeMonitorAudio(audio, sample_rate_hz);
+            dsp_worker->noteMonitorAudioConsumed();
+          });
+  // Signal to signal and DIRECT, for the reason given on the declaration: the
+  // sender at the far end bounds itself, and a queued relay here would put an
+  // unbounded queue in front of that bound and route it through the GUI thread
+  // on the way.
+  connect(dsp_worker, &LiveAudioDspWorker::receiveAudioProduced, this,
+          &ReplayController::receiveAudioProduced, Qt::DirectConnection);
   // Signal to signal, and deliberately DIRECT, unlike every other relay here.
   //
   // An automatic connection would be queued, because the worker lives on
@@ -2099,30 +2116,50 @@ void ReplayController::rebuildDxSpotModel() {
   emit dxSpotsChanged();
 }
 
+QString ReplayController::monitorStatusText() const {
+  switch (monitor_mode_) {
+    case 1:
+      return QStringLiteral("Monitoring full receiver window");
+    case 3:
+      // Says what the operator is hearing and, just as importantly, what they
+      // are not: this is the whole window, so every signal in it arrives at
+      // once, at the pitch its own offset from the window centre gives it.
+      return QStringLiteral("Listening to the whole %1 kHz decode region")
+          .arg(sdr_decoder_bandwidth_hz_ / 1'000.0, 0, 'g', 3);
+    case 2:
+      return monitored_channel_ids_.isEmpty()
+                 ? QStringLiteral("Use a decoder-card speaker to listen")
+                 : (monitored_channel_ids_.size() == 1
+                        ? QStringLiteral("Monitoring 1 stream")
+                        : QStringLiteral("Monitoring %1 streams")
+                              .arg(monitored_channel_ids_.size()));
+    default:
+      return QStringLiteral("Monitor off");
+  }
+}
+
 void ReplayController::setMonitorMode(const int mode) {
-  const int sanitized = std::clamp(mode, 0, 2);
+  const int sanitized = std::clamp(mode, 0, 3);
   if (source_mode_ == 2 && sanitized == 1) {
     monitor_status_ = QStringLiteral(
         "Whole-IQ listening is unavailable; select one or more CW streams.");
     emit monitorChanged();
     return;
   }
+  if (source_mode_ != 2 && sanitized == 3) {
+    // There is no decode region without a complex receiver to carve one out
+    // of. Refused rather than silently accepted, because a listen button that
+    // engages and then plays nothing is indistinguishable from a broken one.
+    monitor_status_ = QStringLiteral(
+        "Region listening needs direct SDR reception.");
+    emit monitorChanged();
+    return;
+  }
   if (monitor_mode_ == sanitized) return;
   monitor_mode_ = sanitized;
   if (monitor_mode_ != 2) monitored_channel_ids_.clear();
-  if (monitor_mode_ == 0) {
-    monitor_status_ = QStringLiteral("Monitor off");
-    stopMonitorOutput();
-  } else if (monitor_mode_ == 1) {
-    monitor_status_ = QStringLiteral("Monitoring full receiver window");
-  } else if (!monitored_channel_ids_.isEmpty()) {
-    monitor_status_ = monitored_channel_ids_.size() == 1
-        ? QStringLiteral("Monitoring 1 stream")
-        : QStringLiteral("Monitoring %1 streams")
-              .arg(monitored_channel_ids_.size());
-  } else {
-    monitor_status_ = QStringLiteral("Use a decoder-card speaker to listen");
-  }
+  if (monitor_mode_ == 0) stopMonitorOutput();
+  monitor_status_ = monitorStatusText();
   publishMonitorConfiguration();
   emit monitorChanged();
 }
@@ -2167,6 +2204,10 @@ void ReplayController::toggleMonitorChannel(const qulonglong channel_id) {
   emit monitorChanged();
 }
 
+void ReplayController::setRemoteAudioSubscribed(const bool subscribed) {
+  emit liveRemoteAudioSubscribedRequested(subscribed);
+}
+
 void ReplayController::setMonitorLevel(const double level) {
   const double sanitized = std::clamp(level, 0.0, 1.0);
   if (monitor_level_ == sanitized) return;
@@ -2179,16 +2220,7 @@ void ReplayController::setMonitorOutputSelection(QString encoded_device_id) {
   if (monitor_output_device_id_ == encoded_device_id) return;
   monitor_output_device_id_ = std::move(encoded_device_id);
   stopMonitorOutput();
-  if (monitor_mode_ != 0) {
-    monitor_status_ = monitor_mode_ == 1
-        ? QStringLiteral("Monitoring full receiver window")
-        : (monitored_channel_ids_.isEmpty()
-               ? QStringLiteral("Use a decoder-card speaker to listen")
-               : monitored_channel_ids_.size() == 1
-                     ? QStringLiteral("Monitoring 1 stream")
-                     : QStringLiteral("Monitoring %1 streams")
-                           .arg(monitored_channel_ids_.size()));
-  }
+  if (monitor_mode_ != 0) monitor_status_ = monitorStatusText();
   emit monitorChanged();
 }
 
@@ -2329,6 +2361,10 @@ void ReplayController::setSourceMode(const int value) {
   live_capturing_ = false;
   source_mode_ = clamped;
   if (source_mode_ == 2 && monitor_mode_ == 1) setMonitorMode(0);
+  // The mirror of the line above. Region listening exists only while a complex
+  // receiver is defining a region, so switching away from direct SDR must end
+  // it rather than leave a live listen button over a source that has none.
+  if (source_mode_ != 2 && monitor_mode_ == 3) setMonitorMode(0);
   rebuildDecoderModels();
   // Changing source changes which frequency counts as the receive frequency.
   publishDxClusterBandFilter();

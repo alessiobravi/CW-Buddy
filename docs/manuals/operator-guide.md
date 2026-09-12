@@ -896,6 +896,27 @@ separate, shorter list held in code rather than in any file, precisely because
 what may go on the air is a safety boundary; adding a prosign here therefore
 lets you read it and never adds it to what can be sent.
 
+**REGION** appears beside OFF and RX while Live SDR is the source, and plays the
+whole decode region at once. Every signal inside the window is heard together,
+each at the pitch its own position in the region gives it: a higher tone is a
+station higher in the region, and two stations 400 Hz apart are heard 400 Hz
+apart. Use it to sweep a window by ear before deciding what to open. It is not a
+decoder card's speaker, which isolates one carrier and moves it to the
+configured CW reference tone -- if you expect the sidetone pitch and hear a
+spread of pitches, you are listening to the region and it is working correctly.
+
+Region audio is 48 kHz mono, and that is what fixes the 24 kHz limit on the
+decode region: real audio sampled at 48 kHz carries 24 kHz of bandwidth and no
+more. A narrow region is the more useful setting here -- at 3 kHz the whole
+window sits inside comfortable listening pitches, while at the full 24 kHz the
+upper part runs past what most people can hear. Region audio is produced only
+while you are listening to it, a remote observer is being sent it, or a debug
+capture is running.
+
+A debug capture taken from an SDR now writes this same audio to `audio.wav`
+beside the IQ recording, so a capture can be listened to as well as analysed.
+The two are the same reception: the WAV is exactly what REGION listening plays.
+
 `callsign-prefixes.txt` decides which decoded tokens are allowed to name a
 station. Every amateur callsign opens with a prefix some administration was
 allocated, so a token whose opening characters belong to no country is far more

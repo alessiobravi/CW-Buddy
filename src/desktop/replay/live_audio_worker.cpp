@@ -276,6 +276,10 @@ void LiveAudioDspWorker::start() {
   monitor_resample_input_rate_hz_ = 0.0;
   monitor_resample_sum_ = 0.0F;
   monitor_resample_count_ = 0;
+  resetRegionAudio();
+  monitor_buffers_in_flight_.store(0, std::memory_order_release);
+  region_audio_samples_ = 0;
+  dropped_region_audio_buffers_ = 0;
   cwassistant::core::RealtimeSampleBlock stale;
   while (pipe_->blocks.try_pop(stale)) {
   }
@@ -323,6 +327,10 @@ void LiveAudioDspWorker::stop() {
   monitor_resample_input_rate_hz_ = 0.0;
   monitor_resample_sum_ = 0.0F;
   monitor_resample_count_ = 0;
+  resetRegionAudio();
+  monitor_buffers_in_flight_.store(0, std::memory_order_release);
+  region_audio_samples_ = 0;
+  dropped_region_audio_buffers_ = 0;
   emit diagnosticsProduced(
       verificationDiagnosticsModel(decoder_.verificationDiagnostics()));
   if (capture_active_) {
@@ -379,6 +387,14 @@ void LiveAudioDspWorker::startDebugCapture(const QString& directory_path) {
   // and the source mode alone does not say what the samples really are.
   capture_base_path_ = capture_dir;
   capture_wav_path_ = QDir(capture_dir).filePath(QStringLiteral("audio.wav"));
+  // The same file name for both sources, because it holds the same thing in
+  // both: the audio the decoder was reading. From a sound card that is the
+  // card's own samples; from an SDR it is the decode region demodulated, and
+  // it is written BESIDE the IQ rather than instead of it. An SDR capture used
+  // to contain no listenable audio at all -- an operator reviewing a recording
+  // of a signal that would not decode had a SigMF file and nothing to play.
+  capture_region_audio_path_ = capture_wav_path_;
+  capture_region_audio_failed_ = false;
   capture_iq_path_ =
       QDir(capture_dir).filePath(QStringLiteral("iq.sigmf-data"));
   capture_iq_sample_rate_hz_ = 0.0;
@@ -438,6 +454,20 @@ void LiveAudioDspWorker::finishDebugCapture(const QString& note) {
                           'f', 1),
                       QString::number(capture_iq_writer_.secondsWritten(), 'f',
                                       1));
+    // Named separately, because the question an operator asks of an SDR
+    // capture is now "can I listen to it", and a line that mentions only the
+    // SigMF payload answers it with silence.
+    const double region_audio_rate_hz =
+        region_demodulator_.outputSampleRateHz();
+    if (capture_writer_.isOpen() && capture_writer_.framesWritten() > 0 &&
+        region_audio_rate_hz > 0.0) {
+      detail += QStringLiteral(" • %1 (%2 s audio)")
+                    .arg(QFileInfo(capture_region_audio_path_).fileName(),
+                         QString::number(
+                             static_cast<double>(capture_writer_.framesWritten()) /
+                                 region_audio_rate_hz,
+                             'f', 1));
+    }
   }
   capture_writer_.close();
   capture_iq_writer_.close();
@@ -562,6 +592,22 @@ QJsonObject LiveAudioDspWorker::buildDiagnosticsRecord(
   throughput.insert(QStringLiteral("peakDrainMicroseconds"),
                     static_cast<double>(window.peak_micros));
   root.insert(QStringLiteral("throughput"), throughput);
+
+  // The region-audio producer, stated as facts rather than as intent: whether
+  // it is running, at what rate, how much it has produced, and how much was
+  // dropped instead of queued when the thread that plays fell behind. A
+  // station with the monitor off, no observer and no capture must show zero
+  // samples however long it has been receiving.
+  QJsonObject region_audio;
+  region_audio.insert(QStringLiteral("active"), region_audio_active_);
+  region_audio.insert(QStringLiteral("wanted"), regionAudioWanted());
+  region_audio.insert(QStringLiteral("sampleRateHz"),
+                      region_demodulator_.outputSampleRateHz());
+  region_audio.insert(QStringLiteral("samples"),
+                      static_cast<qint64>(region_audio_samples_));
+  region_audio.insert(QStringLiteral("droppedBuffers"),
+                      static_cast<qint64>(dropped_region_audio_buffers_));
+  root.insert(QStringLiteral("regionAudio"), region_audio);
 
   // Whether the thread that DRAWS is keeping up, which nothing above measures.
   //
@@ -971,11 +1017,25 @@ void LiveAudioDspWorker::setLocalCharacterFrontendEnabled(const bool enabled) {
 void LiveAudioDspWorker::setMonitor(const int mode,
                                     const QVariantList& channel_ids,
                                     const double reference_tone_hz) {
-  monitor_mode_ = std::clamp(mode, 0, 2);
+  // 3 is region listening: the whole decode region demodulated to audio, as
+  // opposed to 1 (the raw receiver passband, meaningless for complex IQ) and 2
+  // (one tracked signal, narrow-filtered and re-pitched to the sidetone).
+  monitor_mode_ = std::clamp(mode, 0, 3);
   monitor_resample_phase_ = 0.0;
   monitor_resample_input_rate_hz_ = 0.0;
   monitor_resample_sum_ = 0.0F;
   monitor_resample_count_ = 0;
+  // Leaving region mode ends the demand this worker was producing audio for,
+  // and entering it starts a new one. Either way the next region audio must
+  // begin from a clean oscillator and an empty delay line: the samples in
+  // between were never demodulated, so carrying state across them would play a
+  // fragment of an older region into the first buffer the operator hears.
+  resetRegionAudio();
+  monitor_buffers_in_flight_.store(0, std::memory_order_release);
+  // The sample and drop counters are deliberately NOT cleared here. They are
+  // session totals, and a reader asking "has this station been demodulating
+  // the region" must not be answered differently because the operator touched
+  // the listen control a moment ago.
   const auto selected_mode =
       mode == 1   ? cwassistant::core::CwMonitorMode::FullReceiver
       : mode == 2 ? cwassistant::core::CwMonitorMode::SelectedTrack
@@ -1021,6 +1081,9 @@ void LiveAudioDspWorker::applySdrDecoderWindow() {
   // the bank's own out-of-band rule and come back with the receiver.
   decoder_.noteInputDiscontinuity();
   character_frontends_.reset();
+  // The region itself has moved, which changes both the demodulator's shift
+  // frequency and the meaning of every sample still in its delay line.
+  resetRegionAudio();
 }
 
 void LiveAudioDspWorker::noteSpectrumFrameConsumed() noexcept {
@@ -1230,6 +1293,141 @@ void LiveAudioDspWorker::captureBlock(
   }
 }
 
+void LiveAudioDspWorker::setRemoteAudioSubscribed(const bool subscribed) {
+  if (remote_audio_subscribed_ == subscribed) return;
+  remote_audio_subscribed_ = subscribed;
+  // A subscriber arriving is a resumption, not a continuation: nothing was
+  // demodulated while nobody was listening, so the first thing they receive
+  // must not be built on a delay line holding samples from minutes ago.
+  resetRegionAudio();
+}
+
+void LiveAudioDspWorker::noteMonitorAudioConsumed() noexcept {
+  const int previous =
+      monitor_buffers_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+  // Never negative. A buffer acknowledged after a monitor-mode change, or one
+  // still queued when the count was cleared, would otherwise leave a permanent
+  // credit that defeats the bound for the rest of the session.
+  if (previous <= 0) {
+    monitor_buffers_in_flight_.store(0, std::memory_order_release);
+  }
+}
+
+bool LiveAudioDspWorker::regionAudioWanted() const noexcept {
+  // Three consumers, one producer, and no fourth reason to run. Every term
+  // here is a fact about somebody actually wanting the audio right now rather
+  // than about a permission or a capability: an allowed-but-unused remote
+  // stream, or a monitor pointed at one track, must cost nothing.
+  return monitor_mode_ == 3 || remote_audio_subscribed_ || capture_active_;
+}
+
+void LiveAudioDspWorker::resetRegionAudio() noexcept {
+  region_demodulator_.reset();
+  // Forces produceRegionAudio() to reconfigure before it emits again, which is
+  // what re-establishes the shift frequency after a bandwidth change.
+  region_audio_active_ = false;
+  region_audio_.clear();
+}
+
+void LiveAudioDspWorker::emitMonitorAudio(const QByteArray& audio,
+                                          const double sample_rate_hz,
+                                          const bool bounded) {
+  if (audio.isEmpty()) return;
+  if (bounded) {
+    if (monitor_buffers_in_flight_.load(std::memory_order_acquire) >=
+        kMaximumMonitorBuffersInFlight) {
+      ++dropped_region_audio_buffers_;
+      return;
+    }
+    monitor_buffers_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+  }
+  emit monitorAudioProduced(audio, sample_rate_hz);
+}
+
+void LiveAudioDspWorker::produceRegionAudio(
+    const cwassistant::core::RealtimeSampleBlock& block) {
+  if (!regionAudioWanted()) {
+    // Not "compute and discard". Nothing below this line runs, the demodulator
+    // keeps no state across the silence, and the next consumer to appear
+    // starts it cleanly.
+    if (region_audio_active_) resetRegionAudio();
+    return;
+  }
+  if (block.sample_count == 0 ||
+      block.stream.kind != cwassistant::core::StreamKind::ComplexIq) {
+    return;
+  }
+  const double bandwidth_hz = sdr_decoder_bandwidth_hz_;
+  const double input_rate_hz = block.stream.sample_rate_hz;
+  if (!region_audio_active_ ||
+      region_demodulator_.config().bandwidth_hz != bandwidth_hz ||
+      region_demodulator_.config().input_sample_rate_hz != input_rate_hz) {
+    if (!region_demodulator_.configure(
+            {.bandwidth_hz = bandwidth_hz,
+             .input_sample_rate_hz = input_rate_hz})) {
+      // A region no supported audio rate can carry, or a stream too narrow to
+      // hold the window. Silent rather than fatal: the decoder is unaffected,
+      // and the operator's remedy is to narrow the window.
+      region_audio_active_ = false;
+      return;
+    }
+    region_audio_active_ = true;
+  }
+  region_audio_.clear();
+  region_audio_.reserve(
+      region_demodulator_.maximumOutputSamples(block.sample_count));
+  region_demodulator_.process(block.samples.data(), block.sample_count,
+                              region_audio_);
+  region_audio_samples_ += region_audio_.size();
+  if (region_audio_.empty()) return;
+  const double rate_hz = region_demodulator_.outputSampleRateHz();
+  // Built once for both byte consumers. The monitor and the remote stream want
+  // identical bytes, and QByteArray is copy-on-write, so the second consumer
+  // costs a reference count rather than a second copy of the audio.
+  const QByteArray audio = monitor_bytes(region_audio_);
+  if (monitor_mode_ == 3) emitMonitorAudio(audio, rate_hz, true);
+  // Emitted on this thread through a direct relay, straight into a sender that
+  // bounds itself. Nothing is queued upstream of that bound, which is the
+  // whole reason the relay is direct.
+  if (remote_audio_subscribed_) emit receiveAudioProduced(audio, rate_hz);
+  captureRegionAudio(region_audio_, rate_hz);
+}
+
+void LiveAudioDspWorker::captureRegionAudio(const std::vector<float>& audio,
+                                            const double sample_rate_hz) {
+  if (!capture_active_ || capture_region_audio_failed_ || audio.empty()) return;
+  if (!capture_writer_.isOpen()) {
+    // Opened here rather than in captureBlock(), because the audio does not
+    // exist until the demodulator has been configured for this stream and it
+    // is the DEMODULATED rate, not the receiver's, that the file has to
+    // declare. A WAV header naming the IQ rate would play back at the wrong
+    // speed and pitch, which is worse than no file.
+    if (!capture_writer_.open(capture_region_audio_path_.toStdString(),
+                              sample_rate_hz)) {
+      capture_region_audio_failed_ = true;
+      return;
+    }
+  }
+  cwassistant::core::RealtimeSampleBlock chunk;
+  chunk.stream = {.kind = cwassistant::core::StreamKind::Audio,
+                  .sample_rate_hz = sample_rate_hz,
+                  .center_frequency_hz = 0.0,
+                  .channel_count = 1};
+  for (std::size_t offset = 0; offset < audio.size();
+       offset += chunk.samples.size()) {
+    chunk.sample_count = std::min(chunk.samples.size(), audio.size() - offset);
+    for (std::size_t index = 0; index < chunk.sample_count; ++index) {
+      chunk.samples[index] = {audio[offset + index], 0.0F};
+    }
+    if (!capture_writer_.writeBlock(chunk)) {
+      // Only the audio stops. The IQ recording is the primary payload and its
+      // own bound is the one that decides how long a capture lasts.
+      capture_region_audio_failed_ = true;
+      return;
+    }
+  }
+}
+
 void LiveAudioDspWorker::drain() {
   QElapsedTimer drain_clock;
   drain_clock.start();
@@ -1292,8 +1490,13 @@ void LiveAudioDspWorker::drain() {
         continue;
       }
       if (status ==
-          cwassistant::core::IqBlockStatus::AcceptedAfterDiscontinuity)
+          cwassistant::core::IqBlockStatus::AcceptedAfterDiscontinuity) {
         sdr_decoder_pending_ = {};
+        // The samples after a discontinuity do not continue the ones before
+        // it, and the demodulator's delay line is half a millisecond of
+        // exactly those.
+        resetRegionAudio();
+      }
       if (decoder_block.sample_count > 0) {
         if (sdr_decoder_pending_.sample_count > 0 &&
             (sdr_decoder_pending_.stream.sample_rate_hz !=
@@ -1415,6 +1618,12 @@ void LiveAudioDspWorker::drain() {
     // published from the bank's own channels after the loop now, so binding
     // the result here only earned an unused-variable warning.
     static_cast<void>(decoder_.processSamples(*processing_block));
+    // The one demodulation of the decode region, feeding the local monitor,
+    // the remote stream and the debug capture from the same samples. Placed
+    // here because `processing_block` IS the decode region: the channelizer
+    // has already centred and bounded it, so what an operator hears is exactly
+    // what the decoder is reading.
+    produceRegionAudio(*processing_block);
     const auto& raw_monitor_audio = decoder_.monitorAudio();
     if (!raw_monitor_audio.empty() &&
         processing_block->stream.kind ==
@@ -1450,15 +1659,12 @@ void LiveAudioDspWorker::drain() {
             monitor_resample_count_ = 0;
           }
         }
-        const QByteArray monitor_audio = monitor_bytes(resampled);
-        if (!monitor_audio.isEmpty())
-          emit monitorAudioProduced(monitor_audio, monitor_output_rate_hz);
+        emitMonitorAudio(monitor_bytes(resampled), monitor_output_rate_hz,
+                         false);
       }
     } else {
-      const QByteArray monitor_audio = monitor_bytes(raw_monitor_audio);
-      if (!monitor_audio.isEmpty())
-        emit monitorAudioProduced(monitor_audio,
-                                  processing_block->stream.sample_rate_hz);
+      emitMonitorAudio(monitor_bytes(raw_monitor_audio),
+                       processing_block->stream.sample_rate_hz, false);
     }
     const auto& character_tracks = decoder_.characterRefinementTracks();
     for (auto& window :

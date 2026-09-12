@@ -16,6 +16,22 @@ bool contains(const std::string_view source, const std::string_view text) {
   return source.find(text) != std::string_view::npos;
 }
 
+// The body of one free-standing definition: from its signature to the first
+// closing brace in the first column. Checks below assert that a call sits
+// inside a particular function rather than merely somewhere in the file,
+// which is the difference between "the region is written when it is set" and
+// "the region is written by apply(), as before".
+std::string_view functionBody(const std::string_view source,
+                              const std::string_view signature) {
+  const std::size_t begin = source.find(signature);
+  if (begin == std::string_view::npos)
+    return {};
+  const std::size_t end = source.find("\n}\n", begin);
+  if (end == std::string_view::npos)
+    return {};
+  return source.substr(begin, end - begin);
+}
+
 } // namespace
 
 int main() {
@@ -95,6 +111,73 @@ int main() {
       !contains(controller_header, "liveSdrDecoderWindowRequested") ||
       !contains(header, "sdrFollowRadioVfo")) {
     return 10;
+  }
+
+  // A decode region chosen on the spectrum survives a restart. It used to be
+  // written only by the settings dialog's Apply, so a width set by dragging
+  // held until the application closed and then snapped back to the last
+  // applied one -- the main window has no Apply to press.
+  //
+  // Both the drag (setSdrDecoderWindow) and the settings combo
+  // (setSdrDecoderBandwidthHz) must reach disk through the same one writer,
+  // and the write must precede the signals so that a listener correcting the
+  // region stores its correction last. The drag reports once, on release, so
+  // one selection is one write; asserted here because a gesture that reported
+  // continuously would turn this into a write per pointer move.
+  const std::string_view persist_body = functionBody(
+      implementation, "void AppSettings::persistSdrDecoderWindow()");
+  const std::string_view drag_body = functionBody(
+      implementation, "void AppSettings::setSdrDecoderWindow(");
+  const std::string_view bandwidth_body = functionBody(
+      implementation, "void AppSettings::setSdrDecoderBandwidthHz(");
+  const std::string_view center_body = functionBody(
+      implementation, "void AppSettings::setSdrDecoderCenterFrequencyHz(");
+  const std::size_t persist_call = drag_body.find("persistSdrDecoderWindow();");
+  const std::size_t drag_signal = drag_body.find("emit sdrSettingsChanged();");
+  // The gesture reports from its release handler, between the pointer-move
+  // handler above it and the cancel handler below it.
+  const std::size_t drag_move = main_qml.find("onPositionChanged: function(");
+  const std::size_t drag_release = main_qml.find("onReleased: function(");
+  const std::size_t drag_report =
+      main_qml.find("appSettings.setSdrDecoderWindow(");
+  const std::size_t drag_cancel = main_qml.find("onCanceled: ");
+  if (persist_body.empty() || drag_body.empty() || bandwidth_body.empty() ||
+      center_body.empty() ||
+      !contains(persist_body, "sdr/decoderCenterFrequencyHz") ||
+      !contains(persist_body, "sdr/decoderBandwidthHz") ||
+      persist_call == std::string_view::npos ||
+      drag_signal == std::string_view::npos || persist_call > drag_signal ||
+      !contains(bandwidth_body, "persistSdrDecoderWindow();") ||
+      !contains(center_body, "persistSdrDecoderWindow();") ||
+      drag_move == std::string::npos || drag_release == std::string::npos ||
+      drag_report == std::string::npos || drag_cancel == std::string::npos ||
+      !(drag_move < drag_release && drag_release < drag_report &&
+        drag_report < drag_cancel)) {
+    return 16;
+  }
+
+  // One stored region, not two. The width must not be shadowed by a
+  // session-only copy that a restart would then have to choose between.
+  for (const std::string_view forbidden :
+       {"sessionDecoderBandwidth", "session_decoder_bandwidth",
+        "sdr/sessionDecoder"}) {
+    if (contains(header, forbidden) || contains(implementation, forbidden))
+      return 17;
+  }
+
+  // A region saved by a version that allowed more than the operator can now
+  // listen to is narrowed on the way in, so an old profile cannot restore a
+  // width the decimator and the 48 kHz monitor path will not carry.
+  const std::size_t stored_bandwidth =
+      implementation.find("QStringLiteral(\"sdr/decoderBandwidthHz\")), 24'000");
+  if (stored_bandwidth == std::string::npos ||
+      !contains(std::string_view(implementation)
+                    .substr(stored_bandwidth, 200),
+                "kMaximumSdrDecoderBandwidthHz") ||
+      !contains(header,
+                "kMaximumSdrDecoderBandwidthHz = 24'000") ||
+      !contains(header, "kMinimumSdrDecoderBandwidthHz = 2'000")) {
+    return 18;
   }
 
   // Alternative RSPduo operating configurations sharing one serial are

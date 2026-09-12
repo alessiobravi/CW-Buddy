@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <numbers>
+#include <vector>
 
 namespace cwassistant::core {
 namespace {
@@ -43,6 +44,30 @@ void normalize(std::complex<double>& oscillator) noexcept {
   } else {
     oscillator = {1.0, 0.0};
   }
+}
+
+// sin(pi x) / (pi x), continuous at zero. The ideal low-pass impulse response
+// this resampler's kernel is windowed from.
+double normalizedSinc(const double x) noexcept {
+  if (std::abs(x) < 1.0e-12) return 1.0;
+  const double scaled = std::numbers::pi * x;
+  return std::sin(scaled) / scaled;
+}
+
+// Zeroth-order modified Bessel function of the first kind, evaluated by its
+// own series. Written out rather than taken from <cmath>, whose std::cyl_bessel_i
+// is not available on every toolchain this core has to stay warning-clean and
+// buildable on.
+double besselI0(const double x) noexcept {
+  double sum = 1.0;
+  double term = 1.0;
+  for (int index = 1; index < 64; ++index) {
+    term *= (x * 0.5) / static_cast<double>(index);
+    const double contribution = term * term;
+    sum += contribution;
+    if (contribution < 1.0e-17 * sum) break;
+  }
+  return sum;
 }
 
 }  // namespace
@@ -436,6 +461,188 @@ const IqSubbandDecimatorConfig& IqSubbandDecimator::config() const noexcept {
 
 double IqSubbandDecimator::outputSampleRateHz() const noexcept {
   return output_sample_rate_hz_;
+}
+
+
+double IqRegionDemodulator::outputSampleRateForBandwidthHz(
+    const double bandwidth_hz) noexcept {
+  if (!finite(bandwidth_hz) || bandwidth_hz <= 0.0) return 0.0;
+  // Real audio sampled at Fs carries 0..Fs/2, so the region needs Fs >= 2W.
+  // Smallest acceptable candidate wins, because every extra sample is paid for
+  // by the interpolator, the wire and the operator's sound card alike.
+  constexpr std::array<double, 3> candidates{48'000.0, 96'000.0, 192'000.0};
+  for (const double rate : candidates) {
+    if (rate >= 2.0 * bandwidth_hz) return rate;
+  }
+  return 0.0;
+}
+
+bool IqRegionDemodulator::configure(
+    const IqRegionDemodulatorConfig config) noexcept {
+  if (!finite(config.bandwidth_hz) || !finite(config.input_sample_rate_hz)) {
+    return false;
+  }
+  if (config.bandwidth_hz < 100.0 || config.bandwidth_hz > 96'000.0) {
+    return false;
+  }
+  // Strictly greater, not merely different: the region has to fit inside the
+  // analytic stream that carries it, and a region equal to its own sample rate
+  // reaches the Nyquist boundary at both edges at once.
+  if (!(config.input_sample_rate_hz > config.bandwidth_hz)) return false;
+  // This is the decoder branch, never the hardware stream. A megasample rate
+  // arriving here means a caller wired the wrong tap in, and demodulating it
+  // would burn a core producing audio nobody asked for.
+  if (config.input_sample_rate_hz > 1'000'000.0) return false;
+  const double output_rate = outputSampleRateForBandwidthHz(config.bandwidth_hz);
+  if (output_rate <= 0.0) return false;
+
+  config_ = config;
+  output_sample_rate_hz_ = output_rate;
+  input_samples_per_output_ = config.input_sample_rate_hz / output_rate;
+  // The single-sideband shift, stepped at the OUTPUT rate. It cannot be done
+  // at the input rate: the region fills that stream's whole Nyquist span, so a
+  // shift of W/2 there would wrap the top of the region straight onto the
+  // bottom -- the failure this class exists to avoid, introduced by the fix
+  // for it.
+  const double angle =
+      2.0 * std::numbers::pi * (config.bandwidth_hz * 0.5) / output_rate;
+  shift_step_ = {std::cos(angle), std::sin(angle)};
+  buildKernel();
+  reset();
+  configured_ = true;
+  return true;
+}
+
+void IqRegionDemodulator::buildKernel() noexcept {
+  // Cutoff at the region edge, expressed against the input rate. The kernel is
+  // the region filter and the anti-imaging filter at once, so its corner is the
+  // one frequency that means something to an operator: the edge of the window
+  // they chose.
+  const double cutoff = std::min(
+      config_.bandwidth_hz * 0.5 / config_.input_sample_rate_hz, 0.49);
+  constexpr double kBeta = 7.0;
+  const double beta_normalizer = besselI0(kBeta);
+  kernel_.assign(kSubPhases * kTaps, 0.0F);
+  for (std::size_t phase = 0; phase < kSubPhases; ++phase) {
+    const double fraction =
+        static_cast<double>(phase) / static_cast<double>(kSubPhases);
+    double sum = 0.0;
+    for (std::size_t tap = 0; tap < kTaps; ++tap) {
+      const double offset = static_cast<double>(tap) -
+                            static_cast<double>(kHalfTaps) + 1.0 - fraction;
+      const double window_position =
+          offset / static_cast<double>(kHalfTaps);
+      double window = 0.0;
+      if (std::abs(window_position) <= 1.0) {
+        window = besselI0(kBeta * std::sqrt(std::max(
+                              0.0, 1.0 - window_position * window_position))) /
+                 beta_normalizer;
+      }
+      const double value =
+          2.0 * cutoff * normalizedSinc(2.0 * cutoff * offset) * window;
+      kernel_[phase * kTaps + tap] = static_cast<float>(value);
+      sum += value;
+    }
+    // Each fractional position is normalized to unit gain on its own. An
+    // unnormalized polyphase bank has a slightly different gain at every
+    // fractional position, and because those positions are visited in a
+    // repeating pattern the difference becomes amplitude modulation at the
+    // resampling beat rate -- heard as a steady flutter over every signal in
+    // the region at once, which is far more obvious than the fraction of a
+    // decibel it measures.
+    const double scale = std::abs(sum) > 1.0e-12 ? 1.0 / sum : 1.0;
+    for (std::size_t tap = 0; tap < kTaps; ++tap) {
+      kernel_[phase * kTaps + tap] =
+          static_cast<float>(static_cast<double>(kernel_[phase * kTaps + tap]) *
+                             scale);
+    }
+  }
+}
+
+void IqRegionDemodulator::reset() noexcept {
+  history_.fill({});
+  shift_oscillator_ = {1.0, 0.0};
+  next_output_time_ = 0.0;
+  written_samples_ = 0;
+  oscillator_samples_ = 0;
+}
+
+bool IqRegionDemodulator::configured() const noexcept { return configured_; }
+
+const IqRegionDemodulatorConfig& IqRegionDemodulator::config() const noexcept {
+  return config_;
+}
+
+double IqRegionDemodulator::outputSampleRateHz() const noexcept {
+  return output_sample_rate_hz_;
+}
+
+std::size_t IqRegionDemodulator::maximumOutputSamples(
+    const std::size_t input_samples) const noexcept {
+  if (!configured_ || input_samples_per_output_ <= 0.0) return 0;
+  return static_cast<std::size_t>(
+             std::ceil(static_cast<double>(input_samples) /
+                       input_samples_per_output_)) +
+         1U;
+}
+
+void IqRegionDemodulator::process(const std::complex<float>* samples,
+                                  const std::size_t sample_count,
+                                  std::vector<float>& audio) {
+  if (!configured_ || samples == nullptr || sample_count == 0) return;
+  for (std::size_t index = 0; index < sample_count; ++index) {
+    history_[static_cast<std::size_t>(written_samples_ & kHistoryMask)] =
+        static_cast<std::complex<double>>(samples[index]);
+    ++written_samples_;
+    // An output at time t reads input samples floor(t) - kHalfTaps + 1 through
+    // floor(t) + kHalfTaps, so it becomes producible the moment the last of
+    // them has been written. Everything the loop needs is therefore already in
+    // the ring, and the interpolator never has to wait for a whole block.
+    while (true) {
+      const auto floor_index =
+          static_cast<std::uint64_t>(std::floor(next_output_time_));
+      if (floor_index + kHalfTaps + 1U > written_samples_) break;
+      const double fraction =
+          next_output_time_ - static_cast<double>(floor_index);
+      const auto phase = std::min<std::size_t>(
+          kSubPhases - 1U,
+          static_cast<std::size_t>(fraction *
+                                       static_cast<double>(kSubPhases) +
+                                   0.5));
+      const float* coefficients = kernel_.data() + phase * kTaps;
+      // Unsigned arithmetic on purpose. Before the stream has produced
+      // kHalfTaps samples this subtraction wraps, and the mask then selects
+      // ring slots that have never been written -- which hold zero, and zero is
+      // exactly what "the samples before the stream started" should be. No
+      // special case for the first block, and none needed after it, because by
+      // then the index is genuinely positive.
+      const std::uint64_t first = floor_index + 1U - kHalfTaps;
+      std::complex<double> accumulator{};
+      for (std::size_t tap = 0; tap < kTaps; ++tap) {
+        accumulator +=
+            history_[static_cast<std::size_t>((first + tap) & kHistoryMask)] *
+            static_cast<double>(coefficients[tap]);
+      }
+      // The single-sideband step, and the only place the analytic property is
+      // spent. real() of a shifted analytic sample is a real signal whose
+      // spectrum is conjugate-symmetric by construction, but there was nothing
+      // at the reflected frequency to add to it, so the region arrives in
+      // [0, W] intact and un-mirrored.
+      const std::complex<double> shifted = accumulator * shift_oscillator_;
+      shift_oscillator_ *= shift_step_;
+      ++oscillator_samples_;
+      if ((oscillator_samples_ & 1'023U) == 0U) normalize(shift_oscillator_);
+      audio.push_back(static_cast<float>(shifted.real()));
+      next_output_time_ += input_samples_per_output_;
+    }
+  }
+  // Keeps the fractional output clock at full precision however long a session
+  // runs. The interval is a multiple of the ring size, so every slot still
+  // holds the sample its index says it does.
+  if (written_samples_ >= kRebaseInterval) {
+    written_samples_ -= kRebaseInterval;
+    next_output_time_ -= static_cast<double>(kRebaseInterval);
+  }
 }
 
 }  // namespace cwassistant::core

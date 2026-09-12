@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include "../decoder/local_character_decoder.hpp"
 #include "../visualization/spectrum_frame.hpp"
@@ -111,6 +112,13 @@ class LiveAudioDspWorker final : public QObject {
   // frames were refused during ordinary operation and not only under load,
   // which cost the waterfall continuity for no gain. Four is 256 kB at worst.
   static constexpr int kMaximumSpectrumFramesInFlight = 4;
+  // Region audio crosses to the thread that plays, and that thread can stall.
+  // Eight buffers is roughly a fifth of a second at the drain cadence -- ample
+  // slack for ordinary jitter, and a hard ceiling on the backlog a stalled
+  // player can build. Audio refused here is dropped rather than queued,
+  // because a monitor buffer delivered late is worse than one never delivered:
+  // it plays the past.
+  static constexpr int kMaximumMonitorBuffersInFlight = 8;
   static constexpr int kGuiHeartbeatIntervalMs = 100;
   static constexpr double kGuiStallLatenessMs = 250.0;
 
@@ -135,6 +143,16 @@ class LiveAudioDspWorker final : public QObject {
   void setLocalCharacterFrontendEnabled(bool enabled);
   void setMonitor(int mode, const QVariantList& channel_ids,
                   double reference_tone_hz);
+  // Whether anybody is being sent receive audio over the network right now.
+  // Not whether the operator ALLOWED it: a permission nobody is using must
+  // cost this worker nothing, and demodulating the region for an audience of
+  // zero is exactly the "work at the rate data arrives rather than the rate a
+  // consumer needs" fault that has cost this application dearly before.
+  void setRemoteAudioSubscribed(bool subscribed);
+  // Called by the thread that plays, once it has taken a monitor buffer off the
+  // queue. Mirrors noteSpectrumFrameConsumed(): without it the region audio's
+  // in-flight count only ever rises.
+  void noteMonitorAudioConsumed() noexcept;
   void setSdrDecoderWindow(double center_frequency_hz, double bandwidth_hz);
   // Called by the thread that draws, once it has taken a frame off the queue,
   // so this worker knows whether the display is keeping up.
@@ -203,6 +221,14 @@ class LiveAudioDspWorker final : public QObject {
       cwassistant::desktop::CwCharacterFeatureWindowPtr window);
   void monitorAudioProduced(const QByteArray& float_mono_audio,
                             double sample_rate_hz);
+  // The decode region as real audio, for consumers outside the loudspeaker
+  // path. Exactly the same samples the local monitor plays in region mode --
+  // one demodulator feeds the monitor, the remote stream and the debug capture
+  // -- so what a remote listener hears and what a capture records is what the
+  // operator heard, and there is never a second region audio path to keep in
+  // agreement with the first.
+  void receiveAudioProduced(const QByteArray& float_mono_audio,
+                            double sample_rate_hz);
   // The same diagnostics record the debug capture writes to disk, offered as
   // it is produced so a running station can be watched instead of recorded,
   // stopped and sent. Emitted on its own slow timer for the whole time live
@@ -221,6 +247,27 @@ class LiveAudioDspWorker final : public QObject {
   // up.
   [[nodiscard]] bool publishSpectrumFrame(SpectrumFrame&& frame);
   void captureBlock(const cwassistant::core::RealtimeSampleBlock& block);
+  // Demodulates the decode region to audio and hands it to whichever of the
+  // three consumers asked for it, or does nothing whatever if none did.
+  void produceRegionAudio(const cwassistant::core::RealtimeSampleBlock& block);
+  // Whether anything currently wants region audio. Read before a single sample
+  // is touched, so a station with the monitor off, no observer and no capture
+  // running pays one boolean test per drained block for this feature.
+  [[nodiscard]] bool regionAudioWanted() const noexcept;
+  // Drops the demodulator's oscillator phase and delay line. Called wherever
+  // the region samples stop being continuous with the ones before them.
+  void resetRegionAudio() noexcept;
+  // Writes region audio into the capture's audio.wav BESIDE the IQ recording.
+  // A SigMF capture used to contain no listenable audio at all, because the
+  // capture wrote either audio or IQ and an SDR session wrote IQ -- so an
+  // operator reviewing a recording of a signal that would not decode had
+  // nothing to listen to.
+  void captureRegionAudio(const std::vector<float>& audio,
+                          double sample_rate_hz);
+  // The one place a monitor buffer leaves this worker, so the in-flight bound
+  // below cannot be bypassed by a new emit site.
+  void emitMonitorAudio(const QByteArray& audio, double sample_rate_hz,
+                        bool bounded);
   [[nodiscard]] bool openIqCapture(
       const cwassistant::core::RealtimeSampleBlock& block);
   // One throughput measurement window: the counter values at the moment the
@@ -416,6 +463,29 @@ class LiveAudioDspWorker final : public QObject {
   qulonglong radio_tx_rf_hz_{0};
   bool radio_split_active_{false};
   int monitor_mode_{0};
+  // Region audio: the whole decode region demodulated to real audio, produced
+  // once and shared by the local monitor, the remote stream and the capture.
+  cwassistant::core::IqRegionDemodulator region_demodulator_;
+  // Reused between drains so steady-state production allocates nothing.
+  std::vector<float> region_audio_;
+  bool region_audio_active_{false};
+  bool remote_audio_subscribed_{false};
+  std::atomic<int> monitor_buffers_in_flight_{0};
+  std::uint64_t dropped_region_audio_buffers_{0};
+  // How many region-audio samples this worker has demodulated, cumulative for
+  // the session. In the diagnostics record because it is the one number that
+  // distinguishes "nobody is listening" from "the demodulator is running and
+  // the audio is being thrown away" -- and because a feature whose whole cost
+  // discipline is "produce nothing when nobody wants it" needs that claim to
+  // be observable rather than asserted.
+  std::uint64_t region_audio_samples_{0};
+  QString capture_region_audio_path_;
+  // Set once when the capture's audio file cannot be opened, so a failure is
+  // reported once instead of retried on every block. It never ends the
+  // capture: the IQ is the primary payload and losing a forensic recording
+  // because a second file would not open is a worse outcome than losing the
+  // audio beside it.
+  bool capture_region_audio_failed_{false};
   double monitor_resample_phase_{0.0};
   double monitor_resample_input_rate_hz_{0.0};
   float monitor_resample_sum_{0.0F};

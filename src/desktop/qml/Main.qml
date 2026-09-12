@@ -265,6 +265,79 @@ ApplicationWindow {
                     font.weight: Font.Bold
                 }
             }
+            // Receive audio leaving the station, and the switch that allows it.
+            //
+            // On the bar rather than only in Settings, and clickable, because
+            // this is the one disclosure an operator most needs to be able to
+            // see and revoke without going and finding a page. Audio carries
+            // every signal in the passband, not only what this application
+            // decoded, so the chip is visible whenever the diagnostics service
+            // is up -- including while audio is off, which is the state that
+            // says plainly that it is off.
+            //
+            // Amber like its sibling while it is merely allowed; the
+            // application accent teal only while audio is actually going out,
+            // because "permitted" and "leaving this machine right now" are
+            // different facts and the second one is the urgent one. Still never
+            // "#ff6b6b", which on this bar means the transmitter is keyed.
+            Rectangle {
+                id: audioStreamChip
+                objectName: "audioStreamStatusChip"
+                readonly property bool serviceListening: diagnosticsServer.listening
+                readonly property bool allowed: diagnosticsServer.audioStreamingEnabled
+                // Allowed is not the same as able. The audio half binds the
+                // same port as the control half, over UDP, and a port it could
+                // not get must never read as a service that is ready.
+                readonly property bool ready: diagnosticsServer.audioListening
+                readonly property int listeners: diagnosticsServer.audioSubscriberCount
+                visible: audioStreamChip.serviceListening
+                         || audioStreamChip.allowed
+                implicitWidth: Math.max(audioStreamLabel.implicitWidth,
+                                        audioStreamWidest.width) + 24
+                implicitHeight: 30
+                radius: 15
+                color: "#202833"
+                ToolTip.visible: audioStreamHover.hovered
+                ToolTip.delay: 400
+                ToolTip.text: audioStreamChip.listeners > 0
+                              ? "Receive audio is being sent to " + audioStreamChip.listeners + " remote observer(s), unencrypted, over UDP on the diagnostics port. Click to stop it."
+                              : (audioStreamChip.allowed && !audioStreamChip.ready)
+                                ? "Receive audio is allowed but this station could not bind the audio port, so none can be sent. Click to withdraw permission."
+                                : audioStreamChip.allowed
+                                  ? "Remote observers may ask for receive audio. Nothing is being sent yet. Click to withdraw permission."
+                                  : "Receive audio stays on this machine. Click to allow remote observers to ask for it."
+                HoverHandler { id: audioStreamHover }
+                TextMetrics {
+                    id: audioStreamWidest
+                    font: audioStreamLabel.font
+                    text: "AUDIO OUT 4"
+                }
+                // Withdrawing needs no confirmation and takes effect at once;
+                // only granting is asked about, because only granting is the
+                // one that cannot be taken back from whoever already heard it.
+                TapHandler {
+                    onTapped: audioStreamChip.allowed
+                              ? diagnosticsServer.audioStreamingEnabled = false
+                              : audioStreamConsent.open()
+                }
+                Label {
+                    id: audioStreamLabel
+                    anchors.centerIn: parent
+                    text: audioStreamChip.listeners > 0
+                          ? "AUDIO OUT " + audioStreamChip.listeners
+                          : !audioStreamChip.allowed ? "AUDIO OFF"
+                          : audioStreamChip.ready ? "AUDIO ALLOWED"
+                          : "AUDIO DOWN"
+                    // Dimmed amber for allowed-but-unable, the same treatment
+                    // the diagnostics chip gives an enabled service that never
+                    // bound, so the two failures read the same way.
+                    color: audioStreamChip.listeners > 0 ? "#43c6ac"
+                           : !audioStreamChip.allowed ? "#718092"
+                           : audioStreamChip.ready ? "#f3bd55" : "#9c7a3a"
+                    font.pixelSize: 11
+                    font.weight: Font.Bold
+                }
+            }
             Rectangle {
                 implicitWidth: safeLabel.implicitWidth + 24
                 implicitHeight: 30
@@ -380,6 +453,18 @@ ApplicationWindow {
                     ToolTip.text: replayController.sourceMode === 2
                         ? "Raw wideband IQ is not loudspeaker audio; use a decoder-card speaker to monitor filtered streams"
                         : "Play the complete receiver passband without a stream filter"
+                }
+                ToolButton {
+                    objectName: "monitorRegionButton"
+                    text: "REGION"
+                    checkable: true
+                    checked: replayController.monitorMode === 3
+                    visible: replayController.sourceMode === 2
+                    enabled: replayController.activeSource
+                             && replayController.sourceMode === 2
+                    onClicked: replayController.setMonitorMode(3)
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Listen to the whole decode region at once, not one stream: every signal inside the window is heard together, each at the pitch its own position in the window gives it, so a higher tone is a station higher in the region"
                 }
                 Slider {
                     objectName: "monitorLevelSlider"
@@ -556,10 +641,20 @@ ApplicationWindow {
                                                 + spectrumDisplay.width,
                                                 window.hzToX(upperHz)) - x)
                     height: spectrumDisplay.height
-                    color: "#1625c9b0"
-                    border.color: "#43c6ac"
-                    border.width: 1
-                    opacity: 0.34
+                    // Transparency belongs in the fill and nowhere else. This
+                    // carried an 8.6% alpha in the colour AND opacity 0.34 on
+                    // the item, and the two multiplied to under 3% -- so the
+                    // band that says where decoding is happening was the
+                    // hardest thing on the spectrum to see. Worse, an item
+                    // opacity dims its children, so the border and the label
+                    // faded with it: the two parts that carry the meaning were
+                    // attenuated along with the tint that only has to hint.
+                    // The fill stays translucent enough to read the spectrum
+                    // through it; the edge and the label are drawn at full
+                    // strength, because they are what an operator looks for.
+                    color: "#3325c9b0"
+                    border.color: "#5fe4c8"
+                    border.width: 2
                     z: 4
                     Label {
                         anchors.top: parent.top
@@ -944,9 +1039,20 @@ ApplicationWindow {
                         // slice the decimator will accept -- and a drag below
                         // the click threshold still means "put the window
                         // here" and leaves the width alone.
+                        // 24 kHz is the ceiling, and it is the same ceiling
+                        // the setter clamps to. A drag that could ask for more
+                        // than the setting accepts would appear to resize the
+                        // region and then silently not, which is the failure
+                        // this floor was already fixed for once. The number
+                        // comes from what the region is FOR: it is not only
+                        // decoded, it is what the operator listens to, and
+                        // 48 kHz audio carries 24 kHz of bandwidth and no
+                        // more. So the decode region is the listen window --
+                        // one number, and nothing that can be decoded but
+                        // never heard.
                         var bandwidthHz = draggedHz >= 250
                                 ? Math.round(Math.max(2000,
-                                      Math.min(96000, draggedHz)) / 100) * 100
+                                      Math.min(24000, draggedHz)) / 100) * 100
                                 : appSettings.sdrDecoderBandwidthHz
                         var selectedCenterHz = Math.round(
                             draggedHz >= 1000
@@ -4591,6 +4697,50 @@ ApplicationWindow {
     SetupWizard {
         id: setupWizard
         anchors.centerIn: Overlay.overlay
+    }
+
+    // Asked before any receive audio can leave the machine, and asked in these
+    // words because the operator is agreeing to something larger than the
+    // telemetry beside it: the audio carries every signal in the passband,
+    // including stations this application never decoded and anything else the
+    // receiver happens to be hearing.
+    //
+    // Permission is for this session only and is not written to the settings.
+    // Every other network setting here is remembered, because an operator who
+    // set up a diagnostics stream wants it back; this one coming back by
+    // itself, into a session nobody has thought about yet, is the wrong
+    // default for a disclosure this size.
+    Dialog {
+        id: audioStreamConsent
+        objectName: "audioStreamConsentDialog"
+        modal: true
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(460, parent ? parent.width - 48 : 460)
+        title: "Allow receive audio to leave this station?"
+        standardButtons: Dialog.Cancel | Dialog.Ok
+        onAccepted: diagnosticsServer.audioStreamingEnabled = true
+        ColumnLayout {
+            width: parent.width
+            spacing: 10
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: "#edf3f8"
+                text: "A connected observer will be able to ask for the receiver's audio. It carries every signal in the passband, not only what this application decoded."
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: "#c8d4e0"
+                text: "It is sent unencrypted, over UDP on the same port number as the diagnostics stream, only to observers that already hold the access token and are on the allowed-peer list, and only to the address their own connection came from. Nothing is sent until one asks."
+            }
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: "#c8d4e0"
+                text: "This applies to the current session only. It is off again the next time CW Buddy starts, and the status bar shows AUDIO OUT for as long as anything is being sent."
+            }
+        }
     }
 
     // Startup notice for pending updates. It appears once per launch, only

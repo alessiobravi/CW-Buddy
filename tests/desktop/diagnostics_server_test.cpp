@@ -165,8 +165,11 @@ bool disconnectsAPeerThatSends() {
   pump(300);
   if (server.clientCount() != 1) return false;
 
+  // More than one request line's worth, with no line in it. Whatever this peer
+  // is speaking, it is not the two words this stream accepts, and it is
+  // disconnected without any of what it sent being looked at.
   talker.write(QByteArray(
-      static_cast<int>(DiagnosticsServer::kMaximumIgnoredInputBytes) + 1, 'x'));
+      static_cast<int>(DiagnosticsServer::kMaximumRequestBytes) + 1, 'x'));
   talker.flush();
   pump(500);
 

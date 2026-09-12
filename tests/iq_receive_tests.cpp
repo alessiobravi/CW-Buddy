@@ -397,6 +397,164 @@ void testConfigurationBounds() {
          "an SDR transform above the resource bound is rejected");
 }
 
+// Magnitude of a real signal at `frequency_hz`, by direct correlation. A whole
+// FFT would say nothing more here: two frequencies are being compared and the
+// interesting one is deliberately not on a bin boundary.
+double toneMagnitude(const std::vector<float>& audio, const double sample_rate_hz,
+                     const double frequency_hz, const std::size_t skip) {
+  double real = 0.0;
+  double imaginary = 0.0;
+  for (std::size_t index = skip; index < audio.size(); ++index) {
+    const double phase = 2.0 * std::numbers::pi * frequency_hz *
+                         static_cast<double>(index) / sample_rate_hz;
+    real += static_cast<double>(audio[index]) * std::cos(phase);
+    imaginary -= static_cast<double>(audio[index]) * std::sin(phase);
+  }
+  const auto counted = static_cast<double>(audio.size() - skip);
+  return std::hypot(real, imaginary) / std::max(1.0, counted);
+}
+
+// Feeds a complex tone at `offset_hz` from the region centre through the
+// demodulator and returns the real audio it produces.
+std::vector<float> demodulatedTone(cwassistant::core::IqRegionDemodulator& demodulator,
+                                   const double input_rate_hz,
+                                   const double offset_hz,
+                                   const std::size_t input_samples) {
+  std::vector<float> audio;
+  audio.reserve(demodulator.maximumOutputSamples(input_samples));
+  std::vector<std::complex<float>> chunk(512);
+  double phase = 0.0;
+  const double step = 2.0 * std::numbers::pi * offset_hz / input_rate_hz;
+  for (std::size_t produced = 0; produced < input_samples;
+       produced += chunk.size()) {
+    const std::size_t count =
+        std::min(chunk.size(), input_samples - produced);
+    for (std::size_t index = 0; index < count; ++index) {
+      chunk[index] = {static_cast<float>(std::cos(phase)),
+                      static_cast<float>(std::sin(phase))};
+      phase += step;
+    }
+    demodulator.process(chunk.data(), count, audio);
+  }
+  return audio;
+}
+
+// The output rate rule, which is the invariant the whole feature rests on: a
+// W-wide region needs at least 2W of real audio, because real audio sampled at
+// Fs carries only Fs/2. A rate below that does not sound worse, it folds the
+// top of the region onto the bottom.
+void testRegionAudioSampleRateRule() {
+  using cwassistant::core::IqRegionDemodulator;
+  constexpr std::array<double, 6> widths{500.0, 3'000.0, 12'000.0, 24'000.0,
+                                          40'000.0, 96'000.0};
+  for (const double width : widths) {
+    const double rate = IqRegionDemodulator::outputSampleRateForBandwidthHz(width);
+    expect(rate >= 2.0 * width,
+           "region audio rate carries at least twice the region bandwidth");
+  }
+  expect(IqRegionDemodulator::outputSampleRateForBandwidthHz(24'000.0) == 48'000.0,
+         "the capped 24 kHz decode region demodulates to 48 kHz audio");
+  expect(IqRegionDemodulator::outputSampleRateForBandwidthHz(30'000.0) == 96'000.0,
+         "a region wider than 24 kHz steps up to the next supported rate");
+  expect(IqRegionDemodulator::outputSampleRateForBandwidthHz(120'000.0) == 0.0,
+         "a region no supported audio rate can carry is refused, not truncated");
+
+  IqRegionDemodulator demodulator;
+  expect(demodulator.configure({.bandwidth_hz = 24'000.0,
+                                .input_sample_rate_hz = 60'000.0}),
+         "the ordinary decoder branch configures the region demodulator");
+  expect(demodulator.outputSampleRateHz() >= 2.0 * 24'000.0,
+         "the configured output rate honours the 2W rule");
+  expect(!demodulator.configure({.bandwidth_hz = 24'000.0,
+                                 .input_sample_rate_hz = 24'000.0}),
+         "a region as wide as the stream carrying it is refused");
+  expect(!demodulator.configure({.bandwidth_hz = 24'000.0,
+                                 .input_sample_rate_hz = 8'000'000.0}),
+         "the hardware stream is not a region stream and is refused");
+}
+
+// The demodulation itself. A complex tone at a known offset inside the region
+// must land at one audio frequency and nowhere else -- in particular not at the
+// frequency it would reach if the shift went the other way, which is the single
+// most plausible way to get this wrong and the one that still sounds like CW.
+void testRegionAudioSingleSideband() {
+  using cwassistant::core::IqRegionDemodulator;
+  constexpr double kBandwidthHz = 24'000.0;
+  constexpr double kInputRateHz = 60'000.0;
+  constexpr double kOffsetHz = 4'000.0;
+  IqRegionDemodulator demodulator;
+  expect(demodulator.configure({.bandwidth_hz = kBandwidthHz,
+                                .input_sample_rate_hz = kInputRateHz}),
+         "region demodulator configures for a 24 kHz region");
+  const double rate = demodulator.outputSampleRateHz();
+  // A station 4 kHz above the region centre sits 4 kHz above the middle of the
+  // audio window; one 4 kHz below sits the same distance the other way. Their
+  // true separation survives, which is what lets pitch say where in the region
+  // a signal actually is.
+  const double expected_hz = kBandwidthHz * 0.5 + kOffsetHz;
+  const double mirror_hz = kBandwidthHz * 0.5 - kOffsetHz;
+  const std::vector<float> audio =
+      demodulatedTone(demodulator, kInputRateHz, kOffsetHz, 60'000);
+  expect(!audio.empty(), "the region demodulator produces audio");
+  // Skips the interpolator's delay line filling; a quarter of a second of
+  // steady tone remains.
+  const std::size_t skip = std::min<std::size_t>(2'048, audio.size() / 4);
+  const double wanted = toneMagnitude(audio, rate, expected_hz, skip);
+  const double mirror = toneMagnitude(audio, rate, mirror_hz, skip);
+  expect(wanted > 0.2,
+         "a tone inside the region reaches the audio at its own offset");
+  expect(mirror < wanted * 0.02,
+         "the analytic source leaves no mirror image at the reflected audio "
+         "frequency");
+
+  // The other side of the region, to prove the mapping is a shift and not a
+  // fold: the two offsets must not arrive at the same pitch.
+  demodulator.reset();
+  const std::vector<float> below =
+      demodulatedTone(demodulator, kInputRateHz, -kOffsetHz, 60'000);
+  const double below_wanted = toneMagnitude(below, rate, mirror_hz, skip);
+  const double below_mirror = toneMagnitude(below, rate, expected_hz, skip);
+  expect(below_wanted > 0.2,
+         "a tone below the region centre reaches the audio below the centre");
+  expect(below_mirror < below_wanted * 0.02,
+         "a tone below the region centre leaves nothing above it");
+
+  // The region centre lands in the middle of the audio window, and the region
+  // edges land at 0 and at W.
+  demodulator.reset();
+  const std::vector<float> centre =
+      demodulatedTone(demodulator, kInputRateHz, 0.0, 60'000);
+  expect(toneMagnitude(centre, rate, kBandwidthHz * 0.5, skip) > 0.2,
+         "the region centre is heard at half the region width");
+
+  // Out-of-region content must not wrap into the middle of the window. A
+  // neighbour below the region would otherwise arrive at a low audio pitch
+  // through the Nyquist boundary, which is what makes the kernel a region
+  // filter rather than a bare interpolator.
+  demodulator.reset();
+  const std::vector<float> outside =
+      demodulatedTone(demodulator, kInputRateHz, -16'000.0, 60'000);
+  const double leaked = toneMagnitude(outside, rate, 4'000.0, skip);
+  expect(leaked < 0.02,
+         "a signal outside the region does not wrap into the audio window");
+}
+
+// Nothing is produced by a demodulator nobody configured. The feature is one
+// producer for three consumers, and a station with none of them listening must
+// pay nothing at all for it.
+void testRegionAudioIdleUntilConfigured() {
+  cwassistant::core::IqRegionDemodulator demodulator;
+  expect(!demodulator.configured(),
+         "a region demodulator starts unconfigured");
+  std::vector<std::complex<float>> samples(1'024, {0.5F, 0.5F});
+  std::vector<float> audio;
+  demodulator.process(samples.data(), samples.size(), audio);
+  expect(audio.empty(),
+         "an unconfigured region demodulator produces no audio at all");
+  expect(demodulator.maximumOutputSamples(1'024) == 0,
+         "an unconfigured region demodulator reserves nothing");
+}
+
 }  // namespace
 
 int main() {
@@ -406,6 +564,9 @@ int main() {
   testWideIqAcrossBlocksAndDiscovery();
   testChannelizerBridge();
   testConfigurationBounds();
+  testRegionAudioSampleRateRule();
+  testRegionAudioSingleSideband();
+  testRegionAudioIdleUntilConfigured();
   if (failures == 0) {
     std::cout << "All IQ receive tests passed\n";
   }

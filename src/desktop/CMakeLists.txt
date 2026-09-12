@@ -56,6 +56,8 @@ qt_add_executable(cw-buddy-desktop
   dxcluster/dx_cluster_client.hpp
   diagnostics/diagnostics_server.cpp
   diagnostics/diagnostics_server.hpp
+  diagnostics/audio_stream_server.cpp
+  diagnostics/audio_stream_server.hpp
   radio/hamlib_rigctld_client.cpp
   radio/hamlib_rigctld_client.hpp
   transmit/transmit_controller.cpp
@@ -327,6 +329,8 @@ if(CWA_BUILD_TESTS)
     dxcluster/dx_cluster_client.hpp
     diagnostics/diagnostics_server.cpp
     diagnostics/diagnostics_server.hpp
+    diagnostics/audio_stream_server.cpp
+    diagnostics/audio_stream_server.hpp
     replay/replay_controller.cpp
     replay/replay_controller.hpp
     replay/live_audio_worker.cpp
@@ -414,7 +418,9 @@ if(CWA_BUILD_TESTS)
   qt_add_executable(cwa_diagnostics_server_test
     ${PROJECT_SOURCE_DIR}/tests/desktop/diagnostics_server_test.cpp
     diagnostics/diagnostics_server.cpp
-    diagnostics/diagnostics_server.hpp)
+    diagnostics/diagnostics_server.hpp
+    diagnostics/audio_stream_server.cpp
+    diagnostics/audio_stream_server.hpp)
   # Binds only loopback and an unassignable TEST-NET-3 address, so running the
   # suite never puts an interface of the build machine on a socket.
   target_link_libraries(cwa_diagnostics_server_test PRIVATE
@@ -423,6 +429,25 @@ if(CWA_BUILD_TESTS)
     ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME cwa_diagnostics_server_test COMMAND cwa_diagnostics_server_test)
   set_tests_properties(cwa_diagnostics_server_test PROPERTIES TIMEOUT 60)
+
+  qt_add_executable(cwa_diagnostics_audio_stream_test
+    ${PROJECT_SOURCE_DIR}/tests/desktop/diagnostics_audio_stream_test.cpp
+    diagnostics/diagnostics_server.cpp
+    diagnostics/diagnostics_server.hpp
+    diagnostics/audio_stream_server.cpp
+    diagnostics/audio_stream_server.hpp)
+  # Loopback only, in both planes. The control port is chosen to sit one below
+  # a UDP port this test already holds, because the audio port is derived and
+  # never configurable -- that is the property being guarded -- so the test has
+  # to pick the control port to suit the receiver rather than the other way
+  # round.
+  target_link_libraries(cwa_diagnostics_audio_stream_test PRIVATE
+    Qt6::Core Qt6::Network)
+  target_include_directories(cwa_diagnostics_audio_stream_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME cwa_diagnostics_audio_stream_test
+    COMMAND cwa_diagnostics_audio_stream_test)
+  set_tests_properties(cwa_diagnostics_audio_stream_test PROPERTIES TIMEOUT 120)
 
   qt_add_executable(cwa_update_checker_test
     ${PROJECT_SOURCE_DIR}/tests/desktop/update_checker_test.cpp

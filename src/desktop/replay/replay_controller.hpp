@@ -322,6 +322,13 @@ class ReplayController final : public QObject {
   Q_INVOKABLE qulonglong displayFrequencyToRfHz(
       double display_frequency_hz) const noexcept;
   void setMonitorOutputSelection(QString encoded_device_id);
+  // Whether receive audio is currently being sent to a remote observer. Set by
+  // the application from the diagnostics service, which is the only thing that
+  // knows; relayed to the DSP worker so region audio is demodulated when
+  // somebody is listening and not otherwise. The controller neither owns nor
+  // interprets the subscription -- it is a wire, exactly as it is for the
+  // diagnostics records.
+  void setRemoteAudioSubscribed(bool subscribed);
 
   Q_INVOKABLE void openFile(const QUrl& url);
   Q_INVOKABLE void play();
@@ -418,6 +425,16 @@ class ReplayController final : public QObject {
   // know what addresses it is bound to, and does not know whether anything is
   // listening. The application decides where these records go.
   void diagnosticsRecordProduced(const QJsonObject& record);
+  // The decode region as real audio, relayed out of the live DSP worker on the
+  // worker's own thread. DIRECT for the same reason the diagnostics record is:
+  // a queued relay would route every audio buffer through the GUI thread, so
+  // the thread that draws would gate the stream a remote listener hears, and
+  // the sender at the far end of this signal already bounds itself. Adding a
+  // queue in front of a bounded sender is how an unbounded one is built by
+  // accident.
+  void receiveAudioProduced(const QByteArray& float_mono_audio,
+                            double sample_rate_hz);
+  void liveRemoteAudioSubscribedRequested(bool subscribed);
   void radioFrequencyChanged();
   void liveDebugCaptureStartRequested(const QString& directory_path);
   void liveDebugCaptureStopRequested();
@@ -465,6 +482,10 @@ class ReplayController final : public QObject {
   void publishLivePresentationDiagnostics(bool force);
   void resetDecoder();
   void publishMonitorConfiguration();
+  // The one description of what the monitor is currently doing. There were
+  // three copies of this ternary and a fourth mode would have had to be added
+  // to each of them.
+  [[nodiscard]] QString monitorStatusText() const;
   void writeMonitorAudio(const QByteArray& float_mono_audio,
                          double sample_rate_hz);
   void stopMonitorOutput();

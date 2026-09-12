@@ -3,6 +3,7 @@
 #include <QFile>
 #include <QJsonObject>
 #include <QMetaObject>
+#include <QFileInfo>
 #include <QTemporaryDir>
 #include <QThread>
 #include <QTimer>
@@ -28,6 +29,19 @@ constexpr int kDecoderWindowNotInForce = 21;
 constexpr int kGuiBlockMissing = 22;
 constexpr int kGuiLatenessNotReported = 23;
 constexpr int kGuiPeakNotWindowScoped = 24;
+
+// Region audio, from 30 up.
+constexpr int kRegionAudioWithoutConsumer = 30;
+constexpr int kRegionMonitorSilent = 31;
+constexpr int kRegionMonitorWrongRate = 32;
+constexpr int kRegionMonitorWrongPitch = 33;
+constexpr int kRegionMonitorMirrored = 34;
+constexpr int kRemoteAudioSilent = 35;
+constexpr int kRemoteAudioWrongRate = 36;
+constexpr int kCaptureIqMissing = 37;
+constexpr int kCaptureRegionAudioMissing = 38;
+constexpr int kRegionAudioNotReported = 39;
+constexpr int kRegionMonitorUnbounded = 40;
 
 // Two properties of the live DSP worker that only a complex-IQ session can
 // show, driven entirely through the block pipe so no receiver is required:
@@ -106,6 +120,277 @@ int runSpectrumBackpressureChecks() {
     return 20;
   }
   return 0;
+}
+
+// One demodulation of the decode region, three consumers, and nothing at all
+// when none of them wants it.
+//
+// The three are the local monitor (listen mode 3), a remote observer being sent
+// receive audio, and a running debug capture. An SDR capture used to contain no
+// listenable audio whatever -- the capture wrote EITHER audio.wav OR the SigMF
+// IQ, and an SDR session wrote the IQ -- so an operator recording a signal that
+// would not decode had nothing to play back beside it.
+int runRegionAudioChecks() {
+  auto pipe = std::make_shared<cwassistant::desktop::LiveAudioPipe>();
+  QThread dsp_thread;
+  auto* worker = new cwassistant::desktop::LiveAudioDspWorker(pipe);
+  worker->moveToThread(&dsp_thread);
+  QObject::connect(&dsp_thread, &QThread::finished, worker,
+                   &QObject::deleteLater);
+
+  std::vector<float> monitor_audio;
+  double monitor_rate_hz = 0.0;
+  int monitor_buffers = 0;
+  bool acknowledge_monitor = true;
+  std::vector<float> remote_audio;
+  double remote_rate_hz = 0.0;
+  const auto append = [](std::vector<float>& destination,
+                         const QByteArray& bytes) {
+    const auto count =
+        static_cast<std::size_t>(bytes.size() / static_cast<qsizetype>(sizeof(float)));
+    const std::size_t old_size = destination.size();
+    destination.resize(old_size + count);
+    std::memcpy(destination.data() + old_size, bytes.constData(),
+                count * sizeof(float));
+  };
+  // Direct, so every buffer is observed on the worker's own thread inside the
+  // blocking invocation that produced it. The monitor is acknowledged as it is
+  // taken, exactly as the controller acknowledges it, because the region path
+  // is bounded and an unacknowledged consumer would be cut off after eight
+  // buffers -- which is the bound working, not a fault.
+  QObject::connect(
+      worker, &cwassistant::desktop::LiveAudioDspWorker::monitorAudioProduced,
+      worker,
+      [&](const QByteArray& bytes, const double rate_hz) {
+        monitor_rate_hz = rate_hz;
+        ++monitor_buffers;
+        append(monitor_audio, bytes);
+        if (acknowledge_monitor) worker->noteMonitorAudioConsumed();
+      },
+      Qt::DirectConnection);
+  QObject::connect(
+      worker, &cwassistant::desktop::LiveAudioDspWorker::receiveAudioProduced,
+      worker,
+      [&](const QByteArray& bytes, const double rate_hz) {
+        remote_rate_hz = rate_hz;
+        append(remote_audio, bytes);
+      },
+      Qt::DirectConnection);
+  QString capture_base_path;
+  QObject::connect(
+      worker,
+      &cwassistant::desktop::LiveAudioDspWorker::debugCaptureStateChanged,
+      worker,
+      [&capture_base_path](const bool, const QString& path, const double,
+                           const QString&) {
+        if (!path.isEmpty()) capture_base_path = path;
+      },
+      Qt::DirectConnection);
+  QJsonObject record;
+  QObject::connect(
+      worker,
+      &cwassistant::desktop::LiveAudioDspWorker::diagnosticsRecordProduced,
+      worker, [&record](const QJsonObject& published) { record = published; },
+      Qt::DirectConnection);
+  // The demodulator's own sample counter, which is what makes "no work at all"
+  // an assertion rather than a claim. An emitted-buffer count cannot see the
+  // difference between a producer that did not run and one that ran and threw
+  // the result away, and the second is the fault worth catching: doing work at
+  // the rate data arrives rather than the rate a consumer needs is what this
+  // codebase keeps getting wrong.
+  const auto region_audio_samples = [&]() -> qint64 {
+    QMetaObject::invokeMethod(worker, "publishLiveDiagnosticsRecord",
+                              Qt::BlockingQueuedConnection);
+    return record.value(QStringLiteral("regionAudio"))
+        .toObject()
+        .value(QStringLiteral("samples"))
+        .toInteger(-1);
+  };
+
+  constexpr double kIqSampleRateHz = 240'000.0;
+  constexpr double kIqCenterHz = 14'050'000.0;
+  constexpr double kRegionBandwidthHz = 24'000.0;
+  // A carrier 4 kHz above the region centre. Region audio shifts the region up
+  // by half its width, so this station has to be heard at 12 + 4 = 16 kHz and
+  // at nothing else -- in particular not at 12 - 4 = 8 kHz, which is where it
+  // would land if the shift went the other way or the analytic property were
+  // lost on the way.
+  constexpr double kCarrierOffsetHz = 4'000.0;
+  constexpr double kExpectedAudioHz =
+      kRegionBandwidthHz * 0.5 + kCarrierOffsetHz;
+  constexpr double kMirrorAudioHz =
+      kRegionBandwidthHz * 0.5 - kCarrierOffsetHz;
+  constexpr std::size_t kIqBlockSamples = 2'048;
+  constexpr std::size_t kIqBlockCount = 160;
+  std::vector<cwassistant::core::RealtimeSampleBlock> iq_blocks(kIqBlockCount);
+  double phase = 0.0;
+  for (std::size_t index = 0; index < iq_blocks.size(); ++index) {
+    auto& block = iq_blocks[index];
+    block.stream.kind = cwassistant::core::StreamKind::ComplexIq;
+    block.stream.sample_rate_hz = kIqSampleRateHz;
+    block.stream.center_frequency_hz = kIqCenterHz;
+    block.stream.channel_count = 1;
+    block.sequence = index;
+    block.timestamp_ns = static_cast<std::uint64_t>(
+        static_cast<long double>(index * kIqBlockSamples) * 1'000'000'000.0L /
+        kIqSampleRateHz);
+    block.sample_count = kIqBlockSamples;
+    for (std::size_t sample = 0; sample < block.sample_count; ++sample) {
+      block.samples[sample] = {0.5F * static_cast<float>(std::cos(phase)),
+                               0.5F * static_cast<float>(std::sin(phase))};
+      phase += 2.0 * std::numbers::pi * kCarrierOffsetHz / kIqSampleRateHz;
+    }
+  }
+  std::size_t next_block = 0;
+  const auto feed = [&](const std::size_t blocks) {
+    for (std::size_t fed = 0; fed < blocks && next_block < iq_blocks.size();) {
+      std::size_t pushed = 0;
+      while (fed < blocks && next_block < iq_blocks.size() && pushed < 8 &&
+             pipe->blocks.try_push(iq_blocks[next_block])) {
+        ++next_block;
+        ++fed;
+        ++pushed;
+      }
+      QMetaObject::invokeMethod(worker, "drain", Qt::BlockingQueuedConnection);
+    }
+  };
+  const auto magnitude_at = [](const std::vector<float>& audio,
+                               const double rate_hz, const double frequency_hz,
+                               const std::size_t skip) {
+    if (audio.size() <= skip) return 0.0;
+    double real = 0.0;
+    double imaginary = 0.0;
+    for (std::size_t index = skip; index < audio.size(); ++index) {
+      const double angle = 2.0 * std::numbers::pi * frequency_hz *
+                           static_cast<double>(index) / rate_hz;
+      real += static_cast<double>(audio[index]) * std::cos(angle);
+      imaginary -= static_cast<double>(audio[index]) * std::sin(angle);
+    }
+    return std::hypot(real, imaginary) /
+           static_cast<double>(audio.size() - skip);
+  };
+
+  QTemporaryDir capture_root;
+  dsp_thread.start();
+  const int result = [&]() -> int {
+    QMetaObject::invokeMethod(worker, "start", Qt::BlockingQueuedConnection);
+    QMetaObject::invokeMethod(worker, "setSdrDecoderWindow",
+                              Qt::BlockingQueuedConnection,
+                              Q_ARG(double, kIqCenterHz),
+                              Q_ARG(double, kRegionBandwidthHz));
+
+    // 1. Nobody is listening. The monitor is off, no observer has subscribed
+    //    and no capture is running, so not a single sample must be demodulated
+    //    -- this is the fault this codebase keeps repeating, where work is done
+    //    at the rate data arrives rather than the rate a consumer needs.
+    feed(32);
+    const qint64 idle_samples = region_audio_samples();
+    if (idle_samples < 0) {
+      qCritical().noquote() << "no region audio block in the record:" << record;
+      return kRegionAudioNotReported;
+    }
+    if (idle_samples != 0 || !monitor_audio.empty() || !remote_audio.empty()) {
+      qCritical().noquote()
+          << "region audio produced with no consumer: demodulated="
+          << idle_samples << "monitor=" << monitor_audio.size()
+          << "remote=" << remote_audio.size();
+      return kRegionAudioWithoutConsumer;
+    }
+
+    // 2. The local monitor, in region mode.
+    QMetaObject::invokeMethod(worker, "setMonitor", Qt::BlockingQueuedConnection,
+                              Q_ARG(int, 3), Q_ARG(QVariantList, QVariantList{}),
+                              Q_ARG(double, 700.0));
+    feed(32);
+    if (monitor_audio.empty() || region_audio_samples() <= 0) {
+      return kRegionMonitorSilent;
+    }
+    // The rate invariant, at the one place an operator can hear it break: real
+    // audio sampled at Fs carries only Fs/2, so a 24 kHz region needs at least
+    // 48 kHz or its top half folds onto its bottom half.
+    if (monitor_rate_hz < 2.0 * kRegionBandwidthHz) {
+      qCritical().noquote() << "region audio rate" << monitor_rate_hz
+                            << "cannot carry a" << kRegionBandwidthHz
+                            << "Hz region";
+      return kRegionMonitorWrongRate;
+    }
+    const std::size_t skip = std::min<std::size_t>(4'096, monitor_audio.size() / 4);
+    const double wanted = magnitude_at(monitor_audio, monitor_rate_hz,
+                                       kExpectedAudioHz, skip);
+    const double mirror =
+        magnitude_at(monitor_audio, monitor_rate_hz, kMirrorAudioHz, skip);
+    if (wanted < 0.05) {
+      qCritical().noquote() << "region monitor carries no tone at"
+                            << kExpectedAudioHz << "Hz:" << wanted;
+      return kRegionMonitorWrongPitch;
+    }
+    if (mirror > wanted * 0.05) {
+      qCritical().noquote() << "region monitor is mirrored: wanted=" << wanted
+                            << "mirror=" << mirror;
+      return kRegionMonitorMirrored;
+    }
+
+    // 3. The bound. Region audio crosses to the thread that plays, and that
+    //    thread can stall; a producer that keeps emitting into a queue nobody
+    //    drains is how this application once grew to 668 MB and had to be
+    //    killed. A player that acknowledges nothing must stop receiving, not
+    //    accumulate.
+    acknowledge_monitor = false;
+    monitor_buffers = 0;
+    feed(32);
+    if (monitor_buffers >
+        cwassistant::desktop::LiveAudioDspWorker::
+            kMaximumMonitorBuffersInFlight) {
+      qCritical().noquote()
+          << "region audio was not bounded:" << monitor_buffers
+          << "buffers delivered to a player that acknowledged none";
+      return kRegionMonitorUnbounded;
+    }
+    acknowledge_monitor = true;
+
+    // 4. A remote observer. The monitor is switched off first, so what arrives
+    //    can only have come from the region demodulator and not from the
+    //    channel bank's own monitor path.
+    QMetaObject::invokeMethod(worker, "setMonitor", Qt::BlockingQueuedConnection,
+                              Q_ARG(int, 0), Q_ARG(QVariantList, QVariantList{}),
+                              Q_ARG(double, 700.0));
+    QMetaObject::invokeMethod(worker, "setRemoteAudioSubscribed",
+                              Qt::BlockingQueuedConnection, Q_ARG(bool, true));
+    remote_audio.clear();
+    feed(16);
+    if (remote_audio.empty()) return kRemoteAudioSilent;
+    if (remote_rate_hz < 2.0 * kRegionBandwidthHz) return kRemoteAudioWrongRate;
+
+    // 5. A debug capture of an SDR session must produce BOTH files. The IQ is
+    //    the forensic payload and the audio is what an operator can actually
+    //    listen to; writing one instead of the other is the reported fault.
+    QMetaObject::invokeMethod(worker, "setRemoteAudioSubscribed",
+                              Qt::BlockingQueuedConnection, Q_ARG(bool, false));
+    QMetaObject::invokeMethod(worker, "startDebugCapture",
+                              Qt::BlockingQueuedConnection,
+                              Q_ARG(QString, capture_root.path()));
+    feed(16);
+    QMetaObject::invokeMethod(worker, "stopDebugCapture",
+                              Qt::BlockingQueuedConnection);
+    if (capture_base_path.isEmpty()) return kCaptureIqMissing;
+    const QFileInfo iq_file(capture_base_path +
+                            QStringLiteral("/iq.sigmf-data"));
+    if (!iq_file.exists() || iq_file.size() <= 0) return kCaptureIqMissing;
+    const QFileInfo audio_file(capture_base_path +
+                               QStringLiteral("/audio.wav"));
+    if (!audio_file.exists() || audio_file.size() <= 44) {
+      qCritical().noquote()
+          << "SDR capture wrote no listenable audio beside its IQ:"
+          << capture_base_path << "audio exists=" << audio_file.exists()
+          << "size=" << audio_file.size();
+      return kCaptureRegionAudioMissing;
+    }
+    return 0;
+  }();
+  QMetaObject::invokeMethod(worker, "stop", Qt::BlockingQueuedConnection);
+  dsp_thread.quit();
+  dsp_thread.wait();
+  return result;
 }
 
 int runComplexIqDiagnosticsChecks() {
@@ -236,6 +521,10 @@ int main(int argc, char* argv[]) {
   if (const int backpressure_result = runSpectrumBackpressureChecks();
       backpressure_result != 0) {
     return backpressure_result;
+  }
+  if (const int region_audio_result = runRegionAudioChecks();
+      region_audio_result != 0) {
+    return region_audio_result;
   }
   auto pipe = std::make_shared<cwassistant::desktop::LiveAudioPipe>();
   QThread dsp_thread;

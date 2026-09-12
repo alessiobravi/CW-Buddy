@@ -6,7 +6,163 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The decode region can be listened to as ordinary audio -- the whole region,
+  not one selected stream. A **REGION** setting joins OFF and RX on the receiver
+  toolbar while direct SDR is the source, and the same audio is carried to a
+  remote observer and written into a debug capture. Every signal in the window
+  is heard together, each at the pitch its own offset from the region centre
+  gives it, so a higher tone is a station higher in the region. That is
+  deliberately different from a decoder card's speaker, which narrow-filters one
+  carrier and re-pitches it to the configured reference tone.
+
+  The region is demodulated once and shared by all three consumers. Real audio
+  sampled at Fs carries only 0 to Fs/2 while the complex stream it comes from
+  carries its whole sample rate, so a region W wide needs at least 2W of audio
+  or its top half folds onto its bottom half and two stations at opposite ends
+  of the window arrive at the same pitch. The rule is the smallest of 48, 96 and
+  192 kHz that is at least twice the region width. Because the source is
+  analytic there is no image: the region is shifted up by half its width and the
+  real part taken, and a station keeps its true position in the window. Nothing
+  is demodulated unless something is listening -- region listening selected, an
+  observer actually being sent audio, or a capture recording -- and it costs
+  1.9 ms of processor time per second of audio at the full region width.
+
+- Receive audio reaches a remote observer over UDP on the same port as the
+  diagnostics stream. The observer authenticates on the existing TCP control
+  connection and asks with a single fixed request; audio is sent only to the
+  address that connection came from, only while the operator has explicitly
+  allowed it, and stops when the connection closes. Datagrams are a 28-byte
+  self-describing header then mono 16-bit PCM. The sender is bounded and drops
+  rather than buffers, with the count published in the diagnostics record and in
+  each datagram header, so a gap in a remote recording can be told from network
+  loss.
+
+- A captured band can be read back. The application has written SigMF since IQ
+  capture was added and nothing in the tree could open one, so the only
+  recordings replayable through the decoder were single-station WAV files. That
+  gap is why two recent measurements could not be judged at all: a
+  callsign-stability rule measured inert across the corpus because every clip
+  holds one station whose single identification dominates its text, and a
+  proposed bound on the refinement passes had nothing to bound because across
+  seventeen transmission boundaries not one accepts a refinement. Neither result
+  says the change is wrong; both say the corpus cannot contain the answer.
+  `IqReplaySource` is the exact inverse of the writer, hands blocks back shaped
+  as a live receiver delivers them, parses the sidecar strictly with no JSON
+  dependency, and refuses what it cannot understand with a reason rather than
+  guessing a rate nobody recorded.
+
+### Changed
+
+- The decoder follows 64 simultaneous carriers instead of 24, configurable to
+  128. The old limit was not a decision: the display held 24 hand-written
+  colours, the colour-lease table was sized to that palette, and the track cap
+  was sized to the leases -- so how many stations could be decoded was set by
+  the length of a list of hex strings. A capture of a real pileup holds about 50
+  stations in a 6 kHz window at a median spacing of 70 Hz, all of them real, so
+  half that band could not be tracked at any setting; live diagnostics also read
+  `tracks: 24` pinned flat, which looked like a busy band and was the bank
+  saturated against its cap. The new default is a measured budget -- under a
+  twentieth of one core, no audio block over a fifth of its period -- not a
+  round number.
+
+- Track colours are generated rather than read from a table, so the palette no
+  longer limits how many stations can be tracked. Hues are placed a golden angle
+  apart in CIE L*a*b*, with lightness and chroma held inside a band that stays
+  readable over a dark waterfall, which keeps any two tracks distinguishable for
+  any number of them. The palette is randomised at each launch and fixed for the
+  life of a run, so a frequency heard again inside the five-minute
+  colour-identity window still looks like the same station.
+
+- A stream that identified itself keeps its place on the waterfall about twice
+  as long as one that never did. The longer hold is in the display's retained
+  observation, not in track expiry: a track owns a decoder, a bank slot and a
+  frequency cell that a genuinely new station has to be able to take over, and
+  an earlier attempt that held an identified track alive twice as long stopped
+  that takeover and silently broke identity inheritance.
+
+- The diagnostics stream protocol version is now 2. It accepts two request lines
+  from an authenticated client, so `emitOnly` in the greeting is `false`; a
+  version 1 reader should refuse the stream rather than rely on a withdrawn
+  guarantee.
+
+- The decode region is capped at 24 kHz. The region is not only decoded, it is
+  also what an operator listens to, and 48 kHz audio carries 24 kHz of bandwidth
+  and no more. Capping it means the decode region *is* the listen window -- one
+  number, no second concept, and nothing that can be decoded but never heard.
+
 ### Fixed
+
+- A crowded band produced a transcript for every carrier in it, and almost all
+  of them were noise. In an operator capture of a DX pileup -- about fifty
+  stations in six kilohertz, median spacing 70 Hz, minimum 52 Hz -- one station
+  was isolated and decoded cleanly while the rest were calling it from closer
+  together than any filter can separate. The sum of several keyers is not Morse,
+  so what reached the transcript list was roughly forty pages of nonsense and
+  one real contact. Narrowing the filter does not help and was measured not to:
+  at 30 Hz the timing statistics look plausible again and the decoded text stays
+  noise.
+
+  Each track's keying speed is now estimated twice, through the narrowest and
+  the widest analysis filter it is already carried in. One keyer reads nearly
+  the same speed through both, because widening admits more noise but no more
+  keying; several superimposed do not, because the wider filter admits the
+  neighbours, their envelopes beat, and their runs fragment. On the capture, of
+  twenty-one carriers measured exactly one read as a single keyer -- 20.6
+  against 24.4 words per minute, a ratio of 1.19 -- and it is the one that
+  decodes. The next-nearest read 1.83 and the rest ran to 3.50.
+
+  A track that reads as several keyers keeps everything an operator tunes by:
+  detection, frequency, marker, colour, signal level and key activity. It stops
+  publishing open-ended text and a station name, neither of which the signal
+  supports, and reports `unresolved-keyer-overlap` as the reason. The verdict
+  needs about a second and a half of consistent evidence to change in either
+  direction, so a pileup thinning for one word does not flip a stream between
+  copy and silence. This is a statement about effort spent so far rather than a
+  permanent one: carriers this close can be separated by solving neighbours
+  jointly rather than filtering them apart, so a refused track records how
+  crowded its neighbourhood is and by how much its estimate diverged, and that
+  work can be aimed where it would help. Clean single stations are unaffected,
+  which was the requirement -- the surface benchmark still reads the same
+  twenty-six callsigns correctly.
+
+- A stream that had identified kept changing its name. One station read `EH3ST`
+  cleanly eight times in a minute and `EH3S`, `EH3SN`, `EHSMST` and `EG7S` once
+  each in between; the label followed every one of them in turn. The name was
+  recomputed from scratch on every snapshot and written straight over the name
+  already earned, so one momentary misdecode both renamed the stream and became
+  the new memory, persisting into the silence that followed. The name now
+  carries its evidence: an empty reading changes nothing, because a station that
+  stopped sending is not evidence a different one arrived; one clean
+  identification still names a stream immediately, but a name read twice becomes
+  established and a disagreeing reading must itself be read twice before it
+  takes over. Replacement still clears name, evidence and challenger together.
+
+- The decode region snapped back to the settings value after a restart. A width
+  set by dragging took effect immediately and held for the session, but only the
+  settings dialog's Apply ever wrote the region to disk and the main window has
+  no Apply to press. The region is now committed the moment it is chosen, from
+  wherever it is chosen. One writer, the two keys the region already used, and
+  no session-only copy to disagree with the saved one. The drag reports once on
+  release, so one selection is one write; a receiver following the radio's VFO
+  still does not write as it tracks.
+
+- A debug capture of a direct SDR source contained no audio anybody could listen
+  to. The capture wrote either `audio.wav` or the SigMF IQ pair, and an SDR
+  session wrote the IQ -- so an operator recording a signal that would not decode
+  was left with a file they could analyse and nothing they could play. An SDR
+  capture now writes the demodulated decode region to `audio.wav` alongside the
+  IQ. The IQ recording is unchanged and the capture still refuses to mix sample
+  kinds within one file: this is a second file, not a change to the first.
+
+- The decode window was nearly invisible. Its transparency was expressed twice
+  -- an 8.6% alpha in the fill colour and an item opacity of 0.34 -- which
+  multiplied to under 3%. Worse, an item opacity dims its children, so the
+  border and the label faded with it: the two parts that carry the meaning were
+  attenuated along with the tint that only has to hint. The fill stays
+  translucent enough to read the spectrum through; the edge and the label are
+  drawn at full strength.
 
 - Decoding got steadily more expensive the longer the application was left
   running, so a session that started responsive ended up having to be killed.

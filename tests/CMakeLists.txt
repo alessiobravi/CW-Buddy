@@ -118,6 +118,14 @@ target_link_libraries(cwa_decoder_surface_benchmark PRIVATE cwa_core)
 add_test(NAME cwa_decoder_surface_benchmark
   COMMAND cwa_decoder_surface_benchmark)
 
+add_executable(cwa_audio_stream_consent_qml_test
+  desktop/audio_stream_consent_qml_test.cpp)
+target_compile_definitions(cwa_audio_stream_consent_qml_test PRIVATE
+  CWA_MAIN_QML_PATH="${PROJECT_SOURCE_DIR}/src/desktop/qml/Main.qml"
+  CWA_DESKTOP_MAIN_CPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/main.cpp")
+add_test(NAME cwa_audio_stream_consent_qml_test
+  COMMAND cwa_audio_stream_consent_qml_test)
+
 add_executable(cwa_update_notice_qml_test
   desktop/update_notice_qml_test.cpp)
 target_compile_definitions(cwa_update_notice_qml_test PRIVATE

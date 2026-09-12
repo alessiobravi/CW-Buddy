@@ -1720,16 +1720,30 @@ void AppSettings::setSdrBandwidthHz(const int value) {
     emit settingsChanged();
   }
 }
+void AppSettings::persistSdrDecoderWindow() {
+  QSettings settings;
+  settings.setValue(storageKey(QStringLiteral("sdr/decoderCenterFrequencyHz")),
+                    QVariant::fromValue(sdr_decoder_center_frequency_hz_));
+  settings.setValue(storageKey(QStringLiteral("sdr/decoderBandwidthHz")),
+                    sdr_decoder_bandwidth_hz_);
+}
 void AppSettings::setSdrDecoderCenterFrequencyHz(const qulonglong value) {
   const auto bounded = std::clamp<qulonglong>(value, 1ULL, 99'000'000'000ULL);
   if (assign_if_changed(sdr_decoder_center_frequency_hz_, bounded)) {
+    // Written before the signals, so that a listener which corrects the
+    // region -- the acquisition span clamp does -- writes its correction
+    // after this and therefore last. The stored pair ends up being the one
+    // that is actually in force.
+    persistSdrDecoderWindow();
     emit sdrSettingsChanged();
     emit settingsChanged();
   }
 }
 void AppSettings::setSdrDecoderBandwidthHz(const int value) {
-  const int bounded = std::clamp(value, 2'000, 96'000);
+  const int bounded = std::clamp(value, kMinimumSdrDecoderBandwidthHz,
+                                 kMaximumSdrDecoderBandwidthHz);
   if (assign_if_changed(sdr_decoder_bandwidth_hz_, bounded)) {
+    persistSdrDecoderWindow();
     emit sdrSettingsChanged();
     emit settingsChanged();
     if (sdr_follow_radio_vfo_) followSdrToRadioVfo();
@@ -1739,12 +1753,18 @@ void AppSettings::setSdrDecoderWindow(const qulonglong center_frequency_hz,
                                       const int bandwidth_hz) {
   const auto bounded_center =
       std::clamp<qulonglong>(center_frequency_hz, 1ULL, 99'000'000'000ULL);
-  const int bounded_bandwidth = std::clamp(bandwidth_hz, 2'000, 96'000);
+  const int bounded_bandwidth =
+      std::clamp(bandwidth_hz, kMinimumSdrDecoderBandwidthHz,
+                 kMaximumSdrDecoderBandwidthHz);
   const bool center_changed =
       assign_if_changed(sdr_decoder_center_frequency_hz_, bounded_center);
   const bool bandwidth_changed =
       assign_if_changed(sdr_decoder_bandwidth_hz_, bounded_bandwidth);
   if (center_changed || bandwidth_changed) {
+    // This is the end of a spectrum drag: the gesture reports once, on
+    // release, not while the pointer moves, so one selection is one write and
+    // there is nothing here to coalesce.
+    persistSdrDecoderWindow();
     emit sdrSettingsChanged();
     emit settingsChanged();
   }
@@ -2959,7 +2979,8 @@ bool AppSettings::apply() {
   sdr_sample_rate_hz_ = std::clamp(sdr_sample_rate_hz_, 25'000, 64'000'000);
   sdr_bandwidth_hz_ = std::clamp(sdr_bandwidth_hz_, 0, 64'000'000);
   sdr_decoder_bandwidth_hz_ =
-      std::clamp(sdr_decoder_bandwidth_hz_, 2'000, 96'000);
+      std::clamp(sdr_decoder_bandwidth_hz_, kMinimumSdrDecoderBandwidthHz,
+                 kMaximumSdrDecoderBandwidthHz);
   sdr_decoder_center_frequency_hz_ = std::clamp<qulonglong>(
       sdr_decoder_center_frequency_hz_, 1ULL, 99'000'000'000ULL);
   sdr_radio_lo_offset_hz_ =
@@ -3405,11 +3426,14 @@ void AppSettings::load() {
                  QVariant::fromValue<qulonglong>(sdr_center_frequency_hz_))
           .toULongLong(),
       1ULL, 99'000'000'000ULL);
+  // A region saved by an earlier version could be wider than an operator can
+  // now listen to, so it is narrowed on the way in rather than left to
+  // surprise them later.
   sdr_decoder_bandwidth_hz_ = std::clamp(
       settings
           .value(storageKey(QStringLiteral("sdr/decoderBandwidthHz")), 24'000)
           .toInt(),
-      2'000, 96'000);
+      kMinimumSdrDecoderBandwidthHz, kMaximumSdrDecoderBandwidthHz);
   sdr_follow_radio_vfo_ =
       settings.value(storageKey(QStringLiteral("sdr/followRadioVfo")), false)
           .toBool();

@@ -499,6 +499,20 @@ class AppSettings final : public QObject {
   [[nodiscard]] const QString& sdrAntenna() const noexcept;
   [[nodiscard]] qulonglong sdrDecoderCenterFrequencyHz() const noexcept;
   [[nodiscard]] int sdrDecoderBandwidthHz() const noexcept;
+  // The bounds of the decode region, wherever it is set from -- the settings
+  // list, a drag across the spectrum, or a value restored from disk.
+  //
+  // The ceiling is 24 kHz because the region is not only decoded, it is also
+  // what an operator listens to: it is demodulated to audio for the monitor
+  // and for the remote stream, and audio at 48 kHz carries 24 kHz of
+  // bandwidth and no more. A wider region could be decoded and never heard,
+  // which would quietly make one setting mean two different things depending
+  // on which half of the application was asked. Kept here rather than written
+  // at each of the four places that bound this value, because a limit that
+  // exists in four copies is a limit that will eventually disagree with
+  // itself.
+  static constexpr int kMinimumSdrDecoderBandwidthHz = 2'000;
+  static constexpr int kMaximumSdrDecoderBandwidthHz = 24'000;
   [[nodiscard]] bool sdrFollowRadioVfo() const noexcept;
   [[nodiscard]] int sdrTuningStepHz() const noexcept;
   [[nodiscard]] QString sdrRadioSyncStatus() const;
@@ -890,6 +904,25 @@ class AppSettings final : public QObject {
   void reconcilePendingRxFrequency();
   void rememberPendingRxFrequency(std::uint64_t frequency_hz);
   [[nodiscard]] std::optional<std::uint64_t> observedRadioRxRfHz() const noexcept;
+  // Commits the decode region to disk at the moment it is chosen, instead of
+  // waiting for the settings dialog's Apply.
+  //
+  // The region is mostly set from the main window -- a CTRL+RIGHT drag across
+  // the spectrum, a right-click that points it -- and that window has no Apply
+  // button, so a value only written by apply() was lost by exactly the restart
+  // it was supposed to survive: a dragged width worked until the application
+  // closed and then snapped back to whatever Apply had last stored.
+  //
+  // Both keys go out together because the region is one thing. Writing only
+  // the one that changed would leave a stored centre from one selection beside
+  // a width from another, and the pair is read back as a pair.
+  //
+  // Exactly these two keys are written and nothing else, so a half-finished
+  // edit elsewhere on the settings page stays uncommitted. This follows
+  // setPreferredSourceMode, which already writes its single key through for
+  // the same reason; it is deliberately not a general "persist on every
+  // setter" rule.
+  void persistSdrDecoderWindow();
   void setSdrRadioWindow(std::uint64_t rx_frequency_hz);
   bool writeRadioRxDialFrequency(std::uint64_t dial_frequency_hz);
   void invalidateDirectKeyingAcceptance(QString status);

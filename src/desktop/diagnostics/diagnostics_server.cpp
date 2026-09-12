@@ -5,6 +5,7 @@
 #include <QChar>
 #include <QDateTime>
 #include <QHostAddress>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QLatin1Char>
@@ -34,13 +35,39 @@ constexpr char16_t kHighestC1Control = 0x009F;
 // The line-delimited JSON dialect this stream speaks, announced in the
 // greeting so that a reader can refuse a version it does not know instead of
 // misreading it.
-constexpr int kStreamProtocolVersion = 1;
+//
+// 2 rather than 1 because `emitOnly` changed meaning. A reader written against
+// version 1 was told, truthfully at the time, that nothing it sent would be
+// read; it may have relied on that, and this stream now accepts two request
+// lines. Adding fields would not have needed a new version, but withdrawing a
+// promise does: a version 1 reader should refuse this stream and say so rather
+// than carry on under a guarantee that has been taken away.
+constexpr int kStreamProtocolVersion = 2;
 
 // A requested address is text the operator typed or pasted, and it is echoed
 // back in the status line when it cannot be bound. It is bounded and reduced
 // to printable ASCII first: the status line is shown in the UI, and a pasted
 // control character has no business reaching it.
 constexpr int kMaximumQuotedAddressLength = 64;
+
+// THE CLOSED SET. Every request this service accepts, in full. Two byte
+// strings, compared whole against a client's line; there is nothing else to
+// match, nothing inside either of them to read, and no third entry that can be
+// reached by spelling one of these differently.
+//
+// Written as `QByteArrayLiteral` and compared with `==` so the comparison is
+// length-plus-memcmp and cannot be turned into a prefix or a starts-with by a
+// later edit that looked harmless. They are deliberately single hyphenated
+// words rather than a verb and a noun: `start-audio-stream` has no space in it
+// for somebody to later read as an argument separator.
+const QByteArray& startAudioStreamRequest() {
+  static const QByteArray request = QByteArrayLiteral("start-audio-stream");
+  return request;
+}
+const QByteArray& stopAudioStreamRequest() {
+  static const QByteArray request = QByteArrayLiteral("stop-audio-stream");
+  return request;
+}
 
 // Printable ASCII only, and bounded. The same treatment the cluster client
 // gives a spotter, for the same reason: this text is displayed, never used.
@@ -132,9 +159,31 @@ constexpr int kMaximumQuotedAddressLength = 64;
               .arg(missing.join(QStringLiteral(", ")))};
 }
 
+// What the status line says about audio, or nothing at all when the operator
+// has not turned it on.
+//
+// Silent while it is off, on purpose: an operator who has not asked for this
+// does not need a sentence about it in every status line they read. The moment
+// it is on it says so in every one of them, and it names the count separately
+// from the permission, because "allowed" and "leaving this machine right now"
+// are different facts and only the second one is urgent.
+[[nodiscard]] QString audioStatusClause(const bool audio_enabled,
+                                        const int subscribers) {
+  if (!audio_enabled) return {};
+  if (subscribers == 0) {
+    return QStringLiteral(
+        "Receive audio may be streamed on request; nobody is receiving it.");
+  }
+  return subscribers == 1
+             ? QStringLiteral("Receive audio is being sent to one observer.")
+             : QStringLiteral("Receive audio is being sent to %1 observers.")
+                   .arg(subscribers);
+}
+
 // The operator-facing status line, rebuilt from state whenever any part of it
 // changes so that it always answers the same questions in the same order:
-// what is bound, what is not, and who is watching.
+// what is bound, what is not, who is watching, and whether audio is leaving
+// the machine.
 //
 // `detail` carries the one thing the state cannot recover afterwards -- the
 // exact reason for the thing that just happened -- and is dropped on the next
@@ -142,6 +191,7 @@ constexpr int kMaximumQuotedAddressLength = 64;
 [[nodiscard]] QString statusLine(const QStringList& bound,
                                  const QStringList& notes,
                                  const int client_count,
+                                 const QString& audio_clause,
                                  const QString& detail) {
   QStringList parts;
   parts.append(bound.isEmpty()
@@ -157,6 +207,7 @@ constexpr int kMaximumQuotedAddressLength = 64;
                            : QStringLiteral("%1 observers are connected.")
                                  .arg(client_count));
   }
+  if (!audio_clause.isEmpty()) parts.append(audio_clause);
   if (!detail.isEmpty()) parts.append(detail);
   return parts.join(QLatin1Char(' '));
 }
@@ -183,6 +234,31 @@ constexpr int kMaximumQuotedAddressLength = 64;
   return difference == 0;
 }
 
+// How the audio datagrams are shaped, as the greeting and the start
+// confirmation both describe them.
+//
+// Sent rather than left to documentation, and sent identically in both places
+// by being built here once, so that a receiver can be written from what the
+// stream itself said. Every field a decoder needs is present: where the
+// payload begins, what the samples are, and how large a datagram can be. The
+// sample rate is not here because it is not fixed -- it travels in each
+// datagram's own header, which is what lets a receiver start recording without
+// having been told what the station is running.
+[[nodiscard]] QJsonObject audioFormatObject() {
+  QJsonObject format;
+  format.insert(QStringLiteral("transport"), QStringLiteral("udp"));
+  format.insert(QStringLiteral("magic"), QStringLiteral("CWA1"));
+  format.insert(QStringLiteral("headerBytes"),
+                AudioStreamServer::kHeaderBytes);
+  format.insert(QStringLiteral("payload"),
+                QStringLiteral("mono signed 16-bit PCM, big-endian"));
+  format.insert(QStringLiteral("maximumSamplesPerDatagram"),
+                AudioStreamServer::kMaximumSamplesPerDatagram);
+  format.insert(QStringLiteral("maximumDatagramBytes"),
+                AudioStreamServer::kMaximumDatagramBytes);
+  return format;
+}
+
 // The first line an authenticated peer receives.
 //
 // It exists to say what this stream is, and the honesty of what it says is the
@@ -190,13 +266,23 @@ constexpr int kMaximumQuotedAddressLength = 64;
 // written before the token has been accepted, so a peer that cannot
 // authenticate learns only that something is listening.
 //
-// `emitOnly` stays true and now means exactly what it says for every byte
-// after the handshake. One line is read from a client -- the token, before
-// this greeting -- and nothing received afterwards is read or acted on. No
-// `challenge` field is sent: the exchange is one line in one direction, not a
-// challenge, and a field named for something else would misdescribe it. The
-// token itself is never transmitted, because sending the operator's secret to
-// a peer would hand out the only thing protecting a bound routable address.
+// `emitOnly` IS NOW FALSE, and that is why the protocol version moved. This
+// stream accepts two request lines, and a greeting that kept claiming
+// otherwise would be the same broken promise the class comment exists to
+// avoid. `requests` lists the whole closed set in the greeting, so a peer
+// learns what may be asked from the stream itself rather than from a document
+// -- and so the list a peer is shown and the list the code compares against
+// are built from the same two constants and cannot drift apart.
+//
+// No `challenge` field is sent: the token exchange is one line in one
+// direction, not a challenge, and a field named for something else would
+// misdescribe it. The token itself is never transmitted, because sending the
+// operator's secret to a peer would hand out the only thing protecting a bound
+// routable address.
+//
+// `audio.enabled` is a snapshot and says so: it is the state at the moment the
+// greeting was written, and the answer that binds is the one the station sends
+// back when a stream is actually asked for.
 //
 // THE TOKEN NOW GATES BOTH BINDING AND ACCESS. It still decides whether a
 // routable address may be bound at all, and it is additionally required from
@@ -211,32 +297,84 @@ constexpr int kMaximumQuotedAddressLength = 64;
 // that the notice describes what actually happened rather than the common
 // case. A stream with no token configured is a stream every bound address of
 // which is loopback; the binding rule below is what makes that true.
-[[nodiscard]] QByteArray greetingLine(const bool token_presented) {
+[[nodiscard]] QByteArray greetingLine(const bool token_presented,
+                                      const bool audio_enabled,
+                                      const bool audio_listening,
+                                      const quint16 audio_port) {
   QJsonObject greeting;
   greeting.insert(QStringLiteral("event"),
                   QStringLiteral("diagnostics-stream-open"));
   greeting.insert(QStringLiteral("protocol"), kStreamProtocolVersion);
-  greeting.insert(QStringLiteral("emitOnly"), true);
+  greeting.insert(QStringLiteral("emitOnly"), false);
   greeting.insert(QStringLiteral("authenticated"), true);
   greeting.insert(QStringLiteral("openedUnixMs"),
                   QDateTime::currentMSecsSinceEpoch());
   greeting.insert(
+      QStringLiteral("requests"),
+      QJsonArray{QString::fromUtf8(startAudioStreamRequest()),
+                 QString::fromUtf8(stopAudioStreamRequest())});
+  QJsonObject audio = audioFormatObject();
+  audio.insert(QStringLiteral("enabled"), audio_enabled);
+  // Separate from `enabled` on purpose. The first is the operator's
+  // permission; the second is whether this station can actually send. A
+  // service that was allowed to stream but could not bind its audio port must
+  // not read as one that is ready.
+  audio.insert(QStringLiteral("listening"), audio_listening);
+  // The same number as the control connection, which is the whole port design:
+  // one port, TCP for control and records, UDP for audio.
+  audio.insert(QStringLiteral("port"), audio_port);
+  audio.insert(
+      QStringLiteral("notice"),
+      !audio_enabled
+          ? QStringLiteral(
+                "The operator has not allowed receive audio to leave this "
+                "station. start-audio-stream will be refused until they do, "
+                "and asking does not turn it on.")
+      : audio_listening
+          ? QStringLiteral(
+                "The operator has allowed receive audio to be streamed. Ask "
+                "for it with start-audio-stream; it is sent over UDP to the "
+                "address this connection came from, on this same port number.")
+          : QStringLiteral(
+                "The operator has allowed receive audio, but this station "
+                "could not bind the audio port and cannot send any."));
+  greeting.insert(QStringLiteral("audio"), audio);
+  greeting.insert(
       QStringLiteral("notice"),
       token_presented
           ? QStringLiteral(
-                "This stream emits records to authenticated observers. Exactly "
-                "one line is ever read from a client -- the access token, "
-                "presented before this greeting -- and nothing sent after it "
-                "is read or acted on: a client that keeps sending is "
-                "disconnected. The token is one shared secret, and it also "
-                "decides which addresses this stream may be bound to.")
+                "This stream emits records to authenticated observers. Two "
+                "things are read from a client: the access token, presented "
+                "before this greeting, and afterwards request lines, each "
+                "compared whole against the closed set in `requests`. A line "
+                "that is not one of them ends the connection, and nothing a "
+                "client sends can reach the radio, the settings or the "
+                "decoder. The token is one shared secret, and it also decides "
+                "which addresses this stream may be bound to.")
           : QStringLiteral(
-                "This stream only emits. No access token is configured, which "
-                "is possible only because every bound address is loopback, so "
-                "this connection was authenticated without reading anything. "
-                "Nothing sent to this port is read or acted on: a client that "
-                "keeps sending is disconnected."));
+                "No access token is configured, which is possible only "
+                "because every bound address is loopback, so this connection "
+                "was authenticated without reading anything. Request lines "
+                "are read afterwards and are compared whole against the "
+                "closed set in `requests`; a line that is not one of them ends "
+                "the connection, and nothing a client sends can reach the "
+                "radio, the settings or the decoder."));
   QByteArray line = QJsonDocument(greeting).toJson(QJsonDocument::Compact);
+  line.append('\n');
+  return line;
+}
+
+// One answer to one request, in the same dialect as everything else this
+// stream writes, so a peer that already reads the stream needs nothing new to
+// read the reply.
+[[nodiscard]] QByteArray responseLine(const QString& event,
+                                      const QString& reason,
+                                      const QJsonObject& extra = {}) {
+  QJsonObject response = extra;
+  response.insert(QStringLiteral("event"), event);
+  response.insert(QStringLiteral("protocol"), kStreamProtocolVersion);
+  response.insert(QStringLiteral("reason"), reason);
+  QByteArray line = QJsonDocument(response).toJson(QJsonDocument::Compact);
   line.append('\n');
   return line;
 }
@@ -339,15 +477,16 @@ constexpr int kMaximumQuotedAddressLength = 64;
 
 }  // namespace
 
-// One connected observer. Once it is authenticated nothing here describes what
-// the peer sent, only how much of it was thrown away, because from that point
-// the content is never looked at.
+// One connected observer.
 //
-// Before that, `handshake_bytes` holds the one line this class ever reads. It
-// is bounded by `kMaximumHandshakeBytes`, it is released the moment the token
-// is accepted, and nothing else is ever put in it -- so after the handshake
-// there is no buffer of peer input anywhere in this class for a parser to be
-// attached to later.
+// Two bounded buffers and nothing else holds anything a peer sent.
+// `handshake_bytes` takes the token line, is bounded by
+// `kMaximumHandshakeBytes`, and is released the moment the token is accepted.
+// `request_bytes` takes one request line at a time, is bounded by
+// `kMaximumRequestBytes`, and is emptied as soon as a line is complete --
+// whether that line was one of the two accepted or ended the connection. There
+// is no third buffer, nothing accumulates across lines, and no peer bytes are
+// kept once a line has been decided.
 struct DiagnosticsServer::Client {
   QTcpSocket* socket{nullptr};
   // Runs only while this client still owes a token, and is stopped the moment
@@ -355,13 +494,38 @@ struct DiagnosticsServer::Client {
   // not hold one of the few slots this service has for ever.
   QTimer* handshake_timer{nullptr};
   QByteArray handshake_bytes;
-  qint64 ignored_input_bytes{0};
+  QByteArray request_bytes;
+  int request_count{0};
+  // Names this connection to the audio plane. A number rather than a pointer,
+  // so that the audio plane never holds a reference to a socket whose lifetime
+  // it does not control and a stale subscription cannot be followed to a
+  // client record that has been freed.
+  std::uint64_t id{0};
   bool authenticated{false};
 };
 
 DiagnosticsServer::DiagnosticsServer(QObject* parent) : QObject(parent) {
   status_message_ = QStringLiteral("Diagnostics stream is off.");
+  audio_ = new AudioStreamServer(this);
+  // The audio plane's own changes -- a subscription starting or ending, the
+  // operator's switch -- reach the status line and the indicator through the
+  // same path as everything else here, so there is one description of this
+  // service's state rather than two that can disagree.
+  connect(audio_, &AudioStreamServer::stateChanged, this, [this] {
+    rebuildStatus(QString());
+    emit stateChanged();
+  });
 }
+
+// The subscriber bound and the client bound are the same number on purpose: a
+// subscriber must already hold an authenticated control connection, so a
+// larger audio bound could never be reached and a smaller one would refuse
+// audio to an observer this service had already accepted. Stated as an
+// assertion rather than as a comment, because two constants in two files that
+// must match are exactly the pair somebody edits one of.
+static_assert(AudioStreamServer::kMaximumSubscribers ==
+                  DiagnosticsServer::kMaximumClients,
+              "the audio subscriber bound must match the client bound");
 
 DiagnosticsServer::~DiagnosticsServer() {
   // Torn down by hand rather than through `restart`, which reports the change
@@ -631,11 +795,44 @@ void DiagnosticsServer::setEnabled(const bool enabled) {
 
 bool DiagnosticsServer::enabled() const noexcept { return enabled_; }
 
+void DiagnosticsServer::setAudioStreamingEnabled(const bool enabled) {
+  // Straight through to the audio plane, which holds the consent and revokes
+  // every subscription when it is withdrawn. Nothing is decided here: this
+  // method exists so that the operator's switch has one entry point, reachable
+  // from the user interface and from nowhere a peer can influence.
+  audio_->setEnabled(enabled);
+}
+
+bool DiagnosticsServer::audioStreamingEnabled() const noexcept {
+  return audio_->enabled();
+}
+
+int DiagnosticsServer::audioSubscriberCount() const noexcept {
+  return audio_->subscriberCount();
+}
+
+bool DiagnosticsServer::audioListening() const noexcept {
+  return audio_->listening();
+}
+
+void DiagnosticsServer::publishAudio(const QByteArray& float_mono_audio,
+                                     const double sample_rate_hz) {
+  audio_->publishAudio(float_mono_audio, sample_rate_hz);
+}
+
 void DiagnosticsServer::publish(const QJsonObject& record) {
+  // The audio plane's counters ride out with the record rather than in a
+  // record of their own. A drop count means very little on its own and a great
+  // deal beside the throughput figures it now sits next to: both answer the
+  // same question about whether this station is keeping up, and separating
+  // them would leave a reader correlating two streams by timestamp to ask it.
+  QJsonObject augmented = record;
+  augmented.insert(QStringLiteral("audioStream"), audio_->statisticsRecord());
+
   // Compacted here, in whichever thread produced the record, so the thread
   // that owns this object -- the one also running the user interface -- pays
   // only for the write.
-  QByteArray payload = QJsonDocument(record).toJson(QJsonDocument::Compact);
+  QByteArray payload = QJsonDocument(augmented).toJson(QJsonDocument::Compact);
   payload.append('\n');
 
   auto deliver = [this, payload] {
@@ -680,6 +877,102 @@ void DiagnosticsServer::publish(const QJsonObject& record) {
   QMetaObject::invokeMethod(this, deliver, Qt::QueuedConnection);
 }
 
+// Acts on one complete, authenticated request line, and is the whole of what
+// a peer can make this application do.
+//
+// Read it as the safety argument in code. There are two comparisons, each
+// against a constant, and each leads to exactly one call on the audio plane.
+// There is no lookup table to add a row to, no prefix match, no argument to
+// pull out of the line and nothing that reads a byte of it -- the line is
+// used as a value, compared whole, and then discarded. A line that is neither
+// returns false, and the caller ends the connection.
+//
+// What neither branch can reach: the radio, the settings, the decoder, the
+// bind addresses, the token, the allowed-peer list, or the operator's consent
+// for audio. `subscribe` can only spend a permission the operator already
+// gave; it cannot create one. That is why `NotEnabled` is answered with a
+// sentence and not with an offer.
+bool DiagnosticsServer::handleRequestLine(Client* const client,
+                                          const QByteArray& line) {
+  if (client == nullptr) return false;
+  QTcpSocket* const socket = client->socket;
+  if (socket == nullptr) return false;
+
+  if (line == startAudioStreamRequest()) {
+    // Neither half of the destination comes from the peer. The address is the
+    // one this socket reports the connection arrived from, and the port is the
+    // port this connection is already on -- `localPort` rather than the
+    // configured value, so that a service asked for port 0 still names the
+    // port it actually came up on. The local address picks which bound audio
+    // socket it leaves by, so the audio reaches the observer from the address
+    // it connected to.
+    const AudioStreamServer::SubscribeOutcome outcome =
+        audio_->subscribe(client->id, socket->peerAddress(),
+                          socket->localAddress(), socket->localPort());
+    switch (outcome) {
+      case AudioStreamServer::SubscribeOutcome::Started: {
+        QJsonObject extra = audioFormatObject();
+        // Echoes the peer its own address. It learns nothing it did not
+        // already know, and it needs the port to open a receiver on.
+        extra.insert(QStringLiteral("destination"),
+                     audio_->destinationFor(client->id));
+        socket->write(responseLine(
+            QStringLiteral("audio-stream-started"),
+            QStringLiteral(
+                "Receive audio is being sent over UDP to the address this "
+                "connection came from, on this same port number. It is not "
+                "encrypted, it carries every signal in the passband, and it "
+                "stops when this connection closes."),
+            extra));
+        return true;
+      }
+      case AudioStreamServer::SubscribeOutcome::AlreadyStreaming:
+        socket->write(responseLine(
+            QStringLiteral("audio-stream-refused"),
+            QStringLiteral("Audio is already being sent to this connection.")));
+        return true;
+      case AudioStreamServer::SubscribeOutcome::NotEnabled:
+        // The answer that matters most, and the one that must never change
+        // shape under repetition: asking again does not turn it on, and asking
+        // does not tell the operator that somebody wants it either. Only they
+        // can start this, from the station.
+        socket->write(responseLine(
+            QStringLiteral("audio-stream-refused"),
+            QStringLiteral(
+                "The operator has not allowed receive audio to leave this "
+                "station. Only they can allow it, at the station.")));
+        return true;
+      case AudioStreamServer::SubscribeOutcome::TooManySubscribers:
+        socket->write(responseLine(
+            QStringLiteral("audio-stream-refused"),
+            QStringLiteral("At most %1 observers may receive audio at once.")
+                .arg(AudioStreamServer::kMaximumSubscribers)));
+        return true;
+      case AudioStreamServer::SubscribeOutcome::NoDestination:
+        socket->write(responseLine(
+            QStringLiteral("audio-stream-refused"),
+            QStringLiteral(
+                "This station could not bind its audio port, so it has "
+                "nowhere to send audio for this connection.")));
+        return true;
+    }
+    return true;
+  }
+
+  if (line == stopAudioStreamRequest()) {
+    const bool stopped = audio_->unsubscribe(client->id);
+    socket->write(responseLine(
+        QStringLiteral("audio-stream-stopped"),
+        stopped ? QStringLiteral("Receive audio is no longer being sent to "
+                                 "this connection.")
+                : QStringLiteral("Receive audio was not being sent to this "
+                                 "connection.")));
+    return true;
+  }
+
+  return false;
+}
+
 void DiagnosticsServer::acceptPending(QTcpServer* server) {
   if (server == nullptr) return;
   while (server->hasPendingConnections()) {
@@ -702,10 +995,7 @@ void DiagnosticsServer::acceptPending(QTcpServer* server) {
     if (!peerIsAllowed(peer, allowed_peers_)) {
       socket->abort();
       socket->deleteLater();
-      setStatus(statusLine(
-          bound_addresses_,
-          unboundAddressNotes(bind_addresses_, bound_addresses_),
-          clientCount(), peerRefusalDetail(peer, allowed_peers_)));
+      rebuildStatus(peerRefusalDetail(peer, allowed_peers_));
       emit stateChanged();
       continue;
     }
@@ -747,13 +1037,9 @@ void DiagnosticsServer::acceptPending(QTcpServer* server) {
       // valid token from an invalid one.
       connect(socket, &QTcpSocket::readyRead, socket,
               [socket] { socket->skip(socket->bytesAvailable()); });
-      setStatus(statusLine(
-          bound_addresses_,
-          unboundAddressNotes(bind_addresses_, bound_addresses_),
-          clientCount(),
-          QStringLiteral("An observer was refused: at most %1 may watch at "
-                         "once.")
-              .arg(kMaximumClients)));
+      rebuildStatus(QStringLiteral("An observer was refused: at most %1 may "
+                                   "watch at once.")
+                        .arg(kMaximumClients));
       emit stateChanged();
       continue;
     }
@@ -764,6 +1050,7 @@ void DiagnosticsServer::acceptPending(QTcpServer* server) {
     socket->setParent(this);
     Client* const client = new Client{};
     client->socket = socket;
+    client->id = next_client_id_++;
     clients_.append(client);
 
     // Whether this client owes a token. Asked of the configured token rather
@@ -827,45 +1114,110 @@ void DiagnosticsServer::acceptPending(QTcpServer* server) {
                                     "received no records."));
           return;
         }
-        // Authenticated. The buffer is released here and never refilled.
-        const qint64 trailing =
-            static_cast<qint64>(client->handshake_bytes.size()) -
-            (static_cast<qint64>(newline) + 1);
+        // Authenticated. The handshake buffer is released here and never
+        // refilled.
+        //
+        // Anything the peer queued behind its token line is carried into the
+        // request buffer rather than thrown away. A client that writes its
+        // token and its first request in one call is doing something ordinary,
+        // and losing the request silently would be a trap. More than one
+        // request line ahead of a greeting it has not read is not ordinary:
+        // that peer is not following this protocol, and it is disconnected
+        // rather than having part of what it sent acted on. The carry can
+        // therefore never exceed one line, so this cannot become a way to put
+        // more than a line in that buffer.
+        QByteArray carried = client->handshake_bytes.mid(newline + 1);
         client->handshake_bytes = QByteArray();
+        if (static_cast<qint64>(carried.size()) > kMaximumRequestBytes) {
+          dropClient(peer,
+                     QStringLiteral("One observer was disconnected: it sent "
+                                    "more than one request ahead of the "
+                                    "greeting. Nothing it sent was acted on."));
+          return;
+        }
         if (client->handshake_timer != nullptr) {
           client->handshake_timer->stop();
           client->handshake_timer->deleteLater();
           client->handshake_timer = nullptr;
         }
         client->authenticated = true;
-        client->ignored_input_bytes += trailing;
-        peer->write(greetingLine(true));
-        setStatus(statusLine(
-            bound_addresses_,
-            unboundAddressNotes(bind_addresses_, bound_addresses_),
-            clientCount(),
-            QStringLiteral("An observer presented the access token.")));
+        client->request_bytes = std::move(carried);
+        peer->write(greetingLine(true, audio_->enabled(),
+                                 audio_->listening(),
+                                 peer->localPort()));
+        rebuildStatus(
+            QStringLiteral("An observer presented the access token."));
         emit stateChanged();
-        // Falls through, so that anything the peer queued behind its token
-        // line is discarded and counted exactly like every byte it sends
-        // later. The handshake is over for good; there is no second line.
+        // Falls through into the request loop below, so a request carried in
+        // with the token is acted on without waiting for more bytes that may
+        // never come.
       }
 
-      // `skip` rather than `readAll`: the bytes are dropped by the device
-      // without ever being handed to this class as a value. There is no
-      // buffer here for a parser to be added to later.
-      const qint64 available = peer->bytesAvailable();
-      const qint64 discarded = peer->skip(available);
-      if (discarded > 0) client->ignored_input_bytes += discarded;
-      if (client->ignored_input_bytes <= kMaximumIgnoredInputBytes) return;
-      // A peer sending this much has mistaken the port for something that
-      // answers -- a rigctld, a telnet session, a REST endpoint. Saying so by
-      // hanging up is kinder than letting it wait for a reply that this
-      // service will never send.
-      dropClient(peer,
-                 QStringLiteral("One observer was disconnected: it sent data "
-                                "to a stream that only emits. Nothing it sent "
-                                "was read."));
+      // Authenticated, so from here the peer may send request lines. Each one
+      // is bounded before it is read, taken exactly one line at a time, and
+      // compared whole against the closed set; the buffer is emptied whichever
+      // way that comparison went, so nothing a peer sent is ever accumulated
+      // across lines. This loop is the entire surface through which a peer can
+      // select anything, and what it can select is two things.
+      while (true) {
+        const qint64 room =
+            kMaximumRequestBytes -
+            static_cast<qint64>(client->request_bytes.size());
+        const qint64 available = peer->bytesAvailable();
+        // Bounded before it is read, not after, for the same reason the
+        // handshake is: a peer that never sends a newline must not be able to
+        // grow this process by talking.
+        if (room > 0 && available > 0) {
+          client->request_bytes.append(
+              peer->read(std::min<qint64>(room, available)));
+        }
+        const qsizetype end = client->request_bytes.indexOf('\n');
+        if (end < 0) {
+          // Nothing complete yet, and still room for it. Nothing is discarded
+          // on this path and nothing accumulates beyond the bound above: every
+          // byte a peer sends from here either completes a line or fills that
+          // allowance, and filling it ends the connection.
+          if (static_cast<qint64>(client->request_bytes.size()) <
+              kMaximumRequestBytes) {
+            return;
+          }
+          // The allowance is spent with no line in it. Both accepted requests
+          // are under twenty bytes, so whatever this is, it is not one of
+          // them.
+          dropClient(peer,
+                     QStringLiteral("One observer was disconnected: it sent "
+                                    "%1 bytes without completing a request.")
+                         .arg(kMaximumRequestBytes));
+          return;
+        }
+        QByteArray line = client->request_bytes.left(end);
+        client->request_bytes.remove(0, end + 1);
+        // Tolerated for the same reason the token tolerates it: a line typed
+        // into a telnet-style client arrives with a carriage return the
+        // operator cannot see. Nothing else is trimmed, and nothing inside the
+        // line is looked at -- it is compared whole or not at all.
+        if (line.endsWith('\r')) line.chop(1);
+        ++client->request_count;
+        if (client->request_count > kMaximumRequestsPerClient) {
+          dropClient(peer,
+                     QStringLiteral("One observer was disconnected: it made "
+                                    "more than %1 requests on one connection.")
+                         .arg(kMaximumRequestsPerClient));
+          return;
+        }
+        if (!handleRequestLine(client, line)) {
+          // Not one of the two. An empty line is not one of the two either,
+          // and gets the same answer: there is no exception in the closed set,
+          // because an exception is the beginning of a grammar. The peer is
+          // told by the close and told nothing else; the operator is told in
+          // the status line, which is where somebody will read it.
+          dropClient(peer,
+                     QStringLiteral("One observer was disconnected: it sent "
+                                    "something this stream does not accept. "
+                                    "Nothing it sent was acted on."));
+          return;
+        }
+      }
     };
     connect(socket, &QTcpSocket::readyRead, this, receive);
     connect(socket, &QTcpSocket::disconnected, this, [this, socket] {
@@ -903,13 +1255,12 @@ void DiagnosticsServer::acceptPending(QTcpServer* server) {
       // present and nothing outside this machine able to present it, so the
       // connection is authenticated immediately.
       client->authenticated = true;
-      socket->write(greetingLine(false));
+      socket->write(greetingLine(false, audio_->enabled(),
+                                 audio_->listening(),
+                                 socket->localPort()));
     }
 
-    setStatus(
-        statusLine(bound_addresses_,
-                   unboundAddressNotes(bind_addresses_, bound_addresses_),
-                   clientCount(), QString()));
+    rebuildStatus(QString());
     emit stateChanged();
 
     // A socket handed over by `nextPendingConnection` can already be holding
@@ -933,6 +1284,12 @@ void DiagnosticsServer::dropClient(QTcpSocket* socket, const QString& reason) {
   // capable of arriving here twice.
   if (index < 0) return;
   Client* const client = clients_.takeAt(index);
+  // The audio subscription goes with the control connection, always and
+  // without being asked. A stream that outlived the connection that started it
+  // would be a stream nobody could stop: the only handle on it is this
+  // connection, and stopping it is the one thing the operator would want most
+  // and be least able to do.
+  audio_->unsubscribe(client->id);
   // Stopped before the record it belongs to is freed. The timer is a child of
   // the socket and dies with it below; stopping it here means a deadline can
   // never fire for a client that is already gone.
@@ -959,13 +1316,17 @@ void DiagnosticsServer::dropClient(QTcpSocket* socket, const QString& reason) {
   socket->abort();
   socket->deleteLater();
 
-  setStatus(statusLine(bound_addresses_,
-                       unboundAddressNotes(bind_addresses_, bound_addresses_),
-                       clientCount(), reason));
+  rebuildStatus(reason);
   emit stateChanged();
 }
 
 void DiagnosticsServer::restart() {
+  // Every subscription and every bound audio socket goes with the control
+  // listener, because both are rebuilt below from whatever comes up. The
+  // operator's permission is deliberately NOT cleared: rebinding is not
+  // withdrawing consent, and an operator who rebinds after fixing a network
+  // should not have to grant audio again.
+  audio_->configure({});
   for (Client* const client : std::as_const(clients_)) {
     QTcpSocket* const socket = client->socket;
     // Before the record is freed, for the same reason as in `dropClient`.
@@ -1003,6 +1364,7 @@ void DiagnosticsServer::restart() {
   // not about any one address.
   const bool token_acceptable = isAcceptableToken(access_token_);
   QStringList notes;
+  QList<AudioStreamServer::Endpoint> audio_endpoints;
   for (const QString& requested : std::as_const(bind_addresses_)) {
     const std::optional<QHostAddress> address = parsedBindAddress(requested);
     if (!address) {
@@ -1045,12 +1407,36 @@ void DiagnosticsServer::restart() {
             [this, server] { acceptPending(server); });
     servers_.append(server);
     // `serverPort` rather than the requested port, so that the endpoint shown
-    // to the operator is the one a tool can actually be pointed at.
+    // to the operator is the one a tool can actually be pointed at -- and so
+    // the audio half is bound to the port this listener really got rather than
+    // to the 0 it may have been asked for.
     bound_addresses_.append(displayEndpoint(*address, server->serverPort()));
+    audio_endpoints.append(AudioStreamServer::Endpoint{
+        .address = *address, .port = server->serverPort()});
   }
 
-  setStatus(statusLine(bound_addresses_, notes, clientCount(), QString()));
+  // The audio half comes up on exactly what the control half came up on, and
+  // only on that: passing the endpoints that actually bound, rather than the
+  // ones the operator asked for, is what makes it impossible for the two to be
+  // listening in different places.
+  notes.append(audio_->configure(audio_endpoints));
+  setStatus(statusLine(
+      bound_addresses_, notes, clientCount(),
+      audioStatusClause(audio_->enabled(), audio_->subscriberCount()),
+      QString()));
   emit stateChanged();
+}
+
+void DiagnosticsServer::rebuildStatus(const QString& detail) {
+  // The audio half's failures sit with the control half's, in the same
+  // sentence list and in the same words, because an operator reading this line
+  // is asking one question -- is this service actually up -- and half of it
+  // being up is not a yes.
+  QStringList notes = unboundAddressNotes(bind_addresses_, bound_addresses_);
+  notes.append(audio_->bindNotes());
+  setStatus(statusLine(
+      bound_addresses_, notes, clientCount(),
+      audioStatusClause(audio_->enabled(), audio_->subscriberCount()), detail));
 }
 
 void DiagnosticsServer::setStatus(QString message) {

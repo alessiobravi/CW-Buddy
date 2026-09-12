@@ -122,6 +122,8 @@ Pane {
                         model: appSettings.audioOutputNames
                         currentIndex: appSettings.audioOutputIndex
                         onActivated: appSettings.selectAudioOutput(currentIndex)
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Device every monitor mode plays through: the receiver window (RX), one decoder card's stream, or REGION — the whole decode region at once, every signal in it heard together at the pitch its position in the region gives it. Region listening needs 48 kHz mono, which is why the decode region is capped at 24 kHz"
                     }
                     Label { text: "Selected output" }
                     Label { Layout.fillWidth: true; wrapMode: Text.WordWrap; text: appSettings.audioOutputDisplayName; color: "#43c6ac" }
@@ -479,7 +481,7 @@ Pane {
                         // matches no entry and currentIndex is -1. displayText
                         // is bound to the live value rather than to the model,
                         // so the real width still shows.
-                        model: [2000, 3000, 6000, 12000, 24000, 48000, 96000]
+                        model: [2000, 3000, 6000, 12000, 24000]
                         currentIndex: model.indexOf(appSettings.sdrDecoderBandwidthHz)
                         displayText: (appSettings.sdrDecoderBandwidthHz / 1000)
                                      + " kHz"
