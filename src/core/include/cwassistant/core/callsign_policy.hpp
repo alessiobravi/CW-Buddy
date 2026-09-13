@@ -96,6 +96,15 @@ class CallsignPolicy {
   // Reconciles the independent literal and lattice-refined paths. A call seen
   // only in refinement must occur as an exact decoded token or have explicit
   // sender evidence; splitting a glued prosign is not enough by itself.
+  //
+  // A complete callsign standing as a whole token in both texts is credited as
+  // evidence in its own right, above any positional rule short of an explicit
+  // DE handover. The two paths are independent readings of one transmission,
+  // so both producing the same call says something about the signal, while
+  // standing next to a CQ only says where a call was expected to sit. On a
+  // recorded pileup the calling station's EH3ST stood whole in both texts and
+  // scored nothing, while EH4ST -- one element wrong, and third after a CQ --
+  // scored enough to name the stream.
   [[nodiscard]] static std::optional<std::string>
   best_complete_in_parallel_texts(std::string_view primary_text,
                                   std::string_view refined_text,

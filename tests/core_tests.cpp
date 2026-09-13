@@ -2292,6 +2292,111 @@ void test_callsign_policy_prosign_glue() {
          "a genuine DE-prefixed callsign is not split apart");
 }
 
+void test_callsign_policy_cross_path_agreement() {
+  using cwassistant::core::CallsignPolicy;
+  using cwassistant::core::CwOperatorRole;
+
+  // Standing third after a CQ is the weakest positional rule there is, and on
+  // its own it no longer names a stream. It is a guess about where a call sits
+  // in a transmission and says nothing about whether the characters were
+  // copied right: on a recorded pileup EH4ST, one element wrong, sat in
+  // exactly that position and took the name off the station sending it.
+  expect(!CallsignPolicy::best_complete_in_text("CQ CQ EH3 T EH4ST D U "),
+         "a callsign vouched for only by standing third after a CQ is not a "
+         "stream label");
+  // The floor moved by one, not past the evidence that was already carrying
+  // real identifications. Two words after a CQ still names a stream, and so
+  // does a call the same text read twice.
+  expect(CallsignPolicy::best_complete_in_text("CQ TEST EH3ST ") ==
+             std::optional<std::string>("EH3ST"),
+         "a callsign two words after a CQ still names a stream");
+  expect(CallsignPolicy::best_complete_in_text("EH3ST EH3ST ") ==
+             std::optional<std::string>("EH3ST"),
+         "a callsign one text read twice still names a stream");
+
+  // The literal and the lattice-refined texts are independent readings of one
+  // transmission, so a complete callsign standing whole in both is evidence
+  // about the signal rather than about where a call was expected to sit. It
+  // clears the floor with no context word beside it at all.
+  expect(CallsignPolicy::best_complete_in_parallel_texts(
+             "R R EH3ST R E ", "R R EH3ST R E ", CwOperatorRole::Monitor,
+             {}) == std::optional<std::string>("EH3ST"),
+         "a complete callsign both decode paths read names the stream without "
+         "a context word beside it");
+  // Whole tokens on both sides. EH3ST found inside XEH3STY is a different
+  // decode, and matching substrings would let one path's noise confirm the
+  // other path's reading.
+  expect(!CallsignPolicy::best_complete_in_parallel_texts(
+             "R R EH3ST R E ", "R R XEH3STY R E ", CwOperatorRole::Monitor, {}),
+         "a callsign embedded in a longer decoded token is not agreement");
+  // Agreement on a prefix no administration was ever issued is not agreement
+  // on a callsign. The publication gate refuses such a token downstream
+  // anyway, so letting it outrank a candidate that would have survived that
+  // gate would trade a name for no name.
+  expect(!CallsignPolicy::best_complete_in_parallel_texts(
+             "R R QQ1ABC R E ", "R R QQ1ABC R E ", CwOperatorRole::Monitor, {}),
+         "two paths reading the same unallocated prefix do not name a stream");
+
+  // What agreement is worth, from both sides. It outranks the strongest purely
+  // positional rule there is -- a callsign standing next to a CQ -- because
+  // that rule is a guess about position while this is a reading of the signal.
+  expect(CallsignPolicy::best_complete_in_parallel_texts(
+             "R DL1NKB R CQ OK5OO R ", "R DL1NKB R CQ E5Q R ",
+             CwOperatorRole::Monitor, {}) ==
+             std::optional<std::string>("DL1NKB"),
+         "a callsign both paths read outranks a different one standing next "
+         "to a CQ in only one of them");
+  // And where both calls were read by both paths, agreement is credited to
+  // each of them and the station saying whose transmission this is still wins.
+  // Agreement ranks below an explicit handover, not above it.
+  expect(CallsignPolicy::best_complete_in_parallel_texts(
+             "R EA1EYL R DE OK5OO R ", "R EA1EYL R DE OK5OO R ",
+             CwOperatorRole::Monitor, {}) ==
+             std::optional<std::string>("OK5OO"),
+         "an explicit DE handover outranks a bare callsign both paths read");
+
+  // Two callsigns both paths read, neither with a context word beside it. The
+  // decoded text is append-only, so a token's place in it is when it was
+  // copied: the earlier agreement has been standing for the whole stretch
+  // since, the later one for an instant. On the pileup capture the later
+  // agreements were H3SE and L1BWM, both misreadings of the station that had
+  // already been named forty seconds earlier.
+  expect(CallsignPolicy::best_complete_in_parallel_texts(
+             "R EH3ST R R R H3SE R ", "R EH3ST R R R H3SE R ",
+             CwOperatorRole::Monitor, {}) ==
+             std::optional<std::string>("EH3ST"),
+         "between two callsigns both paths read, the one agreed on longest "
+         "names the stream");
+
+  // With one path's text missing there is no second reading to agree with, so
+  // the surviving path has to say the call twice. A lone token next to a CQ,
+  // in a text nothing can contradict, is precisely the misdecode this guards
+  // against: the literal path's timing gate closed for the last second and a
+  // half of the pileup capture and a single refined E5Q took the stream away
+  // from the name both paths had agreed on for the preceding minute.
+  expect(!CallsignPolicy::best_complete_in_parallel_texts(
+             {}, "FQ CQ E5Q EHI ST EH ", CwOperatorRole::Monitor, {}),
+         "one refined-only reading standing next to a CQ does not name a "
+         "stream");
+
+  // The capture itself, both texts exactly as the decoder ended the 133
+  // seconds with them. The station sent its call about eight times; the two
+  // paths recovered it once each and it is the only complete callsign in both.
+  // EH4ST stood third after the opening CQ and E5Q next to a later one, so
+  // both scored and the right call scored nothing.
+  constexpr std::string_view pileup_literal =
+      "CQ CQ EH3 T EH4ST D U BI IQ ERQ EH3ST EH MST KQ LJ E E E B? E "
+      "L1BWM?NN 73/ C7 5Q E 3ST H3SE FQ CQ ?Q EHI ST EH MST EK ";
+  constexpr std::string_view pileup_refined =
+      "CQ CQ EH3 T EHVTST D U B I TEQ ERQ EH3ST ESE MST K Q L? ? W? I "
+      "L1BWM?NN 73/ C7 HEQ E 3ST H3SE FQ CQ E5Q EHI ST EH MS";
+  expect(CallsignPolicy::best_complete_in_parallel_texts(
+             pileup_literal, pileup_refined, CwOperatorRole::Monitor, {}) ==
+             std::optional<std::string>("EH3ST"),
+         "the calling station in the recorded pileup is named from the two "
+         "paths agreeing on its callsign");
+}
+
 void test_callsign_policy() {
   using cwassistant::core::CallsignPolicy;
   CallsignPolicy policy;
@@ -4537,6 +4642,7 @@ int main() {
   test_soft_decision_keying_evidence();
   test_callsign_policy();
   test_callsign_policy_prosign_glue();
+  test_callsign_policy_cross_path_agreement();
   test_cw_morse_alphabet_survives_missing_files();
   test_cw_morse_alphabet();
   test_cw_callsign_prefixes_survive_missing_files();

@@ -6,6 +6,42 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A station whose callsign both decode paths read is named from that agreement
+  alone. The literal and the lattice-refined texts are independent readings of
+  one transmission, so a complete callsign on an allocated prefix standing as a
+  whole token in both is evidence about the signal, and it now outranks the
+  positional rules -- a call beside a `CQ`, or two or three words after one --
+  which only guess at where a call sits in a transmission. Where two such agreed
+  callsigns compete the one read earliest names the stream: the decoded text is
+  append-only, so that is the one the two paths have agreed on for longest while
+  the other has been agreed on for an instant. An explicit `CALL1 DE CALL2`
+  handover still outranks both.
+
+  That ordering rule is not cosmetic. The refined path is derived from the same
+  acoustic evidence, so any stretch refinement left alone agrees trivially, and
+  on a recorded pileup agreement alone ties three candidates at equal score. On
+  that capture the one clearly identifying station is now named `EH3ST` from
+  t=67.9 s to the end of the 133 seconds; before this it was never named at all,
+  because the correct reading was never offered.
+
+- The evidence a decoded token must carry before it can name a stream went from
+  three to four. Three was exactly what a callsign-shaped token earned for
+  standing third after a `CQ`, the weakest positional rule there is; admitting
+  that on its own costs a wrong callsign and gains none -- 26 correct and 5 wrong
+  on the decoder surface benchmark against 26 and 6. A call two words after a
+  `CQ`, or one the same text read twice, still qualifies.
+
+- When only one of the two decode paths produced a text, that path must read a
+  callsign twice before it names a stream rather than once. With nothing to agree
+  with, a lone token vouched for only by a neighbouring `CQ` is the weakest
+  evidence in the system, and it arrives exactly when the other reading is
+  unavailable to contradict it. On the pileup capture the literal path's timing
+  gate closed for the last second and a half and a single refined `E5Q` beside a
+  `CQ` took the stream away from the name both paths had agreed on for the
+  preceding minute.
+
 ### Added
 
 - The live diagnostics record states what the receive worker is listening to and

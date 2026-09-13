@@ -1,9 +1,12 @@
 #include "cwassistant/core/callsign_policy.hpp"
+#include "cwassistant/core/cw_callsign_prefixes.hpp"
 #include "cwassistant/core/cw_vocabulary.hpp"
 
 #include <algorithm>
 #include <cctype>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace cwassistant::core {
@@ -72,6 +75,231 @@ bool isPlausibleDecodedCallsign(const std::string_view normalized) {
   };
   return (plausible_base(left) && plausible_modifier(right)) ||
          (plausible_modifier(left) && plausible_base(right));
+}
+
+// The least evidence a decoded token may carry and still name a stream.
+//
+// Four, not three. Three is exactly what a callsign-shaped token earns for
+// standing third after a CQ, which is the weakest positional rule there is --
+// a guess about where a call sits in a transmission, saying nothing about
+// whether its characters were copied right. On the decoder surface benchmark
+// admitting that alone costs a wrong callsign and gains none: 26 correct and 5
+// wrong at four, against 26 and 6 at three.
+constexpr int kMinimumLabelScore = 4;
+
+// What the two decode paths reading the same callsign is worth.
+//
+// The literal and the lattice-refined texts are independent readings of one
+// transmission -- that independence is the whole reason the refined path
+// exists -- so a complete callsign standing whole in both is evidence about
+// the signal, not about where a call was expected to sit. Six places it above
+// a call standing next to a CQ (5), which is the strongest purely positional
+// rule, and below an explicit DE handover (8), which is the station saying
+// whose transmission this is. It clears the floor on its own, because a call
+// repeated into two agreeing decodes needs no adjacent word to vouch for it.
+constexpr int kCrossPathAgreementScore = 6;
+
+// The completed words of one decoded text, in the order every rule reads them.
+//
+// Completed means before the last word gap: the token still being sent is not
+// yet a reading of anything, and promoting it would name a stream from half a
+// callsign.
+std::vector<std::string> decodedWords(const std::string_view stable_text) {
+  const auto completed_end = stable_text.find_last_of(" \t\r\n");
+  if (completed_end == std::string_view::npos) return {};
+  std::vector<std::string> words;
+  std::string token;
+  for (const unsigned char character :
+       stable_text.substr(0, completed_end + 1)) {
+    if (std::isalnum(character) != 0 || character == '/') {
+      token.push_back(static_cast<char>(std::toupper(character)));
+    } else if (!token.empty()) {
+      // A missing word gap glues a leading prosign onto the callsign that
+      // follows it, and the glued token then collects the very context credit
+      // the callsign earned: an observed CQ CQ DE SV7BIO decoded as
+      // "CQ CQ DESV7BIO SV7BIO" labelled the stream DESV7BIO, even though the
+      // real callsign stood alone twice in the same text. Split the pair only
+      // when what follows the prosign is itself a plausible callsign, so a
+      // genuine DE-prefixed German call is untouched -- stripping DE from
+      // DE1ABC leaves 1ABC, which is not a callsign, and the token stands.
+      // The same set the context rescorer splits on, from
+      // dictionaries/cw-word-gap-prefixes.txt: two copies of this list is how
+      // the two paths come to disagree about the same text.
+      bool split = false;
+      for (const std::string_view prefix : cwSharedVocabulary().wordGapPrefixes()) {
+        if (token.size() <= prefix.size() ||
+            token.compare(0, prefix.size(), prefix) != 0) {
+          continue;
+        }
+        const std::string remainder = token.substr(prefix.size());
+        const auto normalized = CallsignPolicy::normalize(remainder);
+        if (!normalized || !isPlausibleDecodedCallsign(*normalized)) continue;
+        words.emplace_back(prefix);
+        words.push_back(remainder);
+        split = true;
+        break;
+      }
+      if (!split) words.push_back(token);
+      token.clear();
+    }
+  }
+  return words;
+}
+
+// The complete callsigns both decode paths produced, whole.
+//
+// Whole tokens on both sides, never a substring: EH3ST found inside XEH3STY is
+// a different decode, and counting it as agreement would let one path's noise
+// confirm the other path's reading. The token has to be callsign-shaped, and
+// its prefix has to be one the ITU allocated, because an agreed token that the
+// publication gate will refuse anyway must not be allowed to outrank a
+// candidate that would have survived it -- that trades a name for no name.
+//
+// An empty text on either side agrees with nothing, which is what keeps the
+// signal silent when the literal path's timing gate withheld its text: one
+// reading is not two.
+std::unordered_set<std::string> agreedCallsigns(
+    const std::vector<std::string>& primary_words,
+    const std::vector<std::string>& refined_words) {
+  std::unordered_set<std::string> primary_callsigns;
+  for (const auto& word : primary_words) {
+    const auto normalized = CallsignPolicy::normalize(word);
+    if (normalized && isPlausibleDecodedCallsign(*normalized) &&
+        cwSharedCallsignPrefixes().isAllocatedPrefix(*normalized)) {
+      primary_callsigns.insert(*normalized);
+    }
+  }
+  if (primary_callsigns.empty()) return {};
+  std::unordered_set<std::string> agreed;
+  for (const auto& word : refined_words) {
+    const auto normalized = CallsignPolicy::normalize(word);
+    if (normalized && primary_callsigns.contains(*normalized)) {
+      agreed.insert(*normalized);
+    }
+  }
+  return agreed;
+}
+
+std::optional<std::string> bestCompleteInWords(
+    const std::vector<std::string>& words, const CwOperatorRole role,
+    const std::string_view own_callsign,
+    const std::unordered_set<std::string>& agreed) {
+  struct CandidateEvidence {
+    int score{0};
+    std::size_t first_index{0};
+    std::size_t last_index{0};
+    int occurrences{0};
+    bool agreed{false};
+  };
+  std::unordered_map<std::string, CandidateEvidence> evidence;
+  for (std::size_t index = 0; index < words.size(); ++index) {
+    const auto normalized = CallsignPolicy::normalize(words[index]);
+    if (!normalized || !isPlausibleDecodedCallsign(*normalized)) continue;
+    CandidateEvidence& candidate = evidence[*normalized];
+    ++candidate.occurrences;
+    if (candidate.occurrences == 1) candidate.first_index = index;
+    candidate.last_index = index;
+    // A stream label needs more than callsign-shaped spelling. Contest and
+    // ordinary CW exchanges provide useful role evidence: a station normally
+    // identifies itself after DE, CQ/TEST, or TU, and a split runner commonly
+    // places UP immediately after its call. Exact repetition is weaker but
+    // still useful for a caller sending only its own call. These weights rank
+    // decoded alternatives; they never create or correct decoded characters.
+    if (index > 0 && words[index - 1] == "DE") candidate.score += 8;
+    // TU is genuinely ambiguous: it precedes a runner identifying itself and
+    // equally the station it has just worked. Where the operator's role says
+    // which of the two the monitored stream is, the unambiguous contexts are
+    // allowed to outrank it rather than tie with it.
+    if (index > 0 && words[index - 1] == "TU") {
+      candidate.score += role == CwOperatorRole::Monitor ? 6 : 4;
+    }
+    if (index > 0 && words[index - 1] == "CQ") candidate.score += 5;
+    if (index > 1 && words[index - 2] == "CQ") candidate.score += 4;
+    if (index > 2 && words[index - 3] == "CQ") candidate.score += 3;
+    if (index + 1 < words.size() && words[index + 1] == "UP")
+      candidate.score += 5;
+    // Ordinary hand-sent QSOs often close an identification with PSE K, K,
+    // KN, AR, or SK rather than repeating CQ/DE. These are role/boundary
+    // clues only: the token must already be a complete acoustically decoded
+    // callsign before any of these weights apply.
+    if (index + 2 < words.size() && words[index + 1] == "PSE" &&
+        words[index + 2] == "K") {
+      candidate.score += 6;
+    } else if (index + 1 < words.size() &&
+               (words[index + 1] == "K" || words[index + 1] == "KN" ||
+                words[index + 1] == "AR" || words[index + 1] == "SK")) {
+      candidate.score += 4;
+    }
+    if (candidate.occurrences > 1) candidate.score += 4;
+    // Searching and pouncing, the stream being listened to is a runner, so the
+    // call introduced as the sender's own outranks one merely mentioned.
+    // Running, it is a station answering, which sends its call bare and
+    // repeats it rather than introducing it.
+    if (role == CwOperatorRole::SearchAndPounce) {
+      const bool runner_context =
+          (index > 0 && (words[index - 1] == "CQ" || words[index - 1] == "DE")) ||
+          (index > 1 && words[index - 2] == "CQ") ||
+          (index + 1 < words.size() && words[index + 1] == "UP");
+      if (runner_context) candidate.score += 3;
+    } else if (role == CwOperatorRole::Runner) {
+      if (candidate.occurrences > 1) candidate.score += 3;
+      // A caller answering does not call CQ; a CQ in the monitored stream
+      // belongs to somebody else's transmission bleeding into the same slice.
+      if (index > 0 && words[index - 1] == "CQ") candidate.score -= 3;
+    }
+  }
+
+  // Cross-path agreement is a property of the candidate, not of a position, so
+  // it is credited once however often the call was copied. It does not reorder
+  // anything by itself: positional evidence still decides between two calls the
+  // two paths both read, which is what keeps the sender of a CALL1 DE CALL2
+  // handover ahead of the station it addressed when both were copied cleanly.
+  for (const auto& candidate : agreed) {
+    if (const auto found = evidence.find(candidate); found != evidence.end()) {
+      found->second.score += kCrossPathAgreementScore;
+      found->second.agreed = true;
+    }
+  }
+
+  // Whatever the role, a call the operator's own station sends cannot be the
+  // label for another station's stream. Own-call detection elsewhere alerts the
+  // operator that they were called; that is a different question from whose
+  // transmission this is.
+  if (!own_callsign.empty()) {
+    const auto own = CallsignPolicy::normalize(own_callsign);
+    if (own) evidence.erase(*own);
+  }
+
+  // Which candidate names the stream, in three steps.
+  //
+  // Evidence first. Where the totals tie, the call both decode paths read wins
+  // over one only a positional rule vouches for: the same number arrived at
+  // from a reading of the signal rather than from a guess about where a call
+  // sits. Between two calls the paths both read, the earliest wins, and that is
+  // the one rule here that reverses the general preference for the newest
+  // reading. The decoded text is append-only, so a token's place in it is when
+  // it was copied: an agreement standing since early in the transmission has
+  // been holding for the whole stretch since, while one that has just appeared
+  // has held for an instant. Positional evidence carries no such history -- a
+  // CQ beside a call says the same thing wherever it falls, and there the
+  // latest reading is the one that says who is transmitting now -- so ties
+  // between candidates neither path corroborated still go to the last read.
+  const auto outranks = [](const CandidateEvidence& left,
+                           const CandidateEvidence& right) {
+    if (left.score != right.score) return left.score > right.score;
+    if (left.agreed != right.agreed) return left.agreed;
+    if (left.agreed) return left.first_index < right.first_index;
+    return left.last_index > right.last_index;
+  };
+  std::optional<std::string> result;
+  const CandidateEvidence* best = nullptr;
+  for (const auto& [candidate, value] : evidence) {
+    if (value.score < kMinimumLabelScore) continue;
+    if (best != nullptr && !outranks(value, *best)) continue;
+    result = candidate;
+    best = &value;
+  }
+  return result;
 }
 
 }  // namespace
@@ -221,128 +449,9 @@ std::optional<std::string> CallsignPolicy::best_complete_in_text(
 std::optional<std::string> CallsignPolicy::best_complete_in_text(
     const std::string_view stable_text, const CwOperatorRole role,
     const std::string_view own_callsign) {
-  const auto completed_end = stable_text.find_last_of(" \t\r\n");
-  if (completed_end == std::string_view::npos) return std::nullopt;
-  std::vector<std::string> words;
-  std::string token;
-  for (const unsigned char character :
-       stable_text.substr(0, completed_end + 1)) {
-    if (std::isalnum(character) != 0 || character == '/') {
-      token.push_back(static_cast<char>(std::toupper(character)));
-    } else if (!token.empty()) {
-      // A missing word gap glues a leading prosign onto the callsign that
-      // follows it, and the glued token then collects the very context credit
-      // the callsign earned: an observed CQ CQ DE SV7BIO decoded as
-      // "CQ CQ DESV7BIO SV7BIO" labelled the stream DESV7BIO, even though the
-      // real callsign stood alone twice in the same text. Split the pair only
-      // when what follows the prosign is itself a plausible callsign, so a
-      // genuine DE-prefixed German call is untouched -- stripping DE from
-      // DE1ABC leaves 1ABC, which is not a callsign, and the token stands.
-      // The same set the context rescorer splits on, from
-      // dictionaries/cw-word-gap-prefixes.txt: two copies of this list is how
-      // the two paths come to disagree about the same text.
-      bool split = false;
-      for (const std::string_view prefix : cwSharedVocabulary().wordGapPrefixes()) {
-        if (token.size() <= prefix.size() ||
-            token.compare(0, prefix.size(), prefix) != 0) {
-          continue;
-        }
-        const std::string remainder = token.substr(prefix.size());
-        const auto normalized = normalize(remainder);
-        if (!normalized || !isPlausibleDecodedCallsign(*normalized)) continue;
-        words.emplace_back(prefix);
-        words.push_back(remainder);
-        split = true;
-        break;
-      }
-      if (!split) words.push_back(token);
-      token.clear();
-    }
-  }
-
-  struct CandidateEvidence {
-    int score{0};
-    std::size_t last_index{0};
-    int occurrences{0};
-  };
-  std::unordered_map<std::string, CandidateEvidence> evidence;
-  for (std::size_t index = 0; index < words.size(); ++index) {
-    const auto normalized = normalize(words[index]);
-    if (!normalized || !isPlausibleDecodedCallsign(*normalized)) continue;
-    CandidateEvidence& candidate = evidence[*normalized];
-    ++candidate.occurrences;
-    candidate.last_index = index;
-    // A stream label needs more than callsign-shaped spelling. Contest and
-    // ordinary CW exchanges provide useful role evidence: a station normally
-    // identifies itself after DE, CQ/TEST, or TU, and a split runner commonly
-    // places UP immediately after its call. Exact repetition is weaker but
-    // still useful for a caller sending only its own call. These weights rank
-    // decoded alternatives; they never create or correct decoded characters.
-    if (index > 0 && words[index - 1] == "DE") candidate.score += 8;
-    // TU is genuinely ambiguous: it precedes a runner identifying itself and
-    // equally the station it has just worked. Where the operator's role says
-    // which of the two the monitored stream is, the unambiguous contexts are
-    // allowed to outrank it rather than tie with it.
-    if (index > 0 && words[index - 1] == "TU") {
-      candidate.score += role == CwOperatorRole::Monitor ? 6 : 4;
-    }
-    if (index > 0 && words[index - 1] == "CQ") candidate.score += 5;
-    if (index > 1 && words[index - 2] == "CQ") candidate.score += 4;
-    if (index > 2 && words[index - 3] == "CQ") candidate.score += 3;
-    if (index + 1 < words.size() && words[index + 1] == "UP")
-      candidate.score += 5;
-    // Ordinary hand-sent QSOs often close an identification with PSE K, K,
-    // KN, AR, or SK rather than repeating CQ/DE. These are role/boundary
-    // clues only: the token must already be a complete acoustically decoded
-    // callsign before any of these weights apply.
-    if (index + 2 < words.size() && words[index + 1] == "PSE" &&
-        words[index + 2] == "K") {
-      candidate.score += 6;
-    } else if (index + 1 < words.size() &&
-               (words[index + 1] == "K" || words[index + 1] == "KN" ||
-                words[index + 1] == "AR" || words[index + 1] == "SK")) {
-      candidate.score += 4;
-    }
-    if (candidate.occurrences > 1) candidate.score += 4;
-    // Searching and pouncing, the stream being listened to is a runner, so the
-    // call introduced as the sender's own outranks one merely mentioned.
-    // Running, it is a station answering, which sends its call bare and
-    // repeats it rather than introducing it.
-    if (role == CwOperatorRole::SearchAndPounce) {
-      const bool runner_context =
-          (index > 0 && (words[index - 1] == "CQ" || words[index - 1] == "DE")) ||
-          (index > 1 && words[index - 2] == "CQ") ||
-          (index + 1 < words.size() && words[index + 1] == "UP");
-      if (runner_context) candidate.score += 3;
-    } else if (role == CwOperatorRole::Runner) {
-      if (candidate.occurrences > 1) candidate.score += 3;
-      // A caller answering does not call CQ; a CQ in the monitored stream
-      // belongs to somebody else's transmission bleeding into the same slice.
-      if (index > 0 && words[index - 1] == "CQ") candidate.score -= 3;
-    }
-  }
-
-  // Whatever the role, a call the operator's own station sends cannot be the
-  // label for another station's stream. Own-call detection elsewhere alerts the
-  // operator that they were called; that is a different question from whose
-  // transmission this is.
-  if (!own_callsign.empty()) {
-    const auto own = normalize(own_callsign);
-    if (own) evidence.erase(*own);
-  }
-
-  std::optional<std::string> result;
-  int best_score = 3;
-  std::size_t latest_index = 0;
-  for (const auto& [candidate, value] : evidence) {
-    if (value.score > best_score ||
-        (value.score == best_score && value.last_index >= latest_index)) {
-      result = candidate;
-      best_score = value.score;
-      latest_index = value.last_index;
-    }
-  }
-  return result;
+  // One text on its own has no second reading to agree with it.
+  return bestCompleteInWords(decodedWords(stable_text), role, own_callsign,
+                             {});
 }
 
 std::optional<std::string> CallsignPolicy::best_complete_in_parallel_texts(
@@ -350,8 +459,17 @@ std::optional<std::string> CallsignPolicy::best_complete_in_parallel_texts(
     const std::string_view refined_text,
     const CwOperatorRole role,
     const std::string_view own_callsign) {
-  const auto primary = best_complete_in_text(primary_text, role, own_callsign);
-  const auto refined = best_complete_in_text(refined_text, role, own_callsign);
+  const auto primary_words = decodedWords(primary_text);
+  const auto refined_words = decodedWords(refined_text);
+  // Agreement is decided once, over both word lists, and then offered to every
+  // scoring pass below. A call the two paths both produced is the same evidence
+  // whichever text is being read, so scoring one text without it would let the
+  // literal path settle on a call its own refinement contradicts.
+  const auto agreed = agreedCallsigns(primary_words, refined_words);
+  const auto primary =
+      bestCompleteInWords(primary_words, role, own_callsign, agreed);
+  const auto refined =
+      bestCompleteInWords(refined_words, role, own_callsign, agreed);
   if (!refined) return primary;
   if (primary) {
     if (*primary == *refined) return primary;
@@ -360,7 +478,8 @@ std::optional<std::string> CallsignPolicy::best_complete_in_parallel_texts(
     combined.append(primary_text);
     combined.push_back(' ');
     combined.append(refined_text);
-    return best_complete_in_text(combined, role, own_callsign);
+    return bestCompleteInWords(decodedWords(combined), role, own_callsign,
+                               agreed);
   }
 
   std::size_t exact_occurrences = 0;
@@ -378,7 +497,16 @@ std::optional<std::string> CallsignPolicy::best_complete_in_parallel_texts(
     }
   }
   if (!token.empty()) count_token();
-  if (exact_occurrences >= 1U) return refined;
+  // Reaching here means only the refined path read this call: had the literal
+  // text carried it too, agreement would have carried it out of the branch
+  // above. One path on its own has to say it twice, or hand the transmission
+  // over explicitly, before it names a stream -- standing beside a CQ is not
+  // enough when the reading that could have contradicted it is missing. This
+  // is where the whole failure ends, on the operator's pileup: the literal
+  // path's timing gate closed for the last second and a half of the capture,
+  // and a single refined E5Q next to a CQ took the stream away from a name the
+  // two paths had agreed on for the preceding minute.
+  if (exact_occurrences >= 2U) return refined;
   const auto sender = strong_sender_in_text(refined_text);
   return sender && *sender == *refined ? refined : std::nullopt;
 }

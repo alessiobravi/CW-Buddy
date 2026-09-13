@@ -917,6 +917,21 @@ devices apart any more, so a choice would be a guess -- and the wrong guess
 would put a different radio on the decoder without anything on screen saying so.
 Pick the one you want in Settings.
 
+**How a stream earns its name.** CW Buddy decodes each signal along two
+independent paths -- a literal reading and a refined one that re-times the same
+evidence -- and a callsign both of them read, as a whole word, on a prefix some
+country actually holds, is the strongest ordinary evidence there is. It outranks
+a call that merely sits next to a `CQ`, which is a guess about where in a
+transmission a call usually falls. Only an explicit `CALL1 DE CALL2` handover
+counts for more, because there a station is saying who it is.
+
+Where two such calls compete, the one read earliest wins: the transcript only
+ever grows, so that is the one both paths have agreed on for longest. And when
+only one path produced any text at all, it must read the call twice before the
+stream is named -- with nothing to agree with, a single reading beside a `CQ`
+is the weakest evidence in the system, and it turns up exactly when the other
+reading is not there to contradict it.
+
 **Why a stream sometimes has no name.** A decoded stream is labelled with a
 callsign only when the copy supports one. If the only two callsigns read from a
 stream disagree and neither has been read twice, neither is shown: two single
