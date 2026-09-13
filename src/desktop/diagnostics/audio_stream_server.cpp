@@ -121,7 +121,19 @@ void AudioStreamServer::rebind() {
   if (!enabled_.load(std::memory_order_acquire)) return;
   for (const Endpoint& endpoint : std::as_const(requested_endpoints_)) {
     auto* const socket = new QUdpSocket(this);
-    if (!socket->bind(endpoint.address, endpoint.port)) {
+    // DontShareAddress, explicitly, rather than whatever the platform prefers.
+    // Qt's default is DontShareAddress on Unix but ReuseAddressHint on Windows,
+    // so the same call means opposite things: there a second copy of this
+    // application binds a port the first already holds, both report the audio
+    // half as ready, and datagrams arrive at whichever socket the operating
+    // system chooses. Two stations would each believe they were sending, one
+    // of them would be wrong, and nothing anywhere would say so -- while the
+    // manual promises the opposite, that the indicator reads AUDIO DOWN when
+    // another copy already has the port. Asking for exclusivity makes the
+    // refusal below happen on every platform, which is the behaviour that was
+    // documented and tested.
+    if (!socket->bind(endpoint.address, endpoint.port,
+                      QAbstractSocket::DontShareAddress)) {
       // Named, and the other endpoints still come up, exactly as a failed
       // control bind is handled. A service that offers audio and silently
       // cannot send it is the one failure this has to avoid.

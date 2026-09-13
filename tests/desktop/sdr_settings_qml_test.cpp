@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <algorithm>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -8,8 +9,17 @@ namespace {
 
 std::string readFile(const std::filesystem::path &path) {
   std::ifstream input(path, std::ios::binary);
-  return {std::istreambuf_iterator<char>{input},
-          std::istreambuf_iterator<char>{}};
+  std::string text{std::istreambuf_iterator<char>{input},
+                   std::istreambuf_iterator<char>{}};
+  // Carriage returns are removed because this test asserts about the shape of
+  // the source, and a line ending is not part of that shape. Git checks these
+  // files out with CRLF on Windows, so a needle spanning a line break -- the
+  // "\n}\n" that finds the end of a function body below -- matches on every
+  // other platform and never matches there. The test then reports that a call
+  // is missing from a function whose body it simply failed to find, which is a
+  // false failure describing the wrong problem.
+  std::erase(text, '\r');
+  return text;
 }
 
 bool contains(const std::string_view source, const std::string_view text) {
