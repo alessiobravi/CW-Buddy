@@ -42,6 +42,14 @@ constexpr int kCaptureIqMissing = 37;
 constexpr int kCaptureRegionAudioMissing = 38;
 constexpr int kRegionAudioNotReported = 39;
 constexpr int kRegionMonitorUnbounded = 40;
+// The record's own account of whether the region is running. A station
+// reported `active:false, wanted:false` in the same record as a non-zero
+// sample count while a remote observer was listening, which is a record that
+// contradicts itself: a reader cannot tell from it whether region audio is off
+// or whether the flags are simply wrong, and those call for opposite remedies.
+// Only `samples` was ever asserted here, so nothing checked that the two
+// booleans agree with the work actually being done.
+constexpr int kRegionAudioFlagsWrong = 41;
 
 // Two properties of the live DSP worker that only a complex-IQ session can
 // show, driven entirely through the block pipe so no receiver is required:
@@ -206,6 +214,31 @@ int runRegionAudioChecks() {
         .value(QStringLiteral("samples"))
         .toInteger(-1);
   };
+  // Reads the flag out of the record last published by region_audio_samples(),
+  // so one blocking round trip answers for all three fields and they can only
+  // describe the same instant.
+  const auto region_audio_flag = [&record](const char* name) {
+    return record.value(QStringLiteral("regionAudio"))
+        .toObject()
+        .value(QString::fromLatin1(name))
+        .toBool();
+  };
+  // The two booleans against the work: `wanted` is whether a consumer exists
+  // and `active` is whether the demodulator is configured and running for it,
+  // so both must agree with whether samples are being produced at all.
+  const auto region_flags_agree = [&](const bool expected) {
+    const bool wanted = region_audio_flag("wanted");
+    const bool active = region_audio_flag("active");
+    if (wanted == expected && active == expected) return true;
+    qCritical().noquote()
+        << "regionAudio flags disagree with the work being done: expected"
+        << expected << "wanted=" << wanted << "active=" << active
+        << "samples=" << record.value(QStringLiteral("regionAudio"))
+                              .toObject()
+                              .value(QStringLiteral("samples"))
+                              .toInteger(-1);
+    return false;
+  };
 
   constexpr double kIqSampleRateHz = 240'000.0;
   constexpr double kIqCenterHz = 14'050'000.0;
@@ -296,6 +329,7 @@ int runRegionAudioChecks() {
           << "remote=" << remote_audio.size();
       return kRegionAudioWithoutConsumer;
     }
+    if (!region_flags_agree(false)) return kRegionAudioFlagsWrong;
 
     // 2. The local monitor, in region mode.
     QMetaObject::invokeMethod(worker, "setMonitor", Qt::BlockingQueuedConnection,
@@ -305,6 +339,10 @@ int runRegionAudioChecks() {
     if (monitor_audio.empty() || region_audio_samples() <= 0) {
       return kRegionMonitorSilent;
     }
+    // The REGION button's own state, as the record reports it. An operator who
+    // cannot hear the region reads this record to find out whether the station
+    // thinks it is playing, so it must say yes while it is.
+    if (!region_flags_agree(true)) return kRegionAudioFlagsWrong;
     // The rate invariant, at the one place an operator can hear it break: real
     // audio sampled at Fs carries only Fs/2, so a 24 kHz region needs at least
     // 48 kHz or its top half folds onto its bottom half.
@@ -360,6 +398,11 @@ int runRegionAudioChecks() {
     feed(16);
     if (remote_audio.empty()) return kRemoteAudioSilent;
     if (remote_rate_hz < 2.0 * kRegionBandwidthHz) return kRemoteAudioWrongRate;
+    // The exact combination a station reported wrongly: the local monitor is
+    // off and the only consumer is a remote subscriber, so the flags must
+    // still say the region is wanted and running.
+    static_cast<void>(region_audio_samples());
+    if (!region_flags_agree(true)) return kRegionAudioFlagsWrong;
 
     // 5. A debug capture of an SDR session must produce BOTH files. The IQ is
     //    the forensic payload and the audio is what an operator can actually

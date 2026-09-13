@@ -6,6 +6,55 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The Ctrl+Right drag that sizes the SDR decode region now measures the gesture
+  in pixels rather than in hertz. Whether a gesture is a click or a drag is a
+  fact about the pointer, and hertz per pixel is precisely what the spectrum
+  zoom changes: at full span on a two-megahertz capture the old 250 Hz threshold
+  was a sixth of a pixel, so a right-click that slipped at all resized the
+  region; zoomed in far enough to see individual CW signals, a deliberate
+  forty-pixel drag measured under the separate 1000 Hz threshold that chose the
+  centre, so the region was set to the floor width and placed where the button
+  came up instead of across the box that had just been drawn. One threshold now
+  decides both, and the centre is always the middle of what was dragged. The
+  width the drag will apply is shown while the pointer moves, so the 2 kHz floor
+  and the 24 kHz ceiling correct the gesture visibly instead of silently.
+
+- The OFF, RX and REGION listening buttons now show the monitor mode actually in
+  force. They were checkable, so each toggled its own lamp the instant it was
+  pressed, before the handler ran -- and the controller returns without
+  announcing anything when handed the mode already selected. Pressing REGION
+  while region listening was on therefore turned the lamp off and left the audio
+  playing, and pressing it again turned the lamp back on without changing
+  anything either.
+
+- The receiver toolbar now shows what the monitor is doing, and why it is not
+  doing it. Every reason a listening request fails -- region listening asked for
+  without direct SDR reception, a monitor output that cannot carry the region's
+  48 kHz mono float audio, an output that will not start or will not accept
+  audio -- was already recorded and displayed nowhere, so a refused request and
+  a silent output looked exactly like a button that does nothing.
+
+- Cluster and reverse-beacon callsigns stay inside the spot bar. The callsign
+  plates were positioned separately from the bar and nothing clipped them to it,
+  so on any platform whose 13 px line box runs to 16 px or taller the callsign
+  hung several pixels below the band that exists to contain it and was drawn
+  over the waterfall. The bar and the plates are now sized from one measurement
+  of the same font, and the plates are drawn inside the bar. The audio-offset
+  ruler below them and the area a spot can be pointed at are measured from the
+  bar rather than counted out again -- the ruler's ticks were landing inside a
+  callsign plate, and the lower half of a callsign produced no tooltip.
+
+- Cluster and reverse-beacon labels reserve the room a callsign really needs,
+  measured from the font that draws it. The estimate it replaces charged 7.4 px
+  per character, short for the DemiBold capitals a callsign is set in, plus
+  eleven pixels apiece for two evidence marks that have not sat beside the
+  callsign since they became the stripe underneath it -- so a spot reported by
+  both sources reserved eleven pixels it did not use and lost a neighbour's
+  label that would have fitted, while a spot with no stated source reserved ten
+  pixels too few and two callsigns could print into each other.
+
 ### Added
 
 - The decode region can be listened to as ordinary audio -- the whole region,

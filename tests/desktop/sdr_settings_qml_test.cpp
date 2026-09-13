@@ -325,5 +325,136 @@ int main() {
     return 8;
   }
 
+  // The Ctrl+Right region drag is measured in PIXELS. Whether a gesture was a
+  // click or a drag is a fact about the pointer, and the two thresholds this
+  // replaces were in hertz -- so the same gesture meant different things at
+  // different spectrum zooms. At full span on a wide capture 250 Hz is a
+  // fraction of a pixel and any slip resized the region; zoomed in far enough
+  // to see CW, a deliberate drag could measure under 1000 Hz, be read as a
+  // click, and put the region at the release point at the floor width while
+  // the rectangle the operator had just drawn was discarded.
+  //
+  // One threshold, and the centre follows the same decision as the width, so
+  // the box that was drawn and the region that results are the same thing.
+  // functionBody() finds a brace in the first column, which QML has only at
+  // the end of the file, so the release handler is bounded by the handler
+  // declared immediately after it instead.
+  const std::size_t release_begin = main_qml.find("onReleased: function(");
+  const std::size_t release_end = main_qml.find("onCanceled:", release_begin);
+  const std::string_view release_body =
+      release_begin == std::string::npos || release_end == std::string::npos
+          ? std::string_view{}
+          : std::string_view(main_qml).substr(release_begin,
+                                              release_end - release_begin);
+  if (release_body.empty() ||
+      !contains(main_qml,
+                "readonly property real decoderSelectionThresholdPx") ||
+      !contains(release_body, ">= decoderSelectionThresholdPx") ||
+      !contains(release_body, "dragged ? (firstHz + lastHz) / 2 : lastHz") ||
+      // The old hertz thresholds, in either of their roles.
+      contains(main_qml, "draggedHz >= 250") ||
+      contains(main_qml, "draggedHz >= 1000")) {
+    return 19;
+  }
+  // The rectangle on screen and the region that is applied are one
+  // calculation, and the operator can read the width before releasing --
+  // without which both clamps correct the gesture silently and a drag that
+  // was clamped is indistinguishable from one that mis-measured.
+  const std::size_t selection_fn =
+      main_qml.find("function selectionBandwidthHz()");
+  const std::size_t selection_readout =
+      main_qml.find("manualSliceHitArea.selectionBandwidthHz()");
+  if (selection_fn == std::string::npos ||
+      selection_readout == std::string::npos ||
+      !contains(release_body, "selectionBandwidthHz()") ||
+      !contains(main_qml, "objectName: \"sdrDecoderDragReadout\"")) {
+    return 19;
+  }
+
+  // The three Listen lamps must show the controller's monitor mode and
+  // nothing else. A checkable button toggles its own `checked` before the
+  // handler runs, and setMonitorMode() returns without emitting when it is
+  // handed the mode already in force -- so pressing REGION while region
+  // listening was on turned the lamp off and left the audio playing, and
+  // pressing it again turned the lamp back on without changing anything. A
+  // button that visibly toggles while nothing it controls moves is
+  // indistinguishable from a dead one, which is how this was reported.
+  const std::size_t listen_group = main_qml.find("objectName: \"monitorOffButton\"");
+  const std::size_t listen_group_end =
+      main_qml.find("objectName: \"monitorLevelSlider\"", listen_group);
+  if (listen_group == std::string::npos ||
+      listen_group_end == std::string::npos ||
+      contains(std::string_view(main_qml).substr(
+                   listen_group, listen_group_end - listen_group),
+               "checkable") ||
+      !contains(main_qml, "checked: replayController.monitorMode === 0") ||
+      !contains(main_qml, "checked: replayController.monitorMode === 1") ||
+      !contains(main_qml, "checked: replayController.monitorMode === 3")) {
+    return 20;
+  }
+  // Every reason a monitor request failed already existed as a property and
+  // was displayed nowhere, so a refused REGION and a monitor output that
+  // cannot carry the region's 48 kHz mono float both looked exactly like a
+  // button that does nothing.
+  if (!contains(controller_header, "monitorStatus READ monitorStatus") ||
+      !contains(main_qml, "objectName: \"monitorStatusNotice\"") ||
+      !contains(main_qml, "text: replayController.monitorStatus") ||
+      !contains(controller_implementation,
+                "Region listening needs direct SDR reception.")) {
+    return 20;
+  }
+
+  // Cluster and RBN callsigns belong inside the spot bar. They were a sibling
+  // Repeater positioned from the overlay's own coordinates against a bar whose
+  // depth was a hand-counted 26 px, while the plate was built from the label's
+  // own line height plus 8 -- 26 or more wherever a 13 px DemiBold line box
+  // runs to 18 px or taller. Nothing clipped them to the bar, so the callsign
+  // was drawn below the band that exists to contain it, on the waterfall.
+  //
+  // Containment is structural now: the plates are children of the bar and the
+  // bar clips, so no arithmetic can put one outside it. The bar is also sized
+  // from the same single measurement of the font the plate is sized from, so
+  // nothing has to be cut off for that to hold.
+  const std::size_t spot_bar = main_qml.find("objectName: \"dxSpotBar\"");
+  const std::size_t spot_repeater =
+      main_qml.find("model: dxSpotOverlay.placedSpots", spot_bar);
+  const std::size_t spot_plate =
+      main_qml.find("objectName: \"dxSpotLabelPlate\"", spot_bar);
+  const std::size_t offset_ruler = main_qml.find("id: audioOffsetRuler");
+  if (spot_bar == std::string::npos || spot_repeater == std::string::npos ||
+      spot_plate == std::string::npos || offset_ruler == std::string::npos ||
+      !(spot_bar < spot_repeater && spot_repeater < spot_plate &&
+        spot_plate < offset_ruler) ||
+      !contains(std::string_view(main_qml).substr(spot_bar,
+                                                  spot_repeater - spot_bar),
+                "clip: true") ||
+      !contains(std::string_view(main_qml).substr(spot_bar,
+                                                  spot_repeater - spot_bar),
+                "height: dxSpotOverlay.spotBarHeight") ||
+      !contains(main_qml, "FontMetrics {") ||
+      !contains(main_qml, "id: spotLabelMetrics") ||
+      !contains(main_qml, "spotPlateOffsetY + spotPlateHeight + 2") ||
+      !contains(main_qml, "y: dxSpotOverlay.spotPlateOffsetY") ||
+      !contains(main_qml, "height: dxSpotOverlay.spotPlateHeight")) {
+    return 21;
+  }
+  // The label layout reserves the room a callsign really needs. The estimate
+  // it replaces charged 7.4 px per character -- short for DemiBold capitals,
+  // so two neighbours could both be told there was room -- plus 11 px apiece
+  // for two evidence marks that have not sat beside the callsign since they
+  // became the stripe underneath it.
+  if (contains(main_qml, "spot.callsign.length * 7.4") ||
+      contains(main_qml, "function estimatedLabelWidth(") ||
+      !contains(main_qml, "spotLabelMetrics.advanceWidth(") ||
+      !contains(main_qml, "var labelWidth = measuredLabelWidth(spot)")) {
+    return 21;
+  }
+  // The audio-offset ruler clears the bar by measurement rather than by the
+  // count that put its ticks inside a callsign plate.
+  if (!contains(main_qml, "dxSpotOverlay.spotBarBottomY + 4") ||
+      contains(main_qml, "dxSpotOverlay.waterfallTopY + 26")) {
+    return 21;
+  }
+
   return 0;
 }

@@ -432,10 +432,24 @@ ApplicationWindow {
                 }
                 Rectangle { width: 1; height: 28; color: "#303a46" }
                 Label { text: "Listen"; color: "#91a0b1"; font.pixelSize: 11 }
+                // None of the three lamps is `checkable`, and that is the
+                // whole point. A checkable button toggles its own `checked`
+                // the instant it is pressed, before the handler runs, so the
+                // lamp showed the click rather than the monitor mode. The
+                // binding below only repaints it again when the controller
+                // emits monitorChanged() -- and setMonitorMode() returns
+                // without emitting anything when the mode it is handed is the
+                // one already in force. So pressing REGION while region
+                // listening was already on turned the lamp OFF and left the
+                // audio ON, and pressing it again turned the lamp back on
+                // without changing anything either: a button that visibly
+                // toggled while nothing it controlled ever moved, which is
+                // indistinguishable from a dead one. Not checkable, the lamp
+                // is only ever the controller's own state, so what it shows
+                // is what is actually playing.
                 ToolButton {
                     objectName: "monitorOffButton"
                     text: "OFF"
-                    checkable: true
                     checked: replayController.monitorMode === 0
                     onClicked: replayController.setMonitorMode(0)
                     ToolTip.visible: hovered
@@ -444,7 +458,6 @@ ApplicationWindow {
                 ToolButton {
                     objectName: "monitorReceiverButton"
                     text: "RX"
-                    checkable: true
                     checked: replayController.monitorMode === 1
                     enabled: replayController.activeSource
                              && replayController.sourceMode !== 2
@@ -457,7 +470,6 @@ ApplicationWindow {
                 ToolButton {
                     objectName: "monitorRegionButton"
                     text: "REGION"
-                    checkable: true
                     checked: replayController.monitorMode === 3
                     visible: replayController.sourceMode === 2
                     enabled: replayController.activeSource
@@ -476,6 +488,33 @@ ApplicationWindow {
                     onMoved: replayController.setMonitorLevel(value)
                     ToolTip.visible: hovered
                     ToolTip.text: "Monitor level " + Math.round(value * 100) + "%"
+                }
+                // The controller has always written what the monitor is doing,
+                // and every reason it could not do it, into monitorStatus --
+                // "Region listening needs direct SDR reception", "Selected
+                // monitor output does not support 48000 Hz mono float audio",
+                // "Could not start the monitor output", "Monitor output write
+                // failed" -- and nothing in this window ever read the
+                // property. A refused request and an output device that cannot
+                // carry the region's 48 kHz mono float therefore looked
+                // exactly like a button that does nothing: the operator
+                // pressed REGION, heard silence, and had no way to find out
+                // which of the two had happened. Shown unconditionally rather
+                // than only on failure, because the working states are worth
+                // reading too -- mode 3 names the region width it is playing,
+                // which is the one number the gesture that sets it cannot
+                // otherwise confirm.
+                Label {
+                    objectName: "monitorStatusNotice"
+                    visible: replayController.monitorStatus.length > 0
+                    text: replayController.monitorStatus
+                    color: "#8d9aaa"
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
+                    Layout.maximumWidth: 300
+                    ToolTip.visible: monitorStatusHover.hovered
+                    ToolTip.text: replayController.monitorStatus
+                    HoverHandler { id: monitorStatusHover }
                 }
                 Item { Layout.fillWidth: true }
                 Label {
@@ -919,6 +958,50 @@ ApplicationWindow {
                     property bool suppressSelectionClick: false
                     property real decoderSelectionStartX: 0
                     property real decoderSelectionCurrentX: 0
+                    // Whether a gesture was a click or a drag is a question
+                    // about the pointer, so it is answered in pixels. It used
+                    // to be answered in hertz -- 250 to resize at all, and a
+                    // second, different 1000 to centre the region on the
+                    // middle of the box rather than on the point of release --
+                    // and hertz per pixel is precisely what the spectrum zoom
+                    // changes. At full span on a two-megahertz capture 250 Hz
+                    // is a sixth of a pixel, so a right-click that slipped at
+                    // all resized the region; zoomed in far enough to see
+                    // individual CW signals, a deliberate forty-pixel drag
+                    // measured under 1000 Hz, was read as a click, and the
+                    // region jumped to where the button came up at the floor
+                    // width while the box the operator had just drawn was
+                    // discarded. One gesture, two different meanings depending
+                    // on the zoom, and neither of them the drawn rectangle.
+                    readonly property real decoderSelectionThresholdPx: 6
+                    // What the drag currently in progress will apply, so the
+                    // rectangle on screen and the region that results are the
+                    // same calculation rather than two that agree by hand.
+                    // Reading it while the pointer moves is also what makes
+                    // the two clamps visible: a drag wider than 24 kHz or
+                    // narrower than 2 kHz used to be silently corrected on
+                    // release, which is indistinguishable from the gesture
+                    // having mis-measured.
+                    function selectionBandwidthHz() {
+                        if (Math.abs(decoderSelectionCurrentX
+                                     - decoderSelectionStartX)
+                                < decoderSelectionThresholdPx) {
+                            return appSettings.sdrDecoderBandwidthHz
+                        }
+                        var draggedHz = Math.abs(
+                                    frequencyAtX(decoderSelectionCurrentX)
+                                    - frequencyAtX(decoderSelectionStartX))
+                        // 2 kHz is the narrowest slice the decimator accepts.
+                        // 24 kHz is the ceiling, and it is the same ceiling
+                        // the setter clamps to: the region is not only
+                        // decoded, it is what the operator listens to, and
+                        // 48 kHz audio carries 24 kHz of bandwidth and no
+                        // more. So the decode region is the listen window --
+                        // one number, and nothing that can be decoded but
+                        // never heard.
+                        return Math.round(Math.max(2000, Math.min(
+                                   24000, draggedHz)) / 100) * 100
+                    }
                     function frequencyAtX(positionX) {
                         var fraction = Math.max(0, Math.min(1,
                                                            positionX / width))
@@ -1029,34 +1112,28 @@ ApplicationWindow {
                             0, Math.min(width, mouse.x))
                         var firstHz = frequencyAtX(decoderSelectionStartX)
                         var lastHz = frequencyAtX(decoderSelectionCurrentX)
-                        var draggedHz = Math.abs(lastHz - firstHz)
+                        var dragged = Math.abs(decoderSelectionCurrentX
+                                               - decoderSelectionStartX)
+                                      >= decoderSelectionThresholdPx
                         // The width is whatever was dragged, to the nearest
-                        // hundred hertz. It used to be floored at 6 kHz and
-                        // rounded to the nearest kilohertz, so a drag narrower
-                        // than six kilohertz set the width it already had and
-                        // the region appeared to move but never resize. Two
-                        // kilohertz is the real floor -- it is the narrowest
-                        // slice the decimator will accept -- and a drag below
-                        // the click threshold still means "put the window
-                        // here" and leaves the width alone.
-                        // 24 kHz is the ceiling, and it is the same ceiling
-                        // the setter clamps to. A drag that could ask for more
-                        // than the setting accepts would appear to resize the
-                        // region and then silently not, which is the failure
-                        // this floor was already fixed for once. The number
-                        // comes from what the region is FOR: it is not only
-                        // decoded, it is what the operator listens to, and
-                        // 48 kHz audio carries 24 kHz of bandwidth and no
-                        // more. So the decode region is the listen window --
-                        // one number, and nothing that can be decoded but
-                        // never heard.
-                        var bandwidthHz = draggedHz >= 250
-                                ? Math.round(Math.max(2000,
-                                      Math.min(24000, draggedHz)) / 100) * 100
+                        // hundred hertz, clamped by the same function the
+                        // rectangle on screen was reading while the pointer
+                        // moved. A gesture below the click threshold still
+                        // means "put the window here" and leaves the width
+                        // alone.
+                        var bandwidthHz = dragged
+                                ? selectionBandwidthHz()
                                 : appSettings.sdrDecoderBandwidthHz
+                        // One rule for the centre: the middle of what was
+                        // drawn. A second threshold used to decide this
+                        // separately, so a drag between the two sizes the
+                        // region to the floor width and then centred it on the
+                        // release point instead of on the box -- the region
+                        // landed beside the signal the operator had just
+                        // bracketed. A drag narrower than the floor still gets
+                        // the floor, but it stays centred where it was drawn.
                         var selectedCenterHz = Math.round(
-                            draggedHz >= 1000
-                                ? (firstHz + lastHz) / 2 : lastHz)
+                            dragged ? (firstHz + lastHz) / 2 : lastHz)
                         // The window, and only the window. This also opened a
                         // manual decode at the centre of whatever was dragged,
                         // so choosing where to listen silently created a
@@ -1165,6 +1242,42 @@ ApplicationWindow {
                     border.width: 2
                     opacity: 0.52
                     z: 8
+                }
+                // What the drag in progress will actually apply, read off the
+                // same function that applies it. A spectrum spanning the whole
+                // capture puts the entire 2-24 kHz range of this setting
+                // inside about fifteen pixels, so without a figure the
+                // operator is aiming a gesture whose result they cannot
+                // predict and only discovers the clamp afterwards.
+                Rectangle {
+                    objectName: "sdrDecoderDragReadout"
+                    visible: manualSliceHitArea.decoderSelectionActive
+                    x: Math.max(spectrumDisplay.x,
+                                Math.min(spectrumDisplay.x
+                                         + spectrumDisplay.width - width,
+                                         spectrumDisplay.x
+                                         + (manualSliceHitArea
+                                            .decoderSelectionStartX
+                                            + manualSliceHitArea
+                                              .decoderSelectionCurrentX) / 2
+                                         - width / 2))
+                    y: spectrumDisplay.y + 10
+                    width: dragReadoutLabel.implicitWidth + 14
+                    height: dragReadoutLabel.implicitHeight + 8
+                    radius: 3
+                    color: "#d2071b18"
+                    border.color: "#7fffe7"
+                    border.width: 1
+                    z: 9
+                    Label {
+                        id: dragReadoutLabel
+                        anchors.centerIn: parent
+                        text: (manualSliceHitArea.selectionBandwidthHz()
+                               / 1000).toFixed(1) + " kHz decode region"
+                        color: "#7fffe7"
+                        font.pixelSize: 11
+                        font.weight: Font.DemiBold
+                    }
                 }
                 ToolButton {
                     objectName: "resetSpectrumZoomButton"
@@ -1494,7 +1607,6 @@ ApplicationWindow {
                     // retained-stream marks just above it, and the callsigns
                     // hang beneath them on the waterfall side.
                     readonly property real separatorY: Math.round(height * 0.36)
-                    readonly property real waterfallTopY: separatorY + 8
                     // Deliberately one flat colour from the axis/chrome family
                     // rather than anything in the 24 decoded-stream identity
                     // colours, the teal decode window or the pink TX slice.
@@ -1528,6 +1640,41 @@ ApplicationWindow {
                     readonly property real labelGapPx: 6
                     readonly property real tickWidthPx: 15
 
+                    // Every vertical number in this band comes from one
+                    // measurement of the callsign's own font, because the bar
+                    // and the plate it is supposed to contain used to be
+                    // counted by hand against each other and did not agree.
+                    // The bar was a flat 26 px deep; the plate was built from
+                    // the label's own line height plus 8, which is 26 or more
+                    // on any platform whose 13 px DemiBold line box runs to
+                    // 18 px or taller. So on a real station the callsign hung
+                    // six to nine pixels out of the bottom of the band that
+                    // exists to give it a home, and was drawn on the waterfall
+                    // below it -- which is the state the bar was added to fix.
+                    // Measured once and used for both, the two cannot disagree
+                    // whatever the platform font turns out to be.
+                    FontMetrics {
+                        id: spotLabelMetrics
+                        font.pixelSize: 13
+                        font.weight: Font.DemiBold
+                        font.letterSpacing: 0.4
+                    }
+                    readonly property real spotLabelLineHeight:
+                        Math.ceil(spotLabelMetrics.height)
+                    // 3 px of air above the callsign and 3 below it, then the
+                    // 2 px source stripe on the plate's own bottom edge.
+                    readonly property real spotPlateHeight:
+                        spotLabelLineHeight + 8
+                    readonly property real spotBarTopY: separatorY + 2
+                    // Bar-relative, because the tick and the plate are drawn
+                    // inside the bar now rather than beside it.
+                    readonly property real spotTickOffsetY: 2
+                    readonly property real spotPlateOffsetY: 8
+                    readonly property real spotBarHeight:
+                        spotPlateOffsetY + spotPlateHeight + 2
+                    readonly property real spotBarBottomY:
+                        spotBarTopY + spotBarHeight
+
                     function ageStrength(ageSeconds) {
                         var age = Number(ageSeconds)
                         if (!Number.isFinite(age) || age <= freshSeconds)
@@ -1558,14 +1705,28 @@ ApplicationWindow {
                         return "source not stated"
                     }
 
-                    // No font metrics are available while laying out, so this
-                    // is deliberately generous: over-estimating costs a little
-                    // extra air between callsigns, under-estimating prints two
-                    // of them on top of each other.
-                    function estimatedLabelWidth(spot) {
-                        return 12 + spot.callsign.length * 7.4
-                               + (spot.reverseBeacon ? 11 : 0)
-                               + (spot.cluster ? 11 : 0)
+                    // The room this callsign will really occupy, asked of the
+                    // font that will really draw it. It used to be reserved as
+                    // 12 + 7.4 px per character plus 11 px apiece for a
+                    // reverse-beacon and a cluster mark -- marks that have not
+                    // sat beside the callsign since they became the stripe
+                    // underneath it. Charging for them over-reserved by up to
+                    // 22 px and lost labels that would have fitted, while
+                    // 7.4 px per character under-measures DemiBold capitals,
+                    // so two neighbours could both be told there was room and
+                    // then print into each other.
+                    //
+                    // advanceWidth() is a call, not a property read: a shared
+                    // TextMetrics whose text every plate had to assign in turn
+                    // would make each plate's width binding invalidate every
+                    // other one. The 10 px is the plate's own 5 px inset on
+                    // each side, and the extra pixel covers the difference
+                    // between an advance and the laid-out item's own implicit
+                    // width, which is what the plate is finally sized by.
+                    function measuredLabelWidth(spot) {
+                        return 11 + Math.ceil(
+                                   spotLabelMetrics.advanceWidth(
+                                       spot.callsign))
                     }
 
                     // Strongest evidence first: two independent sources that
@@ -1591,7 +1752,7 @@ ApplicationWindow {
                     // leaves it unlabelled when a stronger neighbour already
                     // holds that space.
                     function claimLabelSpace(spot, taken, plotWidth) {
-                        var labelWidth = estimatedLabelWidth(spot)
+                        var labelWidth = measuredLabelWidth(spot)
                         var left = Math.max(0, Math.min(
                             plotWidth - labelWidth,
                             spot.pixelX - labelWidth / 2))
@@ -1688,9 +1849,14 @@ ApplicationWindow {
                         if (!manualSliceHitArea.containsMouse
                                 || manualSliceHitArea.hoveredStreamId !== 0)
                             return -1
+                        // The band a spot can be pointed at is the bar, taken
+                        // from the bar rather than counted out again: the
+                        // hand-counted version stopped 18 px under the
+                        // waterfall top, which is above the bottom of a plate
+                        // on most platforms, so pointing at the lower part of
+                        // a callsign produced no tooltip.
                         var pointerY = manualSliceHitArea.mouseY
-                        if (pointerY < separatorY
-                                || pointerY > waterfallTopY + 18)
+                        if (pointerY < separatorY || pointerY > spotBarBottomY)
                             return -1
                         var pointerX = manualSliceHitArea.mouseX
                         var nearest = -1
@@ -1715,15 +1881,25 @@ ApplicationWindow {
                     // reports rather than to this receiver. A quiet bar gives
                     // them a home, and it is drawn only when there is
                     // something to put in it.
+                    // The ticks and the callsigns are CHILDREN of the bar, and
+                    // that is the fix rather than a tidying of it. They used
+                    // to be a sibling Repeater positioned from the overlay's
+                    // own coordinates, so nothing but two sets of hand-counted
+                    // offsets kept them in the band -- and when those offsets
+                    // disagreed, as they did, there was no clip anywhere in
+                    // the chain to stop a callsign being drawn outside the bar
+                    // entirely. Inside it and clipped, a plate cannot leave
+                    // the band whatever a platform's font metrics turn out to
+                    // be; the bar is sized from those same metrics so that
+                    // nothing has to be cut off for that to hold.
                     Rectangle {
                         objectName: "dxSpotBar"
                         visible: dxSpotOverlay.placedSpots.length > 0
                         x: 0
-                        y: dxSpotOverlay.separatorY + 2
+                        y: dxSpotOverlay.spotBarTopY
                         width: dxSpotOverlay.width
-                        // Deep enough for the enlarged callsign plates and the
-                        // source stripe beneath them.
-                        height: 26
+                        height: dxSpotOverlay.spotBarHeight
+                        clip: true
                         color: "#b00b1420"
                         Rectangle {
                             anchors.top: parent.top
@@ -1737,123 +1913,132 @@ ApplicationWindow {
                             height: 1
                             color: "#2b3947"
                         }
-                    }
 
-                    Repeater {
-                        model: dxSpotOverlay.placedSpots
-                        delegate: Item {
-                            id: dxSpotMarker
-                            required property var modelData
-                            required property int index
-                            readonly property bool pointerHovered:
-                                dxSpotOverlay.hoveredIndex === index
-                            readonly property real ageOpacity:
-                                pointerHovered
-                                ? 1.0
-                                : dxSpotOverlay.ageStrength(
-                                      modelData.ageSeconds)
-                            // A plain geometric container: the tick sits on
-                            // the exact frequency while the callsign below is
-                            // free to slide along the plot to stay readable.
-                            width: dxSpotOverlay.width
-                            height: dxSpotOverlay.height
-
-                            Rectangle {
-                                objectName: "dxSpotTick"
-                                x: modelData.pixelX
-                                   - dxSpotOverlay.tickWidthPx / 2
-                                y: dxSpotOverlay.separatorY + 4
-                                width: dxSpotOverlay.tickWidthPx
-                                height: 2
-                                color: dxSpotOverlay.spotColor
-                                opacity: dxSpotMarker.ageOpacity
-                                ToolTip.visible: dxSpotMarker.pointerHovered
-                                ToolTip.delay: 450
-                                ToolTip.text:
-                                    modelData.callsign + "\n"
-                                    + modelData.frequencyText + "\n"
-                                    + dxSpotOverlay.spotSourceText(modelData)
-                                    + "  •  " + modelData.observations
-                                    + (modelData.observations === 1
-                                       ? " report" : " reports")
-                                    + "  •  "
-                                    + dxSpotOverlay.formatSpotAge(
+                        Repeater {
+                            model: dxSpotOverlay.placedSpots
+                            delegate: Item {
+                                id: dxSpotMarker
+                                required property var modelData
+                                required property int index
+                                readonly property bool pointerHovered:
+                                    dxSpotOverlay.hoveredIndex === index
+                                readonly property real ageOpacity:
+                                    pointerHovered
+                                    ? 1.0
+                                    : dxSpotOverlay.ageStrength(
                                           modelData.ageSeconds)
-                                    + "\nReported by another receiver. "
-                                    + "Nothing here was decoded from this "
-                                    + "signal."
-                            }
-                            Rectangle {
-                                id: dxSpotLabelPlate
-                                objectName: "dxSpotLabelPlate"
-                                // Like every other label on this panel, drawn
-                                // straight over live waterfall speckle, so it
-                                // carries its own semi-opaque plate.
-                                visible: modelData.showLabel
-                                         && appSettings.dxSpotsShowLabels
-                                x: Math.max(0, Math.min(
-                                       dxSpotOverlay.width - width,
-                                       modelData.pixelX - width / 2))
-                                y: dxSpotOverlay.waterfallTopY + 2
-                                // The two evidence marks are placed by hand
-                                // rather than by a positioner so that both
-                                // stay centred on the callsign's own height
-                                // and the plate keeps a constant 5 px inset
-                                // whichever of them is present.
-                                // The source stripe under the call. Two
-                                // sources agreeing split it, so agreement is
-                                // visible without a second mark.
-                                readonly property real stripeHeight: 2
-                                width: 10 + dxSpotCallLabel.implicitWidth
-                                height: dxSpotCallLabel.implicitHeight + 6
-                                       + stripeHeight
-                                radius: 3
-                                color: "#c8080f16"
-                                border.color: dxSpotMarker.pointerHovered
-                                              ? dxSpotOverlay.spotColor
-                                              : "transparent"
-                                border.width: 1
-                                opacity: dxSpotMarker.ageOpacity
-                                Label {
-                                    id: dxSpotCallLabel
-                                    x: 5
-                                    y: 3
-                                    // A fifth larger than before, on the
-                                    // owner's reading of it at the previous
-                                    // size.
-                                    text: modelData.callsign
+                                // A plain geometric container filling the bar: the
+                                // tick sits on the exact frequency while the
+                                // callsign below is free to slide along the plot
+                                // to stay readable.
+                                width: dxSpotOverlay.width
+                                height: dxSpotOverlay.spotBarHeight
+
+                                Rectangle {
+                                    objectName: "dxSpotTick"
+                                    x: modelData.pixelX
+                                       - dxSpotOverlay.tickWidthPx / 2
+                                    y: dxSpotOverlay.spotTickOffsetY
+                                    width: dxSpotOverlay.tickWidthPx
+                                    height: 2
                                     color: dxSpotOverlay.spotColor
-                                    font.pixelSize: 13
-                                    font.weight: Font.DemiBold
-                                    font.letterSpacing: 0.4
+                                    opacity: dxSpotMarker.ageOpacity
+                                    ToolTip.visible: dxSpotMarker.pointerHovered
+                                    ToolTip.delay: 450
+                                    ToolTip.text:
+                                        modelData.callsign + "\n"
+                                        + modelData.frequencyText + "\n"
+                                        + dxSpotOverlay.spotSourceText(modelData)
+                                        + "  •  " + modelData.observations
+                                        + (modelData.observations === 1
+                                           ? " report" : " reports")
+                                        + "  •  "
+                                        + dxSpotOverlay.formatSpotAge(
+                                              modelData.ageSeconds)
+                                        + "\nReported by another receiver. "
+                                        + "Nothing here was decoded from this "
+                                        + "signal."
                                 }
-                                Row {
-                                    objectName: "dxSpotSourceStripe"
-                                    x: 5
-                                    anchors.bottom: parent.bottom
-                                    anchors.bottomMargin: 2
-                                    width: dxSpotCallLabel.implicitWidth
-                                    height: dxSpotLabelPlate.stripeHeight
-                                    // Half each when the two sources agree,
-                                    // the whole width when only one reported.
-                                    readonly property int sources:
-                                        (modelData.reverseBeacon ? 1 : 0)
-                                        + (modelData.cluster ? 1 : 0)
-                                    Rectangle {
-                                        objectName: "dxSpotReverseBeaconStripe"
-                                        visible: modelData.reverseBeacon
-                                        width: parent.sources > 1
-                                               ? parent.width / 2 : parent.width
-                                        height: parent.height
-                                        color: dxSpotOverlay.spotRbnColor
+                                Rectangle {
+                                    id: dxSpotLabelPlate
+                                    objectName: "dxSpotLabelPlate"
+                                    // Like every other label on this panel, drawn
+                                    // straight over live waterfall speckle, so it
+                                    // carries its own semi-opaque plate.
+                                    visible: modelData.showLabel
+                                             && appSettings.dxSpotsShowLabels
+                                    x: Math.max(0, Math.min(
+                                           dxSpotOverlay.width - width,
+                                           modelData.pixelX - width / 2))
+                                    y: dxSpotOverlay.spotPlateOffsetY
+                                    // The two evidence marks are placed by hand
+                                    // rather than by a positioner so that both
+                                    // stay centred on the callsign's own height
+                                    // and the plate keeps a constant 5 px inset
+                                    // whichever of them is present.
+                                    // The source stripe under the call. Two
+                                    // sources agreeing split it, so agreement is
+                                    // visible without a second mark.
+                                    readonly property real stripeHeight: 2
+                                    // The width is still this label's own
+                                    // laid-out size; the height is the
+                                    // overlay's one measurement of the font,
+                                    // which is the same number the bar was
+                                    // sized from. That is what makes the
+                                    // containment arithmetic rather than
+                                    // coincidence: the plate cannot be deeper
+                                    // than the band that holds it, because
+                                    // both are the same expression.
+                                    width: 10 + dxSpotCallLabel.implicitWidth
+                                    height: dxSpotOverlay.spotPlateHeight
+                                    radius: 3
+                                    color: "#c8080f16"
+                                    border.color: dxSpotMarker.pointerHovered
+                                                  ? dxSpotOverlay.spotColor
+                                                  : "transparent"
+                                    border.width: 1
+                                    opacity: dxSpotMarker.ageOpacity
+                                    Label {
+                                        id: dxSpotCallLabel
+                                        x: 5
+                                        y: 3
+                                        // A fifth larger than before, on the
+                                        // owner's reading of it at the previous
+                                        // size.
+                                        text: modelData.callsign
+                                        color: dxSpotOverlay.spotColor
+                                        font.pixelSize: 13
+                                        font.weight: Font.DemiBold
+                                        font.letterSpacing: 0.4
                                     }
-                                    Rectangle {
-                                        objectName: "dxSpotClusterStripe"
-                                        visible: modelData.cluster
-                                        width: parent.sources > 1
-                                               ? parent.width / 2 : parent.width
-                                        height: parent.height
-                                        color: dxSpotOverlay.spotClusterColor
+                                    Row {
+                                        objectName: "dxSpotSourceStripe"
+                                        x: 5
+                                        anchors.bottom: parent.bottom
+                                        anchors.bottomMargin: 2
+                                        width: dxSpotCallLabel.implicitWidth
+                                        height: dxSpotLabelPlate.stripeHeight
+                                        // Half each when the two sources agree,
+                                        // the whole width when only one reported.
+                                        readonly property int sources:
+                                            (modelData.reverseBeacon ? 1 : 0)
+                                            + (modelData.cluster ? 1 : 0)
+                                        Rectangle {
+                                            objectName: "dxSpotReverseBeaconStripe"
+                                            visible: modelData.reverseBeacon
+                                            width: parent.sources > 1
+                                                   ? parent.width / 2 : parent.width
+                                            height: parent.height
+                                            color: dxSpotOverlay.spotRbnColor
+                                        }
+                                        Rectangle {
+                                            objectName: "dxSpotClusterStripe"
+                                            visible: modelData.cluster
+                                            width: parent.sources > 1
+                                                   ? parent.width / 2 : parent.width
+                                            height: parent.height
+                                            color: dxSpotOverlay.spotClusterColor
+                                        }
                                     }
                                 }
                             }
@@ -1904,18 +2089,21 @@ ApplicationWindow {
 
                     // Vertical band. The 8 px gutter itself is full: the
                     // retained-stream marks straddle the separator line, the
-                    // spot ticks take its lower half, and the spot callsign
-                    // plates hang from waterfallTopY + 2 down to roughly
-                    // + 22. The lower "dBFS" plate straddles the separator on
-                    // the left edge, and the rotated stream callsigns end
-                    // 12 px above it, so the strip above the separator is not
-                    // free either. The first band clear of all of them starts
-                    // four pixels under the deepest spot plate. It is
-                    // measured from dxSpotOverlay's own waterfallTopY so the
-                    // two cannot drift apart if that overlay is ever
-                    // re-laid-out.
+                    // spot ticks take its lower half, and the spot bar below
+                    // them holds the callsign plates. The lower "dBFS" plate
+                    // straddles the separator on the left edge, and the
+                    // rotated stream callsigns end 12 px above it, so the
+                    // strip above the separator is not free either. The first
+                    // band clear of all of them starts four pixels under the
+                    // spot bar. Taken from the bar's own bottom edge rather
+                    // than from a count of where the plates were assumed to
+                    // reach: that count said "roughly waterfallTopY + 22" and
+                    // put this ruler's ticks at + 26, which is inside a plate
+                    // on any platform whose 13 px line box runs to 18 px or
+                    // more -- the same mis-measurement that let the callsigns
+                    // out of the bar in the first place.
                     readonly property real tickTopY:
-                        dxSpotOverlay.waterfallTopY + 26
+                        dxSpotOverlay.spotBarBottomY + 4
                     readonly property real tickHeightPx: 4
                     // Plated label depth at this font size, rounded up.
                     readonly property real labelDepthPx: 16
