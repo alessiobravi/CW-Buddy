@@ -2745,7 +2745,13 @@ void ReplayController::beginLiveAudioCapture() {
   // After liveDspStartRequested(), for the reason given on the SDR path: the
   // monitor is a demand the worker has to be holding, and a start is where it
   // must be restated.
-  publishMonitorConfiguration();
+  // Only where there is a demand to restate. Mode 0 is "no monitor", which
+  // is what the worker holds immediately after a start in any case, so
+  // publishing it states nothing and still crosses a thread boundary during
+  // startup -- on a machine with no audio device at all that is a cost for
+  // no statement. A real demand, which is the case this restatement exists
+  // for, is unaffected.
+  if (monitor_mode_ != 0) publishMonitorConfiguration();
   emit liveStartRequested(audio_input_id_, audio_input_device_name_);
 }
 
@@ -2782,7 +2788,13 @@ void ReplayController::beginLiveSdrCapture() {
   // carrying three scalars -- and it makes the controller, not the order in
   // which an operator happened to press things, the authority on what this
   // station is listening to.
-  publishMonitorConfiguration();
+  // Only where there is a demand to restate. Mode 0 is "no monitor", which
+  // is what the worker holds immediately after a start in any case, so
+  // publishing it states nothing and still crosses a thread boundary during
+  // startup -- on a machine with no audio device at all that is a cost for
+  // no statement. A real demand, which is the case this restatement exists
+  // for, is unaffected.
+  if (monitor_mode_ != 0) publishMonitorConfiguration();
   emit sdrStartRequested(sdr_device_id_,
                          static_cast<double>(sdr_center_frequency_hz_),
                          static_cast<double>(sdr_sample_rate_hz_),
