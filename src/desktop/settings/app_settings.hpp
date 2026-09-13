@@ -41,6 +41,12 @@ class AppSettings final : public QObject {
   Q_PROPERTY(int audioInputIndex READ audioInputIndex NOTIFY audioInputsChanged)
   Q_PROPERTY(QString audioInputDisplayName READ audioInputDisplayName NOTIFY
                  audioInputsChanged)
+  // True while two or more present inputs share one operating-system
+  // description. The interface explains its ordinals only then, because an
+  // explanation left on screen for the ordinary single-interface station is
+  // noise, and withheld from the station that has two is a dead end.
+  Q_PROPERTY(bool audioInputNamesAmbiguous READ audioInputNamesAmbiguous NOTIFY
+                 audioInputsChanged)
   Q_PROPERTY(QStringList audioOutputNames READ audioOutputNames NOTIFY
                  audioOutputsChanged)
   Q_PROPERTY(
@@ -471,7 +477,16 @@ class AppSettings final : public QObject {
   [[nodiscard]] const QStringList& audioInputNames() const noexcept;
   [[nodiscard]] int audioInputIndex() const noexcept;
   [[nodiscard]] QString audioInputDisplayName() const;
+  [[nodiscard]] bool audioInputNamesAmbiguous() const noexcept;
   [[nodiscard]] const QString& audioInputId() const noexcept;
+  // The operating system's own description of the chosen input, undecorated by
+  // the ordinal and default markers the list shows. This is what the input can
+  // be found by after its identifier changes, so it is stored raw.
+  [[nodiscard]] const QString& audioInputDeviceName() const noexcept;
+  // Records an input found by name after its saved identifier vanished, and
+  // writes the recovered identifier straight to storage so the next start
+  // matches on the identifier again rather than recovering a second time.
+  void adoptRecoveredAudioInput(const QString& encoded_id);
   [[nodiscard]] const QStringList& audioOutputNames() const noexcept;
   [[nodiscard]] int audioOutputIndex() const noexcept;
   [[nodiscard]] QString audioOutputDisplayName() const;
@@ -948,8 +963,13 @@ class AppSettings final : public QObject {
   QStringList serial_ports_;
   QStringList audio_input_names_;
   QStringList audio_input_ids_;
+  // The undecorated operating-system descriptions, index-aligned with the two
+  // lists above, so the raw name of a selection can be recovered from its row.
+  QStringList audio_input_device_names_;
+  bool audio_input_names_ambiguous_{false};
   QString audio_input_id_;
   QString audio_input_name_;
+  QString audio_input_device_name_;
   QStringList audio_output_names_;
   QStringList audio_output_ids_;
   QString audio_output_id_;

@@ -409,7 +409,11 @@ class ReplayController final : public QObject {
                                       int custom_port,
                                       const QString& login_callsign,
                                       int retention_minutes, int tolerance_hz);
-  void setAudioInputSelection(QString encoded_id, QString display_name);
+  // display_name is what the operator reads; device_name is the operating
+  // system's own description of the device, which is what an input can be
+  // found by when its identifier has changed underneath it.
+  void setAudioInputSelection(QString encoded_id, QString display_name,
+                              QString device_name);
   void setSdrInputSelection(QString device_id, QString display_name,
                             qulonglong center_frequency_hz,
                             int sample_rate_hz, int bandwidth_hz,
@@ -483,7 +487,16 @@ class ReplayController final : public QObject {
                           bool automatic_bandwidth,
                           double lower_frequency_hz,
                           double upper_frequency_hz);
-  void liveStartRequested(const QString& encoded_device_id);
+  // The device name rides with the identifier because QAudioDevice::id() does
+  // not survive a restart, a driver reload or a different USB port, and the
+  // name is the only other thing the application knows about the operator's
+  // choice. See AudioInputOutcome in replay/live_audio_worker.hpp.
+  void liveStartRequested(const QString& encoded_device_id,
+                          const QString& device_name);
+  // An input was found by name after its saved identifier vanished. Settings
+  // listens so the recovered identifier is written back and the next start is
+  // an exact-identifier match again.
+  void audioInputRecovered(const QString& adopted_id);
   void liveStopRequested();
   void sdrStartRequested(const QString& device_id,
                          double center_frequency_hz,
@@ -654,6 +667,10 @@ class ReplayController final : public QObject {
   qulonglong input_overruns_{0};
   QString audio_input_id_;
   QString audio_input_name_{QStringLiteral("System default input")};
+  QString audio_input_device_name_;
+  // Held so the notice survives started(), which overwrites the status line
+  // with the live-RX summary the instant capture begins.
+  QString audio_input_recovery_notice_;
   QString sdr_device_id_;
   QString sdr_device_name_{QStringLiteral("No SDR selected")};
   qulonglong sdr_center_frequency_hz_{14'050'000ULL};

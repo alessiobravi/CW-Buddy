@@ -501,8 +501,16 @@ QString AppSettings::audioInputDisplayName() const {
                                    : audio_input_name_;
 }
 
+bool AppSettings::audioInputNamesAmbiguous() const noexcept {
+  return audio_input_names_ambiguous_;
+}
+
 const QString& AppSettings::audioInputId() const noexcept {
   return audio_input_id_;
+}
+
+const QString& AppSettings::audioInputDeviceName() const noexcept {
+  return audio_input_device_name_;
 }
 const QStringList& AppSettings::audioOutputNames() const noexcept {
   return audio_output_names_;
@@ -2429,6 +2437,8 @@ void AppSettings::refreshSerialPorts() {
 void AppSettings::refreshAudioInputs() {
   QStringList names{QStringLiteral("System default input (recommended)")};
   QStringList ids{QString{}};
+  QStringList device_names{QString{}};
+  QList<bool> defaults{false};
   for (const auto& device : QMediaDevices::audioInputs()) {
     const QString id = QString::fromLatin1(device.id().toBase64(
         QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
@@ -2439,11 +2449,40 @@ void AppSettings::refreshAudioInputs() {
     if (name.isEmpty()) {
       name = QStringLiteral("Audio input %1").arg(ids.size());
     }
-    if (device.isDefault()) {
-      name += QStringLiteral(" (current default)");
-    }
     names.push_back(name);
     ids.push_back(id);
+    device_names.push_back(name);
+    defaults.push_back(device.isDefault());
+  }
+
+  // Two interfaces the operating system describes with identical words are
+  // unchoosable: a station with two of the same model sees one row of text
+  // twice and cannot tell which of them is the radio. Number them, in
+  // enumeration order, so the list offers something to point at -- and so the
+  // report that refuses to guess between them has names to quote. The same
+  // numbering is applied to the candidates listed by the ambiguity report in
+  // replay/live_audio_worker.cpp; the two must agree or the report names rows
+  // that are not in the list.
+  bool ambiguous = false;
+  for (qsizetype row = 1; row < names.size(); ++row) {
+    int ordinal = 0;
+    int total = 0;
+    for (qsizetype other = 1; other < device_names.size(); ++other) {
+      if (device_names.at(other) != device_names.at(row)) continue;
+      ++total;
+      if (other <= row) ordinal = total;
+    }
+    if (total < 2) continue;
+    ambiguous = true;
+    names[row] = QStringLiteral("%1 #%2").arg(names.at(row)).arg(ordinal);
+  }
+  audio_input_names_ambiguous_ = ambiguous;
+
+  // The default marker goes on after the ordinal, so it never lands between a
+  // name and its number, and never becomes part of the raw name that identity
+  // is matched on.
+  for (qsizetype row = 1; row < names.size(); ++row) {
+    if (defaults.at(row)) names[row] += QStringLiteral(" (current default)");
   }
 
   if (!audio_input_id_.isEmpty() && !ids.contains(audio_input_id_)) {
@@ -2453,6 +2492,10 @@ void AppSettings::refreshAudioInputs() {
             : audio_input_name_;
     names.push_back(unavailable_name + QStringLiteral(" (unavailable)"));
     ids.push_back(audio_input_id_);
+    // An absent device keeps the raw name it was saved with. That name is the
+    // only handle left on it, and losing it here would cost the very recovery
+    // this list is describing the failure of.
+    device_names.push_back(audio_input_device_name_);
   }
 
   const int selected_index = ids.indexOf(audio_input_id_);
@@ -2460,12 +2503,17 @@ void AppSettings::refreshAudioInputs() {
     audio_input_name_ = names.at(selected_index);
     if (audio_input_name_.endsWith(QStringLiteral(" (unavailable)"))) {
       audio_input_name_.chop(QStringLiteral(" (unavailable)").size());
+    } else {
+      audio_input_device_name_ = device_names.at(selected_index);
     }
   }
 
-  if (names != audio_input_names_ || ids != audio_input_ids_) {
-    audio_input_names_ = std::move(names);
-    audio_input_ids_ = std::move(ids);
+  const bool listing_changed =
+      names != audio_input_names_ || ids != audio_input_ids_;
+  audio_input_names_ = std::move(names);
+  audio_input_ids_ = std::move(ids);
+  audio_input_device_names_ = std::move(device_names);
+  if (listing_changed) {
     emit audioInputsChanged();
   }
 }
@@ -2477,6 +2525,14 @@ void AppSettings::selectAudioInput(const int index) {
   audio_input_id_ = audio_input_ids_.at(index);
   audio_input_name_ = index == 0 ? QStringLiteral("System default input")
                                  : audio_input_names_.at(index);
+  // The raw description, not the decorated row text: the ordinal and the
+  // default marker describe where a device sits in today's enumeration, and
+  // both are wrong tomorrow. Only what the operating system calls the device
+  // is worth storing as its identity.
+  audio_input_device_name_ =
+      index < audio_input_device_names_.size()
+          ? audio_input_device_names_.at(index)
+          : QString{};
   if (audio_input_name_.endsWith(QStringLiteral(" (unavailable)"))) {
     audio_input_name_.chop(QStringLiteral(" (unavailable)").size());
   }
@@ -2485,6 +2541,25 @@ void AppSettings::selectAudioInput(const int index) {
                      "disarmed until started by the operator."));
   emit audioInputsChanged();
   emit settingsChanged();
+}
+
+void AppSettings::adoptRecoveredAudioInput(const QString& encoded_id) {
+  if (encoded_id.isEmpty() || encoded_id == audio_input_id_) return;
+  audio_input_id_ = encoded_id;
+  refreshAudioInputs();
+  // Written now rather than at the next Apply. The identifier was recovered
+  // during a start the operator did not initiate a settings change for, and if
+  // the application closes before anything else is applied the station would
+  // meet the same unresolvable selection at the next restart -- which is the
+  // failure this whole path exists to end.
+  QSettings settings;
+  settings.setValue(storageKey(QStringLiteral("audio/inputId")),
+                    audio_input_id_);
+  settings.setValue(storageKey(QStringLiteral("audio/inputName")),
+                    audio_input_name_);
+  settings.setValue(storageKey(QStringLiteral("audio/inputDeviceName")),
+                    audio_input_device_name_);
+  emit audioInputsChanged();
 }
 
 void AppSettings::refreshSdrDevices() {
@@ -3093,6 +3168,8 @@ bool AppSettings::apply() {
                     audio_input_id_);
   settings.setValue(storageKey(QStringLiteral("audio/inputName")),
                     audio_input_name_);
+  settings.setValue(storageKey(QStringLiteral("audio/inputDeviceName")),
+                    audio_input_device_name_);
   settings.setValue(storageKey(QStringLiteral("audio/outputId")),
                     audio_output_id_);
   settings.setValue(storageKey(QStringLiteral("audio/outputName")),
@@ -3351,6 +3428,25 @@ void AppSettings::load() {
                           .value(storageKey(QStringLiteral("audio/inputName")),
                                  QStringLiteral("System default input"))
                           .toString();
+  audio_input_device_name_ =
+      settings.value(storageKey(QStringLiteral("audio/inputDeviceName")))
+          .toString();
+  if (audio_input_device_name_.isEmpty() && !audio_input_id_.isEmpty()) {
+    // A profile written before the raw name was stored separately. The row
+    // text is the only record of the device there, so strip the decorations
+    // back off it rather than leaving the station with no name to recover by
+    // -- which is exactly the position that made this worth fixing.
+    audio_input_device_name_ = audio_input_name_;
+    static const QStringList decorations{
+        QStringLiteral(" (current default)"), QStringLiteral(" (unavailable)"),
+        QStringLiteral(" (recommended)")};
+    for (const auto& decoration : decorations) {
+      if (audio_input_device_name_.endsWith(decoration)) {
+        audio_input_device_name_.chop(decoration.size());
+      }
+    }
+    audio_input_device_name_ = audio_input_device_name_.trimmed();
+  }
   audio_output_id_ =
       settings.value(storageKey(QStringLiteral("audio/outputId"))).toString();
   audio_output_name_ =
@@ -4021,6 +4117,7 @@ void AppSettings::resetInMemorySettings() {
   setup_complete_ = false;
   audio_input_id_.clear();
   audio_input_name_ = QStringLiteral("System default input");
+  audio_input_device_name_.clear();
   audio_dc_rejection_ = true;
   audio_automatic_gain_ = false;
   audio_gain_db_ = 0.0;

@@ -553,10 +553,139 @@ int runComplexIqDiagnosticsChecks() {
   return result;
 }
 
+// Audio-input resolution, from 50 up.
+//
+// A station rebooted his PC and reception refused to start: "the selected
+// audio input is unavailable". His interface had not moved -- QAudioDevice::id()
+// is an opaque handle the operating system hands out, and a restart, a driver
+// reload or a different USB port can all reissue it. The one fact the
+// application remembered about his choice was the one fact that does not
+// survive a restart, and he had two interfaces the system describes with
+// identical words, so the name alone could not be allowed to decide either.
+//
+// resolveAudioInputSelection is pure over a device list precisely so all four
+// outcomes can be reached here, on a build machine with no sound hardware.
+constexpr int kExactIdentifierNotPreferred = 50;
+constexpr int kExactIdentifierConsultedName = 51;
+constexpr int kUniqueNameNotRecovered = 52;
+constexpr int kRecoveryNotReported = 53;
+constexpr int kDuplicateNameNotRefused = 54;
+constexpr int kDuplicateNameCandidatesNotNamed = 55;
+constexpr int kAbsentDeviceNotFailed = 56;
+constexpr int kEmptySelectionNotSystemDefault = 57;
+
+int runAudioInputResolutionChecks() {
+  using cwassistant::desktop::AudioInputCandidate;
+  using cwassistant::desktop::AudioInputOutcome;
+  using cwassistant::desktop::resolveAudioInputSelection;
+
+  // Two interfaces the operating system cannot tell apart by name, plus one
+  // that is unmistakable. This is the reporting station's hardware.
+  const std::vector<AudioInputCandidate> twins{
+      {QStringLiteral("id-a"), QStringLiteral("USB Audio CODEC")},
+      {QStringLiteral("id-b"), QStringLiteral("USB Audio CODEC")},
+      {QStringLiteral("id-c"), QStringLiteral("Built-in Microphone")}};
+
+  // 1. The identifier is present, so it decides, and nothing else is
+  //    consulted. The overwhelmingly common path must not change at all.
+  {
+    const auto resolution = resolveAudioInputSelection(
+        twins, QStringLiteral("id-b"), QStringLiteral("USB Audio CODEC"));
+    if (resolution.outcome != AudioInputOutcome::Matched ||
+        resolution.index != 1) {
+      return kExactIdentifierNotPreferred;
+    }
+    if (!resolution.message.isEmpty() || !resolution.adopted_id.isEmpty()) {
+      return kExactIdentifierNotPreferred;
+    }
+    // A present identifier wins even when the stored name is stale or wrong:
+    // consulting the name here could only move the answer away from the device
+    // the operator actually chose.
+    const auto stale_name = resolveAudioInputSelection(
+        twins, QStringLiteral("id-c"), QStringLiteral("USB Audio CODEC"));
+    if (stale_name.outcome != AudioInputOutcome::Matched ||
+        stale_name.index != 2) {
+      return kExactIdentifierConsultedName;
+    }
+  }
+
+  // 2. The identifier is gone and one input carries the name. Nothing else
+  //    could have been meant, so it is adopted -- and said out loud.
+  {
+    const std::vector<AudioInputCandidate> renumbered{
+        {QStringLiteral("id-new"), QStringLiteral("Built-in Microphone")},
+        {QStringLiteral("id-other"), QStringLiteral("USB Audio CODEC")}};
+    const auto resolution =
+        resolveAudioInputSelection(renumbered, QStringLiteral("id-c"),
+                                   QStringLiteral("Built-in Microphone"));
+    if (resolution.outcome != AudioInputOutcome::Recovered ||
+        resolution.index != 0 ||
+        resolution.adopted_id != QStringLiteral("id-new")) {
+      return kUniqueNameNotRecovered;
+    }
+    // Reported, not silent. An operator who has swapped one interface for
+    // another of the same model has to be able to see that the application
+    // followed the name rather than the hardware.
+    if (!resolution.message.contains(QStringLiteral("Built-in Microphone")) ||
+        !resolution.message.contains(QStringLiteral("by name"))) {
+      return kRecoveryNotReported;
+    }
+  }
+
+  // 3. The identifier is gone and both twins answer to the name. There is no
+  //    evidence left that separates them, so there is nothing to decide from.
+  //    Refusing costs a reselection; guessing puts a different radio on the
+  //    decoder and says nothing.
+  {
+    const std::vector<AudioInputCandidate> rebooted{
+        {QStringLiteral("id-x"), QStringLiteral("USB Audio CODEC")},
+        {QStringLiteral("id-y"), QStringLiteral("USB Audio CODEC")}};
+    const auto resolution = resolveAudioInputSelection(
+        rebooted, QStringLiteral("id-a"), QStringLiteral("USB Audio CODEC"));
+    if (resolution.outcome != AudioInputOutcome::Ambiguous ||
+        resolution.index != -1 || !resolution.adopted_id.isEmpty()) {
+      return kDuplicateNameNotRefused;
+    }
+    // The candidates are named the way the settings list numbers them, because
+    // a refusal an operator cannot act on is only a slower failure.
+    if (!resolution.message.contains(QStringLiteral("USB Audio CODEC #1")) ||
+        !resolution.message.contains(QStringLiteral("USB Audio CODEC #2"))) {
+      return kDuplicateNameCandidatesNotNamed;
+    }
+  }
+
+  // 4. Neither identifier nor name is present. This is a genuinely absent
+  //    interface and it must still fail, exactly as it always did.
+  {
+    const auto resolution = resolveAudioInputSelection(
+        twins, QStringLiteral("id-gone"), QStringLiteral("Rigblaster"));
+    if (resolution.outcome != AudioInputOutcome::Missing ||
+        resolution.index != -1 || !resolution.message.isEmpty()) {
+      return kAbsentDeviceNotFailed;
+    }
+  }
+
+  // 5. Nothing was ever chosen: the system default, with no name lookup and
+  //    no complaint.
+  {
+    const auto resolution =
+        resolveAudioInputSelection(twins, QString{}, QString{});
+    if (resolution.outcome != AudioInputOutcome::SystemDefault ||
+        resolution.index != -1 || !resolution.message.isEmpty()) {
+      return kEmptySelectionNotSystemDefault;
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
   QCoreApplication application(argc, argv);
+  if (const int resolution_result = runAudioInputResolutionChecks();
+      resolution_result != 0) {
+    return resolution_result;
+  }
   if (const int complex_iq_result = runComplexIqDiagnosticsChecks();
       complex_iq_result != 0) {
     return complex_iq_result;

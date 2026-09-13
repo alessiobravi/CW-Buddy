@@ -6,6 +6,36 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- A monitored stream is published without a station name while the only two
+  callsigns read from it disagree and neither has been read twice. Two single
+  readings that contradict each other are evidence that the copy is not good
+  enough to read a call out of, not evidence for whichever was read last; the
+  name appears as soon as one of them is confirmed. On a recorded DX pileup this
+  is the difference between labelling the one clearly identifying station with a
+  callsign that was not its own and leaving it unlabelled.
+
+- The one-keyer-or-several test now reads the decoder's acoustic cadence fit
+  alongside the keying-speed ratio measured at two filter widths, and either
+  measure refusing a channel withholds its text. The two are complementary
+  rather than redundant, which is why both are kept: on a recorded pileup the
+  ratio produced no speed estimate at all for 41 of 48 published carriers, while
+  the cadence fit refused 42 of 48 and separated the two resolvable stations
+  cleanly -- and on a synthetic two-carrier fixture the ratio refuses where the
+  cadence fit does not. The cadence reading applies only where at least two other
+  carriers share the neighbourhood, so a lone station with poor copy keeps its
+  transcript.
+
+- Audio inputs the operating system describes with identical words are numbered
+  #1, #2 and so on in Settings and in the setup wizard, with a note explaining
+  the numbering shown only while such a collision exists. When the saved
+  identifier is gone and several inputs answer to the saved name, live audio
+  refuses to start and names the numbered candidates rather than choosing
+  between them: nothing distinguishes those devices any more, so a choice would
+  be a guess, and the wrong one would put a different radio on the decoder with
+  nothing on screen to say so.
+
 ### Added
 
 - A recorded SigMF capture can now be scored, not only played back.
@@ -34,6 +64,17 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 
 ### Fixed
+
+- Live audio finds its input again after the operating system reissues the
+  device identifier. A restart, a driver reload or a different USB port can all
+  change the identifier while the interface stays plugged into the same radio,
+  and that identifier was the only thing remembered about the operator's choice,
+  so reception refused to start with "The selected audio input is unavailable".
+  The device's own description is now stored beside the identifier and used when
+  the identifier is gone: an input that uniquely carries the saved name is
+  adopted, the recovered identifier is written straight back so the next start
+  matches on the identifier again, and the status line reports that the
+  application followed the name rather than the hardware.
 
 - The application no longer freezes for seconds at a time when several stations
   are decoding. Every publish of the decoded-channel model re-derived two things

@@ -137,6 +137,22 @@ constexpr float kKeyerRunHysteresisFraction = 0.15F;
 // text and withholding it.
 constexpr std::uint16_t kKeyerEvaluationFrames = 250;
 constexpr std::uint8_t kKeyerVerdictEvaluations = 3;
+// Tracked carriers that must sit inside the joint-separation radius, besides
+// the track itself, before a collapsed cadence is read as several keyers
+// rather than as poor copy.
+//
+// Two, so three carriers in the neighbourhood. One neighbour is the two-signal
+// case, which the speed-ratio comparison already answers well -- on the
+// two-carrier synthetic fixture it crosses its limit and refuses, while the
+// cadence there falls only to 0.637 and would not -- so reading the cadence
+// there costs what the ratio was already earning. Three or more is the case
+// the ratio goes silent on. Measured on the decoder surface benchmark,
+// this is exactly the difference between a build whose per-seed-set character
+// error is identical to the pre-change baseline and one that pays 0.014 and
+// 0.021 on two of the three sets: the benchmark's low-fit tracks reach one
+// neighbour, never two, while the capture's pileup carriers reach seven and
+// eight.
+constexpr std::uint8_t kKeyerCadenceMinimumNeighbours = 2;
 // Frequency radius inside which a later stage would have to solve carriers
 // jointly, and the largest number of sources such a solve stays conditioned
 // for. Both come from the separation experiment on the operator's capture:
@@ -325,6 +341,10 @@ CwStreamLabel cwApplyStreamLabelReading(CwStreamLabel label,
 
   if (reading == label.callsign) {
     label.support = std::max(label.support, support);
+    // A contested name that has now been corroborated is a name again: what
+    // was withheld was a single unsupported reading, not this station's
+    // identity.
+    if (label.support >= bar) label.contested = false;
     // The station said its name again. Whatever was arguing that this is
     // somebody else has just been answered, so it starts over rather than
     // keeping credit earned against a name that is still being confirmed.
@@ -336,8 +356,21 @@ CwStreamLabel cwApplyStreamLabelReading(CwStreamLabel label,
     // Provisional. One clean identification is enough to name a stream -- an
     // operator wants the call the moment it is copied -- it is only enough to
     // *keep* the name that has to be earned twice.
+    //
+    // Displacing one uncorroborated name with another is the one case where
+    // naming the stream at all is wrong. Two single readings that contradict
+    // each other say the copy is not good enough to read a call out of; they
+    // do not say the later one is right. On the operator's pileup capture the
+    // one stream that identified clearly wore EH4ST for ninety seconds and
+    // then E5Q for the last two, and the station was EH3ST: the flip was the
+    // evidence that neither reading could be trusted, and the operator saw the
+    // second one as though it were an answer. The reading is still taken, so
+    // it is there to be confirmed; until something confirms it the stream is
+    // published without a name.
+    const bool displaced = !label.callsign.empty();
     label.callsign.assign(reading);
     label.support = support;
+    label.contested = displaced && support < bar;
     label.challenger.clear();
     label.challenger_support = 0;
     return label;
@@ -353,6 +386,7 @@ CwStreamLabel cwApplyStreamLabelReading(CwStreamLabel label,
     // misdecode, so it takes the stream over with the evidence it brought.
     label.callsign = std::move(label.challenger);
     label.support = label.challenger_support;
+    label.contested = false;
     label.challenger.clear();
     label.challenger_support = 0;
   }
@@ -520,6 +554,9 @@ void CwChannelBank::sanitizeConfig() noexcept {
   if (!std::isfinite(config_.maximum_single_keyer_speed_ratio)) {
     config_.maximum_single_keyer_speed_ratio = 1.5F;
   }
+  if (!std::isfinite(config_.minimum_single_keyer_cadence_fit)) {
+    config_.minimum_single_keyer_cadence_fit = 0.50F;
+  }
   // Below 1.25 the clean carrier the default was measured against (1.19) would
   // itself be silenced once noise moved it a little; above 4.0 nothing in that
   // capture, whose worst carrier read 3.50, would ever be refused. Outside
@@ -527,6 +564,8 @@ void CwChannelBank::sanitizeConfig() noexcept {
   // offered. `resolve_overlapping_keyers` is the way to turn the test off.
   config_.maximum_single_keyer_speed_ratio =
       std::clamp(config_.maximum_single_keyer_speed_ratio, 1.25F, 4.0F);
+  config_.minimum_single_keyer_cadence_fit =
+      std::clamp(config_.minimum_single_keyer_cadence_fit, 0.30F, 0.70F);
 }
 
 void CwChannelBank::parkTracksOutsideBand(
@@ -2035,6 +2074,9 @@ void CwChannelBank::resetFilter(Track& track) noexcept {
   // after it. Clearing the verdict here would republish a window of noise
   // transcripts on every retune until the evidence rebuilt.
   for (auto& runs : track.keyer_runs) runs = {};
+  // The cadence high-water goes with them, and for the same reason: it records
+  // what one signal path was carrying, and the path is what changed.
+  track.keyer_cadence_peak = 0.0F;
   track.keyer_evaluation_countdown = 0;
   track.filter_initialized = false;
 }
@@ -2181,37 +2223,73 @@ void CwChannelBank::updateKeyerResolution(
   };
   observe(track.keyer_runs[0], narrow_snr_db);
   observe(track.keyer_runs[1], wide_snr_db);
+  track.keyer_cadence_peak = std::max(
+      track.keyer_cadence_peak, track.update.acoustic_cadence_confidence);
 
   if (track.keyer_evaluation_countdown < kKeyerEvaluationFrames) {
     ++track.keyer_evaluation_countdown;
     return;
   }
   track.keyer_evaluation_countdown = 0;
+
+  // Two readings of one question, kept together because each answers where the
+  // other cannot, and either refusing the track is enough to refuse it.
+  //
+  // The speed comparison needs two full run windows at two filter widths and a
+  // narrow width solid enough to be the reference half. On a dense pileup that
+  // is mostly unavailable -- on the operator's capture it produced no estimate
+  // at all for 41 of the 48 published carriers. The cadence fit needs only
+  // that the decoder has estimated a cadence, which it has for every track
+  // carrying anything at all, and it collapses on exactly the population the
+  // ratio goes silent on. Where both can speak they agree; where only one can,
+  // that one decides; where neither can, the status quo stands.
+  bool speed_answers = false;
+  bool speed_overlapping = false;
   const auto& narrow = track.keyer_runs[0];
   const auto& wide = track.keyer_runs[1];
-  // Both windows full, or there is no measurement -- only an opinion formed
-  // from a handful of runs. A partly filled window is not evidence, and the
-  // safe reading of no evidence is the status quo, which is to publish.
-  if (narrow.run_count < Track::KeyingRuns::kRunHistorySize ||
-      wide.run_count < Track::KeyingRuns::kRunHistorySize) {
-    return;
+  if (narrow.run_count >= Track::KeyingRuns::kRunHistorySize &&
+      wide.run_count >= Track::KeyingRuns::kRunHistorySize) {
+    const double narrow_wpm = cwKeyingSpeedFromRuns(
+        {narrow.run_history.data(), narrow.run_count}, evidence_frame_rate_hz);
+    const double wide_wpm = cwKeyingSpeedFromRuns(
+        {wide.run_history.data(), wide.run_count}, evidence_frame_rate_hz);
+    if (narrow_wpm > 0.0 && wide_wpm > 0.0) {
+      track.keyer_speed_ratio = static_cast<float>(wide_wpm / narrow_wpm);
+      // The ratio is recorded either way, because it is evidence a later stage
+      // can read, but it may only speak when its reference half was solid.
+      if (narrow.believable_duty >= kKeyerMinimumNarrowDuty) {
+        speed_answers = true;
+        speed_overlapping =
+            track.keyer_speed_ratio > config_.maximum_single_keyer_speed_ratio;
+      }
+    }
   }
-  const double narrow_wpm = cwKeyingSpeedFromRuns(
-      {narrow.run_history.data(), narrow.run_count}, evidence_frame_rate_hz);
-  const double wide_wpm = cwKeyingSpeedFromRuns(
-      {wide.run_history.data(), wide.run_count}, evidence_frame_rate_hz);
-  if (!(narrow_wpm > 0.0) || !(wide_wpm > 0.0)) return;
-  track.keyer_speed_ratio = static_cast<float>(wide_wpm / narrow_wpm);
-  // The ratio is recorded either way, because it is evidence a later stage can
-  // read, but it may only refuse a track when its reference half was solid.
-  if (narrow.believable_duty < kKeyerMinimumNarrowDuty) {
+
+  // Zero is the decoder saying it has no cadence estimate, not a channel with
+  // a bad one, so it is silence rather than a refusal.
+  //
+  // And a collapsed cadence only means several keyers where there are several
+  // carriers close enough that no usable filter separates them. Alone on a
+  // frequency, or with one neighbour, the same collapse means poor copy -- a
+  // fast signal in noise, fading, a weak one -- and refusing it would take the
+  // transcript away from a station the operator can work. Measured: without
+  // this guard a clean 40 WPM carrier with receiver noise and nothing else on
+  // the band loses its transcript outright. The neighbourhood is measured once
+  // per audio block for every track anyway.
+  const bool crowded =
+      track.overlap_neighbour_count >= kKeyerCadenceMinimumNeighbours;
+  const bool cadence_answers = crowded && track.keyer_cadence_peak > 0.0F;
+  const bool cadence_overlapping =
+      cadence_answers &&
+      track.keyer_cadence_peak < config_.minimum_single_keyer_cadence_fit;
+
+  if (!speed_answers && !cadence_answers) {
     track.keyer_overlap_evaluations = 0;
     track.keyer_single_evaluations = 0;
     return;
   }
 
-  const bool overlapping =
-      track.keyer_speed_ratio > config_.maximum_single_keyer_speed_ratio;
+  const bool overlapping = speed_overlapping || cadence_overlapping;
   if (overlapping) {
     track.keyer_single_evaluations = 0;
     if (track.keyer_overlap_evaluations < kKeyerVerdictEvaluations)
@@ -3132,9 +3210,12 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
     // name instead of as a new stream; but while it cannot be resolved, the
     // name and the frozen predecessor text are exactly the parts an operator
     // would act on, and neither is supported by what the channel is carrying
-    // now.
-    snapshot.callsign =
-        withhold_text ? std::string{} : retained->label.callsign;
+    // now. A contested name is withheld for a separate reason: the channel is
+    // resolvable and its text is worth reading, but the two names it has
+    // offered disagree and neither is worth acting on.
+    snapshot.callsign = withhold_text || retained->label.contested
+                            ? std::string{}
+                            : retained->label.callsign;
     if (withhold_text) {
       snapshot.qso_participants.clear();
     } else if (snapshot.qso_participants.empty()) {

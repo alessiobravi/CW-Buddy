@@ -17,6 +17,7 @@
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QMediaDevices>
+#include <QStringList>
 
 #include <algorithm>
 #include <cmath>
@@ -31,16 +32,23 @@ QString encoded_device_id(const QAudioDevice& device) {
       QByteArray::Base64UrlEncoding | QByteArray::OmitTrailingEquals));
 }
 
-QAudioDevice resolve_input(const QString& requested_id) {
-  if (requested_id.isEmpty()) {
-    return QMediaDevices::defaultAudioInput();
+// The inputs the settings list would show, in the same order and with the same
+// exclusions, so the ordinals an ambiguity report quotes are the ordinals the
+// operator reads in Settings. Kept in step with AppSettings::refreshAudioInputs.
+std::vector<AudioInputCandidate> present_audio_inputs(
+    const QList<QAudioDevice>& devices) {
+  std::vector<AudioInputCandidate> candidates;
+  candidates.reserve(static_cast<std::size_t>(devices.size()));
+  for (const auto& device : devices) {
+    const QString id = encoded_device_id(device);
+    if (id.isEmpty()) continue;
+    const bool already_listed =
+        std::any_of(candidates.begin(), candidates.end(),
+                    [&id](const AudioInputCandidate& c) { return c.id == id; });
+    if (already_listed) continue;
+    candidates.push_back({id, device.description().trimmed()});
   }
-  for (const auto& device : QMediaDevices::audioInputs()) {
-    if (encoded_device_id(device) == requested_id) {
-      return device;
-    }
-  }
-  return {};
+  return candidates;
 }
 
 QAudioFormat capture_format(const QAudioDevice& device) {
@@ -62,20 +70,127 @@ QByteArray monitor_bytes(const std::vector<float>& samples) {
 
 }  // namespace
 
+AudioInputResolution resolveAudioInputSelection(
+    const std::vector<AudioInputCandidate>& devices, const QString& requested_id,
+    const QString& requested_name) {
+  AudioInputResolution resolution;
+  if (requested_id.isEmpty()) {
+    resolution.outcome = AudioInputOutcome::SystemDefault;
+    return resolution;
+  }
+
+  // Step one. The saved identifier is present, so nothing moved and nothing
+  // else is consulted -- not the name, not a remembered position. This is the
+  // path almost every start takes and it must behave exactly as it always did.
+  for (std::size_t index = 0; index < devices.size(); ++index) {
+    if (devices[index].id == requested_id) {
+      resolution.outcome = AudioInputOutcome::Matched;
+      resolution.index = static_cast<int>(index);
+      return resolution;
+    }
+  }
+
+  const QString wanted = requested_name.trimmed();
+  if (wanted.isEmpty()) return resolution;
+
+  std::vector<std::size_t> same_name;
+  for (std::size_t index = 0; index < devices.size(); ++index) {
+    if (devices[index].name.trimmed() == wanted) same_name.push_back(index);
+  }
+  if (same_name.empty()) return resolution;
+
+  // Step two. One input, one name, one possible meaning. Adopt it and hand
+  // back the identifier so the next start is a step-one match again.
+  if (same_name.size() == 1) {
+    resolution.outcome = AudioInputOutcome::Recovered;
+    resolution.index = static_cast<int>(same_name.front());
+    resolution.adopted_id = devices[same_name.front()].id;
+    resolution.message =
+        QStringLiteral(
+            "Reselected \"%1\" by name: the system identifier saved for it "
+            "changed, which a restart, a driver reload or a different USB "
+            "port will do. It is the only input with that name. Confirm it in "
+            "Settings if you have swapped interfaces.")
+            .arg(wanted);
+    return resolution;
+  }
+
+  // Step three. Several inputs answer to the name and the identifier that told
+  // them apart is gone. There is no evidence left that distinguishes them, so
+  // there is nothing to decide from -- only something to guess at, and a wrong
+  // guess here puts a different radio on the decoder in silence. Refuse, and
+  // number the candidates the way the settings list numbers them.
+  QStringList candidates;
+  candidates.reserve(static_cast<qsizetype>(same_name.size()));
+  for (std::size_t ordinal = 0; ordinal < same_name.size(); ++ordinal) {
+    candidates.push_back(
+        QStringLiteral("%1 #%2").arg(wanted).arg(ordinal + 1));
+  }
+  resolution.outcome = AudioInputOutcome::Ambiguous;
+  resolution.message =
+      QStringLiteral(
+          "The saved audio input \"%1\" cannot be identified: the system "
+          "identifier stored for it changed, and %2 inputs now carry that "
+          "name (%3). Choose the one you want in Settings. The application "
+          "will not choose for you, because the wrong one would decode a "
+          "different radio without saying so.")
+          .arg(wanted)
+          .arg(same_name.size())
+          .arg(candidates.join(QStringLiteral(", ")));
+  return resolution;
+}
+
 LiveAudioCaptureWorker::LiveAudioCaptureWorker(
     std::shared_ptr<LiveAudioPipe> pipe, QObject* parent)
     : QObject(parent), pipe_(std::move(pipe)) {}
 
 LiveAudioCaptureWorker::~LiveAudioCaptureWorker() { stop(); }
 
-void LiveAudioCaptureWorker::start(const QString& encoded_device_id_value) {
+void LiveAudioCaptureWorker::start(const QString& encoded_device_id_value,
+                                   const QString& device_name) {
   stop();
   stopping_ = false;
-  const QAudioDevice device = resolve_input(encoded_device_id_value);
+  const QList<QAudioDevice> inputs = QMediaDevices::audioInputs();
+  const std::vector<AudioInputCandidate> candidates =
+      present_audio_inputs(inputs);
+  const AudioInputResolution resolution = resolveAudioInputSelection(
+      candidates, encoded_device_id_value, device_name);
+
+  QAudioDevice device;
+  switch (resolution.outcome) {
+    case AudioInputOutcome::SystemDefault:
+      device = QMediaDevices::defaultAudioInput();
+      break;
+    case AudioInputOutcome::Matched:
+    case AudioInputOutcome::Recovered: {
+      // present_audio_inputs() preserves enumeration order and drops nothing
+      // that could be selected, so the resolved index addresses the same
+      // device the resolver was shown.
+      const QString& resolved_id =
+          candidates[static_cast<std::size_t>(resolution.index)].id;
+      for (const auto& input : inputs) {
+        if (encoded_device_id(input) == resolved_id) {
+          device = input;
+          break;
+        }
+      }
+      break;
+    }
+    case AudioInputOutcome::Ambiguous:
+    case AudioInputOutcome::Missing:
+      break;
+  }
+
   if (device.isNull()) {
-    emit failed(
-        QStringLiteral("The selected audio input is unavailable. "
-                       "Reconnect it or select another input."));
+    // Only the ambiguous refusal replaces the original wording. Everything
+    // else that cannot produce a device is still a device that is not there,
+    // and that sentence already says the useful half: reconnect it, or pick
+    // another one.
+    emit failed(resolution.outcome == AudioInputOutcome::Ambiguous
+                    ? resolution.message
+                    : QStringLiteral(
+                          "The selected audio input is unavailable. "
+                          "Reconnect it or select another input."));
     return;
   }
 
@@ -116,6 +231,14 @@ void LiveAudioCaptureWorker::start(const QString& encoded_device_id_value) {
   }
   connect(input_, &QIODevice::readyRead, this,
           &LiveAudioCaptureWorker::consumeAvailableBytes);
+  // Only here, on the one path where the device is open and producing: a
+  // recovery notice emitted earlier would tell the operator the application
+  // switched inputs when it switched to nothing, and would persist an
+  // identifier that never worked. Ahead of started() so the controller has the
+  // sentence in hand when it composes the live-RX status line.
+  if (resolution.outcome == AudioInputOutcome::Recovered) {
+    emit inputRecovered(resolution.adopted_id, resolution.message);
+  }
   emit started(device.description(), static_cast<double>(format_.sampleRate()),
                format_.channelCount());
 }

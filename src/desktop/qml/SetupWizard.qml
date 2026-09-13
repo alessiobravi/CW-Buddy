@@ -210,6 +210,15 @@ Dialog {
                     currentIndex: appSettings.audioInputIndex
                     onActivated: appSettings.selectAudioInput(currentIndex)
                 }
+                Label { text: "" }
+                Label {
+                    objectName: "setupAudioInputAmbiguityNote"
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    visible: appSettings.audioInputNamesAmbiguous
+                    color: "#e0b341"
+                    text: "Two or more inputs report the same name, so they are numbered #1, #2 … in the order the operating system lists them. If reception starts on the wrong radio, pick the other number."
+                }
                 Label { text: "Selected input" }
                 Label {
                     Layout.fillWidth: true

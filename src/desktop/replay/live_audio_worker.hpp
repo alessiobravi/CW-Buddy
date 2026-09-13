@@ -35,6 +35,62 @@ class QIODevice;
 
 namespace cwassistant::desktop {
 
+// One audio input as resolution sees it. Deliberately not a QAudioDevice: the
+// outcome is decided entirely from an identifier and a name, and two strings
+// can be written down in a test on a machine that has no sound hardware at
+// all, which is the only way this logic can be checked at all.
+struct AudioInputCandidate {
+  QString id;
+  QString name;
+};
+
+// Why an audio input needs more than its saved identifier to be found again.
+//
+// QAudioDevice::id() is an opaque handle the operating system hands out; it is
+// not a property of the hardware. A reboot, a driver reload or a different USB
+// port can all change it while the same interface stays plugged into the same
+// radio. A station reported exactly that: the PC restarted and reception
+// refused to start, because the one fact remembered about the chosen input was
+// the one fact that does not survive a restart.
+//
+// The name does survive, but it is not unique -- that same station had two
+// interfaces the operating system describes with identical words. So the name
+// can rescue the common case and must not be allowed to decide the ambiguous
+// one: silently opening the wrong sound card would decode a different radio
+// with nothing on screen to say so, which is worse than refusing to start.
+enum class AudioInputOutcome {
+  // Nothing was ever chosen. Whatever the system currently calls its default.
+  SystemDefault,
+  // The saved identifier is still present. The overwhelmingly common path,
+  // and the only one that consults nothing else.
+  Matched,
+  // The identifier is gone and exactly one input carries the saved name.
+  // Nothing else could have been meant, so adopt it -- and say so.
+  Recovered,
+  // The identifier is gone and several inputs carry the saved name. Refuse,
+  // name the candidates, and make the operator choose.
+  Ambiguous,
+  // Neither the identifier nor the name is present.
+  Missing,
+};
+
+struct AudioInputResolution {
+  AudioInputOutcome outcome{AudioInputOutcome::Missing};
+  // Index into the candidate list; -1 for SystemDefault, Ambiguous and Missing.
+  int index{-1};
+  // The identifier to write back to settings, so the next start is a Matched.
+  // Non-empty only for Recovered.
+  QString adopted_id;
+  // Operator-facing sentence. Empty for SystemDefault and Matched, because
+  // nothing happened that an operator needs to be told about.
+  QString message;
+};
+
+// Pure over the device list, so every outcome is reachable from a test.
+[[nodiscard]] AudioInputResolution resolveAudioInputSelection(
+    const std::vector<AudioInputCandidate>& devices, const QString& requested_id,
+    const QString& requested_name);
+
 class LiveAudioCaptureWorker final : public QObject {
   Q_OBJECT
 
@@ -44,7 +100,9 @@ class LiveAudioCaptureWorker final : public QObject {
   ~LiveAudioCaptureWorker() override;
 
  public slots:
-  void start(const QString& encoded_device_id);
+  // The name travels with the identifier because the identifier alone cannot
+  // survive a restart. See AudioInputOutcome above.
+  void start(const QString& encoded_device_id, const QString& device_name);
   void stop();
 
  signals:
@@ -52,6 +110,12 @@ class LiveAudioCaptureWorker final : public QObject {
                int channel_count);
   void stopped();
   void failed(const QString& message);
+  // An input was found by name after its saved identifier vanished. Carries
+  // the identifier to persist and the sentence the operator must read: an
+  // operator who has quietly swapped one interface for another of the same
+  // model deserves to know the application followed the name rather than the
+  // hardware.
+  void inputRecovered(const QString& adopted_id, const QString& message);
   void overrunCountChanged(qulonglong count);
 
  private slots:

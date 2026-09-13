@@ -896,6 +896,47 @@ separate, shorter list held in code rather than in any file, precisely because
 what may go on the air is a safety boundary; adding a prosign here therefore
 lets you read it and never adds it to what can be sent.
 
+**Choosing an audio input when two have the same name.** Some systems describe
+two different interfaces with identical words. Where that happens the input list
+numbers them `#1`, `#2` and so on in the order the system reports them, and a
+note appears beside the list explaining the numbering. It is shown only while
+such a collision exists.
+
+The system's own identifier for a device can change -- a restart, a driver
+reload, or moving the interface to a different USB port will all do it -- while
+the interface stays plugged into the same radio. CW Buddy remembers the device's
+name as well as its identifier, so when the identifier is gone it looks for the
+name instead. If exactly one input carries that name it is adopted, the new
+identifier is remembered, and the status line says the application followed the
+name rather than the hardware. Confirm it in Settings if you have swapped
+interfaces since.
+
+If several inputs carry that name, CW Buddy refuses to start and lists the
+numbered candidates rather than choosing between them. Nothing tells those
+devices apart any more, so a choice would be a guess -- and the wrong guess
+would put a different radio on the decoder without anything on screen saying so.
+Pick the one you want in Settings.
+
+**Why a stream sometimes has no name.** A decoded stream is labelled with a
+callsign only when the copy supports one. If the only two callsigns read from a
+stream disagree and neither has been read twice, neither is shown: two single
+readings that contradict each other say the copy is not yet good enough to read
+a call out of, not that the last one read is right. The transcript is untouched,
+so you can read what was copied and judge it yourself, and the name appears as
+soon as one reading is confirmed.
+
+The same applies to a crowded band. Where several stations sit closer together
+than any filter can separate, their keying sums into something that is not
+Morse, and CW Buddy reports those signals as occupancy -- a marker, a frequency
+and a signal level -- rather than inventing a transcript for them. A pileup
+therefore shows many markers and few transcripts, which is the honest picture.
+
+**When something goes wrong.** A failure that stops reception is shown in full
+rather than trimmed to fit the status line, because the part that says what to
+do is usually the part that would be cut. A failure that stops nothing -- a
+retune the radio refused, say -- stays on the status line, since reception is
+still running on the frequency it was already on.
+
 **REGION** appears beside OFF and RX while Live SDR is the source, and plays the
 whole decode region at once. Every signal inside the window is heard together,
 each at the pitch its own position in the region gives it: a higher tone is a

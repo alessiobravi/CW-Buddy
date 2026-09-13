@@ -3894,6 +3894,48 @@ void test_stream_label_hysteresis() {
                                             "CQ DE EG7S ", "");
     expect(provisional.callsign == "EG7S",
            "a provisional name follows the newest reading");
+    // ...and stops being shown at all, because the flip is itself the
+    // evidence. Two single readings that contradict each other say the copy
+    // is not good enough to read a call out of; neither of them is an answer
+    // an operator should act on. Measured on the operator's pileup capture,
+    // this is the whole difference between publishing E5Q on a station that
+    // was EH3ST and publishing no name at all.
+    expect(provisional.contested,
+           "one uncorroborated name displaced by another leaves the stream "
+           "unnamed rather than renamed");
+    provisional = cwApplyStreamLabelReading(std::move(provisional), "EG7S",
+                                            "EG7S CQ DE EG7S ", "");
+    expect(provisional.callsign == "EG7S" && provisional.support >= 2 &&
+               !provisional.contested,
+           "the station identifying twice settles the contest and the name is "
+           "shown again");
+  }
+
+  {
+    // A name that nothing has argued with is not contested, however long it
+    // stands alone: withholding it would cost an operator the call at the one
+    // moment it is most useful, and nothing here disputes it.
+    CwStreamLabel quiet;
+    quiet = cwApplyStreamLabelReading(std::move(quiet), "DK7SS",
+                                      "CQ DE DK7SS ", "");
+    quiet = cwApplyStreamLabelReading(std::move(quiet), "DK7SS",
+                                      "CQ DE DK7SS K ", "");
+    expect(quiet.callsign == "DK7SS" && !quiet.contested,
+           "a single uncontradicted reading still names the stream");
+  }
+
+  {
+    // A corroborated reading displacing an uncorroborated one is an answer,
+    // not a contest: it arrived with evidence the incumbent never had.
+    CwStreamLabel answered;
+    answered = cwApplyStreamLabelReading(std::move(answered), "EH3ST",
+                                         "CQ DE EH3ST ", "");
+    answered = cwApplyStreamLabelReading(std::move(answered), "EG7S",
+                                         "EG7S DE EG7S ", "");
+    expect(answered.callsign == "EG7S" && answered.support >= 2 &&
+               !answered.contested,
+           "a reading that arrives already corroborated takes the name "
+           "outright");
   }
 
   {
@@ -4150,6 +4192,10 @@ struct KeyerFixtureOutcome {
   // Strongest divergence between the wide- and narrow-filter speed estimates
   // seen on any live track in the window.
   float speed_ratio{0.0F};
+  // Best acoustic cadence fit any live track in the window reached, and the
+  // most other carriers any of them had inside the joint-separation radius.
+  // The second discriminator reads both.
+  float cadence_fit{0.0F};
   bool unresolved{false};
   // A live, currently matched carrier in the window that is published with its
   // frequency and key state but without text.
@@ -4202,6 +4248,8 @@ KeyerFixtureOutcome runKeyerFixture(
       outcome.tracked = true;
       outcome.speed_ratio =
           std::max(outcome.speed_ratio, diagnostic.keyer_speed_ratio);
+      outcome.cadence_fit = std::max(outcome.cadence_fit,
+                                     diagnostic.acoustic_cadence_confidence);
       outcome.unresolved =
           outcome.unresolved || diagnostic.keyer_overlap_unresolved;
       outcome.neighbours =
@@ -4326,11 +4374,50 @@ void test_overlapping_keyers_publish_occupancy_not_text() {
   // Hysteresis. The verdict follows sustained evidence, never one
   // measurement: a pileup thinning for a word, or a DX pausing, must not flip
   // a stream between publishing text and withholding it.
+  // Hysteresis. The verdict follows sustained evidence, never one
+  // measurement: a pileup thinning for a word, or a DX pausing, must not flip
+  // a stream between publishing text and withholding it. Three consecutive
+  // agreeing evaluations is more than a second of audio, whichever of the two
+  // measures carried them.
+  constexpr double block_seconds = 1'024.0 / sample_rate;
+  expect(crowded_outcome.first_verdict_block > 0 &&
+             static_cast<double>(crowded_outcome.first_verdict_block) *
+                     block_seconds >
+                 1.0,
+         "the standing verdict needs more than a second of consistent "
+         "evidence and cannot follow a single measurement");
+
+  // Which of the two measures answers first, and that each answers where the
+  // other cannot.
+  //
+  // Here the speed comparison is the one that decides the case -- two carriers
+  // 60 Hz apart still leave a cadence one keyer's model can fit, and the fit
+  // only falls to about 0.64 -- but it cannot decide it quickly: it needs two
+  // full sixty-four-run windows before it has anything to compare, and on this
+  // fixture that is seven seconds of audio. The cadence reading is available
+  // as soon as the decoder has estimated a cadence at all, so with it the
+  // channel stops publishing a transcript of two superimposed stations several
+  // seconds sooner. Lower the cadence limit until it cannot speak and the same
+  // audio waits for the ratio, which is the pre-change behaviour.
+  expect(crowded_outcome.cadence_fit >
+             CwChannelBankConfig{}.minimum_single_keyer_cadence_fit,
+         "one neighbour still leaves a cadence one keyer's model can fit, so "
+         "the cadence limit alone would keep publishing this channel");
   expect(crowded_outcome.first_ratio_over_limit_block > 0 &&
-             crowded_outcome.first_verdict_block >
-                 crowded_outcome.first_ratio_over_limit_block + 5,
-         "the standing verdict lags the first measurement that crosses the "
-         "limit by several further measurements");
+             crowded_outcome.first_verdict_block <
+                 crowded_outcome.first_ratio_over_limit_block,
+         "the cadence reading refuses a crowded channel before the speed "
+         "comparison has two full run windows to compare");
+
+  const auto ratio_only = runKeyerFixture(
+      crowded, sample_rate, 0.5 * (carrier_hz + neighbour_hz), 60.0,
+      {.minimum_single_keyer_cadence_fit = 0.30F});
+  expect(ratio_only.unresolved && !ratio_only.text_published,
+         "the speed comparison still refuses the channel on its own");
+  expect(ratio_only.first_verdict_block >
+             ratio_only.first_ratio_over_limit_block,
+         "with the cadence limit lowered out of the way the verdict waits for "
+         "the ratio, which is what it used to do");
 }
 
 // The bank used to hold 24 carriers, and the 24 was not a decision: the

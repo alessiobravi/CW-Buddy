@@ -1213,7 +1213,24 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
                     .arg(name)
                     .arg(sample_rate, 0, 'f', 0)
                     .arg(channel_count);
+            // A recovery is not an error, so it must not block; but it must
+            // not vanish either. The live-RX summary is written the instant
+            // capture begins and would otherwise erase the only sentence that
+            // says the application followed a name rather than the hardware.
+            if (!audio_input_recovery_notice_.isEmpty()) {
+              status_text_ += QStringLiteral(" • ") +
+                              audio_input_recovery_notice_;
+            }
             emit stateChanged();
+          });
+  connect(capture_worker, &LiveAudioCaptureWorker::inputRecovered, this,
+          [this](const QString& adopted_id, const QString& message) {
+            audio_input_recovery_notice_ = message;
+            // Adopt the identifier here first. Settings echoes the change back
+            // through setAudioInputSelection, and a selection that still
+            // looked different would restart the capture that just started.
+            audio_input_id_ = adopted_id;
+            emit audioInputRecovered(adopted_id);
           });
   connect(capture_worker, &LiveAudioCaptureWorker::stopped, this, [this] {
     if (live_capturing_ && source_mode_ == 0) {
@@ -2600,10 +2617,12 @@ void ReplayController::setOwnCallsign(const QString& callsign) {
 }
 
 void ReplayController::setAudioInputSelection(QString encoded_id,
-                                               QString display_name) {
+                                               QString display_name,
+                                               QString device_name) {
   const bool changed = audio_input_id_ != encoded_id;
   audio_input_id_ = std::move(encoded_id);
   audio_input_name_ = std::move(display_name);
+  audio_input_device_name_ = std::move(device_name);
   if (changed && live_capturing_ && source_mode_ == 0) {
     beginLiveAudioCapture();
   }
@@ -2715,11 +2734,15 @@ void ReplayController::beginLiveAudioCapture() {
   source_loaded_ = false;
   input_overruns_ = 0;
   emit sourceReset();
+  // Before clearBlockingError(), which decoder_display_separation_test.cpp
+  // pins to the status line that follows it: a recovery notice is about the
+  // start now beginning, so a previous one must not survive into it.
+  audio_input_recovery_notice_.clear();
   clearBlockingError();
   setStatus(QStringLiteral("Starting live audio from %1…").arg(audio_input_name_));
   publishSpectrumConfiguration();
   emit liveDspStartRequested();
-  emit liveStartRequested(audio_input_id_);
+  emit liveStartRequested(audio_input_id_, audio_input_device_name_);
 }
 
 void ReplayController::beginLiveSdrCapture() {

@@ -93,3 +93,31 @@ supported WPM and prosign requirements that bound this matrix are now settled:
 speeds run from 8 to 60 WPM, and the transmittable prosigns are the closed set
 of seven, so a generated case outside those bounds measures something the
 project does not claim.
+
+## Scoring a recorded SigMF capture
+
+A SigMF capture replays through the same decode path as a WAV clip, by naming
+either half of the pair:
+
+```sh
+cwa_capture_replay --decoder-center-hz 7012396 --decoder-bandwidth-hz 6000 iq.sigmf-data
+```
+
+The wide complex block goes through the live receiver's own chain -- overview
+transform, subband decimator, decoder transform -- before the channel bank reads
+it, and detection sees only the requested window. A capture block fed straight
+to the decoder is not audio: every filter and timing constant in the bank is
+sized for the decode region rather than for the hardware passband.
+
+The window defaults to the capture's own centre frequency at 24 kHz, which is
+frequently not where the operator was listening -- a receiver watching a pileup
+16 kHz down from its dial records a capture whose centre holds nothing. The
+sidecar's description records the window that was in use. A window whose slice
+falls outside the acquired passband is refused before the replay starts, naming
+the frequencies that do not fit, rather than decoding nothing while the spectrum
+paints normally.
+
+An annotation sidecar bound to a capture carries the digest of the
+`.sigmf-data` and `.sigmf-meta` files together, because the sidecar holds the
+sample rate and segment centres that decide what a track's absolute RF means.
+Its event frequencies are absolute RF.

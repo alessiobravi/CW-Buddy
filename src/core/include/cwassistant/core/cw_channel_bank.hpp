@@ -138,6 +138,13 @@ struct CwStreamLabel {
   std::string challenger;
   std::uint32_t support{0};
   std::uint32_t challenger_support{0};
+  // Set when a name that had not yet been corroborated was displaced by a
+  // disagreeing reading no better supported than it was. Two single readings
+  // that contradict each other are evidence that the copy is not good enough
+  // to read a call out of; they are not evidence for whichever of them was
+  // read last. While this stands the stream is published without a name. It
+  // clears the moment any reading reaches the corroboration bar.
+  bool contested{false};
 };
 
 // Folds one reading of a stream's station name into the name it already wears.
@@ -381,6 +388,46 @@ struct CwChannelBankConfig {
   // clean but noisy signal would be silenced, and above 4 nothing measured
   // here would ever fire.
   float maximum_single_keyer_speed_ratio{1.5F};
+  // Below this acoustic cadence fit, a crowded channel is judged to hold more
+  // than one keyer. The second, independent half of the question the ratio
+  // above asks, because on real crowded air the ratio mostly cannot answer it.
+  //
+  // The fit is how well one keyer's cadence explains the channel's envelope,
+  // and the decoder computes it for every track already. One keyer scores high
+  // on it by construction; a dense pileup has no single cadence to fit and the
+  // measure collapses. It is read only where the neighbourhood holds enough
+  // other carriers for that reading to mean anything -- see
+  // `kKeyerCadenceMinimumNeighbours` -- because alone on a frequency the same
+  // collapse means poor copy.
+  //
+  // The two measures answer different failures and neither covers the other,
+  // which is why both are kept. On the operator's capture of a real DX pileup
+  // -- about fifty stations in six kilohertz, median spacing 70 Hz, minimum
+  // 52 Hz -- the ratio produced no estimate at all for 41 of the 48 carriers
+  // the bank published and refused exactly one, which was outside the dense
+  // block; the cadence fit refuses 42 of 48 while keeping the DX that decodes
+  // cleanly, the second station calling CQ, and the two carriers outside the
+  // block. On the two-carrier synthetic fixture it is the other way round: the
+  // ratio reads over 1.5 and refuses, while the fit falls only to 0.637 and
+  // does not.
+  //
+  // Swept over the capture, with the decoder surface benchmark's per-seed-set
+  // character error identical to the pre-change baseline at every value:
+  //
+  //   fit     capture carriers refused
+  //   0.30          18 of 48
+  //   0.40          27 of 46
+  //   0.50          42 of 48
+  //   0.60          44 of 49
+  //   0.70          44 of 49
+  //
+  // 0.50 is where the curve flattens, and it is the conservative side of the
+  // flat part: the weakest clean single carrier on the synthetic corpus
+  // reaches 0.701, and the two further carriers 0.60 refuses are worth less
+  // than that margin against silencing a station an operator could work. The
+  // clamp keeps the setting inside the range where it can still mean
+  // something at either end.
+  float minimum_single_keyer_cadence_fit{0.50F};
 };
 
 struct CwVerificationDiagnostics {
@@ -498,8 +545,10 @@ struct CwTrackDiagnostic {
   // keying to answer. One keyer holds near unity; several superimposed run to
   // two or three.
   float keyer_speed_ratio{0.0F};
-  // The standing verdict that ratio produced, after hysteresis. True means
-  // "not resolved by the effort spent so far", not "unresolvable".
+  // The standing verdict, after hysteresis, from that ratio and from
+  // `acoustic_cadence_confidence` above together: either refusing the track is
+  // enough. True means "not resolved by the effort spent so far", not
+  // "unresolvable".
   bool keyer_overlap_unresolved{false};
   // The evidence a later, more expensive separation stage needs in order to
   // choose which refused tracks are worth attempting: how many other tracked
@@ -784,6 +833,18 @@ class CwChannelBank {
     std::array<KeyingRuns, 2> keyer_runs{};
     std::uint16_t keyer_evaluation_countdown{0};
     float keyer_speed_ratio{0.0F};
+    // Best acoustic cadence fit this track has ever reached.
+    //
+    // A high-water mark rather than a sample or an interval peak. The fit is
+    // measured over the decoder's own cadence window and falls back through a
+    // word gap, a pause, or a stretch of the transmission the pileup happened
+    // to bury, so a sample of it says as much about when it was taken as about
+    // the channel. The question asked here is whether one keyer's cadence ever
+    // explained this channel, and a station does not become several keyers by
+    // going quiet. Measured: reading the interval peak instead costs a further
+    // 0.01 of paired character error on the decoder surface benchmark and
+    // refuses no additional carrier on the capture.
+    float keyer_cadence_peak{0.0F};
     bool keyer_overlap_unresolved{false};
     // Consecutive ratio evaluations agreeing with each verdict. A verdict only
     // changes once one of these reaches the required run, so a single

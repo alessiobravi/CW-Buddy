@@ -518,7 +518,8 @@ int main(int argc, char* argv[]) {
   apply_transmit_radio_safety();
   follow_sdr_to_radio_vfo();
   replay_controller.setAudioInputSelection(settings.audioInputId(),
-                                           settings.audioInputDisplayName());
+                                           settings.audioInputDisplayName(),
+                                           settings.audioInputDeviceName());
   apply_sdr_input();
   if (settings.receiverInputTypeIndex() == 1)
     replay_controller.setSourceMode(2);
@@ -630,7 +631,17 @@ int main(int argc, char* argv[]) {
       &settings, &cwassistant::desktop::AppSettings::audioInputsChanged,
       &replay_controller, [&settings, &replay_controller] {
         replay_controller.setAudioInputSelection(
-            settings.audioInputId(), settings.audioInputDisplayName());
+            settings.audioInputId(), settings.audioInputDisplayName(),
+            settings.audioInputDeviceName());
+      });
+  // An input found by name after its identifier changed is adopted for good,
+  // so the next start matches on the identifier and never has to recover a
+  // second time.
+  QObject::connect(
+      &replay_controller,
+      &cwassistant::desktop::ReplayController::audioInputRecovered, &settings,
+      [&settings](const QString& adopted_id) {
+        settings.adoptRecoveredAudioInput(adopted_id);
       });
   QObject::connect(
       &settings, &cwassistant::desktop::AppSettings::sdrSettingsChanged,

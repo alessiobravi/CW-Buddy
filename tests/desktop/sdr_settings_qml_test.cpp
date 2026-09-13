@@ -456,5 +456,62 @@ int main() {
     return 21;
   }
 
+  // An audio input has to be findable again after its identifier changes.
+  //
+  // A station rebooted and reception refused to start, because the only thing
+  // stored about his chosen input was the base64 of QAudioDevice::id() -- an
+  // opaque operating-system handle that a restart, a driver reload or a
+  // different USB port can reissue while the hardware sits untouched. The
+  // operating system's own description of the device survives all three, so it
+  // is stored raw, undecorated by the ordinal and default markers the list
+  // shows, and it is what the input is found by when the identifier is gone.
+  // Inside apply(), not merely somewhere in the file: the recovery path writes
+  // the same key, and an assertion that either one satisfies would let the
+  // ordinary Apply stop storing the name without anything noticing.
+  if (!contains(functionBody(implementation, "bool AppSettings::apply()"),
+                "storageKey(QStringLiteral(\"audio/inputDeviceName\"))") ||
+      !contains(header, "const QString& audioInputDeviceName() const noexcept") ||
+      !contains(functionBody(implementation, "void AppSettings::selectAudioInput("),
+                "audio_input_device_name_ =")) {
+    return 22;
+  }
+  // A recovered identifier is written to storage there and then, not left for
+  // the next Apply: a station that closes the application before applying
+  // anything else would otherwise meet the same unresolvable selection at the
+  // next restart, which is the failure being repaired.
+  const std::string_view adopt_body =
+      functionBody(implementation, "void AppSettings::adoptRecoveredAudioInput(");
+  if (adopt_body.empty() ||
+      !contains(adopt_body, "storageKey(QStringLiteral(\"audio/inputId\"))") ||
+      !contains(adopt_body, "refreshAudioInputs()") ||
+      !contains(controller_header, "void audioInputRecovered(const QString& adopted_id)")) {
+    return 22;
+  }
+  // The name travels with the identifier all the way to the worker. Without
+  // it, resolution has nothing to fall back on and the recovery cannot happen
+  // at all.
+  if (!contains(controller_header, "void liveStartRequested(const QString& encoded_device_id,") ||
+      !contains(functionBody(controller_implementation,
+                             "void ReplayController::beginLiveAudioCapture("),
+                "emit liveStartRequested(audio_input_id_, audio_input_device_name_)")) {
+    return 22;
+  }
+
+  // Identically-named inputs are numbered, in the list and in the wizard, and
+  // the numbering is explained exactly when there is something to explain. Two
+  // rows reading the same words are unchoosable: a refusal to guess between
+  // them is only actionable if the operator can point at one of them.
+  const std::string setup_qml =
+      readFile(std::filesystem::path(CWA_SETTINGS_QML_PATH).parent_path() /
+               "SetupWizard.qml");
+  if (setup_qml.empty() ||
+      !contains(functionBody(implementation, "void AppSettings::refreshAudioInputs("),
+                "QStringLiteral(\"%1 #%2\")") ||
+      !contains(header, "bool audioInputNamesAmbiguous() const noexcept") ||
+      !contains(qml, "visible: appSettings.audioInputNamesAmbiguous") ||
+      !contains(setup_qml, "visible: appSettings.audioInputNamesAmbiguous")) {
+    return 23;
+  }
+
   return 0;
 }
