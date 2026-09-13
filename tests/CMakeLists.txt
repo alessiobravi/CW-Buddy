@@ -242,6 +242,16 @@ add_executable(cwa_verification_benchmark cw_verification_benchmark.cpp)
 target_link_libraries(cwa_verification_benchmark PRIVATE cwa_core)
 add_test(NAME cwa_verification_benchmark COMMAND cwa_verification_benchmark)
 
+# The replay harness's SigMF path, on a fixture this test writes itself. The
+# operator captures it exists for are private, so the two-stage receive chain
+# they are decoded through would otherwise have no test at all.
+add_executable(cwa_iq_capture_replay_tests iq_capture_replay_tests.cpp)
+target_link_libraries(cwa_iq_capture_replay_tests PRIVATE cwa_core)
+target_compile_definitions(cwa_iq_capture_replay_tests PRIVATE
+  CWA_CAPTURE_REPLAY_PATH="${PROJECT_SOURCE_DIR}/tests/cw_capture_replay.cpp")
+add_test(NAME cwa_iq_capture_replay_tests
+  COMMAND cwa_iq_capture_replay_tests)
+
 # Operator captures are private and are therefore not CI fixtures. This
 # target provides the same native replay path for local before/after audits
 # without making external capture files a test-suite dependency.

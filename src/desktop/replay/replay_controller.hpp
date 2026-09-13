@@ -99,10 +99,114 @@ advisoryCallsignPresentation(const QVariantMap& channel,
                              QString* diagnostic_reason = nullptr,
                              bool allow_database_correction = false);
 
+// The two expensive parts of a published decoder channel, kept against the
+// exact evidence they were derived from.
+//
+// rebuildDecoderModels() runs on the GUI thread, for every visible stream, on
+// every publish: measured on a busy band at 23 publishes a second across 24
+// streams, so roughly 550 derivations a second on the thread that draws. Two
+// of the derived values cost real time there.
+//
+// The first is whether the operator's own callsign appears in the transcript.
+// The transcript is append-only and unbounded, so asking that question by
+// splitting the whole of it grew more expensive for as long as the application
+// stayed open. The second is advisoryCallsignPresentation(), which walks a
+// wildcard span, runs an edit-distance program against every acoustic
+// alternative and may search the whole offline directory.
+//
+// Measured in an optimized build over 24 streams at 23 publishes a second,
+// with the 32,000-character transcripts an hour on a busy band produces: those
+// two cost between 1.85 and 2.09 seconds of GUI thread for every second of
+// publishes, against a reported freeze of up to 2.1 seconds. The event loop
+// cannot catch up with that, which is why an empty band was fine and a full
+// one was not.
+//
+// Both are pure functions of the evidence below, and nobody reads a callsign
+// suggestion 23 times a second. When none of the evidence moved, the previous
+// answer is still the right answer, so it is returned rather than recomputed.
+// The same publishes then cost 2 to 7 ms when no stream changed and 63 ms with
+// every stream changing on every publish, which is a rate no operator can
+// produce: it needs 23 committed characters a second on each of 24 streams.
+// This is the memo the decoder already keeps for word-gap reconstruction
+// (word_gap_cache_input_ in cw_decoder.cpp), applied one layer up.
+class DecoderChannelPresentationCache {
+ public:
+  struct Derived {
+    bool calling_own_station{false};
+    bool callsign_in_database{false};
+    QString suggestion;
+    QString suggestion_raw_span;
+    QString suggestion_source;
+    int suggestion_agreeing_alternatives{0};
+    double suggestion_support{0.0};
+    double suggestion_relative_cost{0.0};
+    QString suggestion_diagnostic;
+  };
+
+  // Evidence that does not live in any one channel. Changing the operator's
+  // callsign or the correction preference changes every stream's answer at
+  // once, so every retained answer is dropped.
+  void setContext(const QString& own_callsign, bool allow_database_correction);
+  // The directory itself was reloaded. Its contents are not compared, so the
+  // caller says when they moved.
+  void invalidate() noexcept;
+
+  [[nodiscard]] const Derived& derive(
+      qulonglong channel_id, const QVariantMap& channel,
+      const cwassistant::core::OfflineCallsignDatabase& database);
+
+  // Called once a publish has derived every live stream. A stream that has
+  // gone keeps no entry: its channel id is never published again.
+  void endPublish() noexcept;
+
+  // How many times derive() has had to compute an answer rather than return a
+  // retained one. A publish that changed nothing must not move this, which is
+  // the whole claim this class makes and the only way to assert it without
+  // timing anything.
+  [[nodiscard]] qulonglong computations() const noexcept {
+    return computations_;
+  }
+  [[nodiscard]] std::size_t retainedStreams() const noexcept {
+    return entries_.size();
+  }
+
+ private:
+  struct Entry {
+    // The evidence. Held as the published QStrings and QVariantList, which are
+    // implicitly shared, so retaining them costs a reference rather than a
+    // copy of the transcript.
+    QString text;
+    QString refined_text;
+    QString callsign;
+    QVariantList acoustic_alternatives;
+    bool verified_cw{false};
+    bool valid{false};
+    qulonglong publish{0};
+    Derived derived;
+  };
+
+  std::unordered_map<qulonglong, Entry> entries_;
+  QString own_callsign_;
+  bool allow_database_correction_{false};
+  qulonglong publish_{1};
+  qulonglong computations_{0};
+};
+
 class ReplayController final : public QObject {
   Q_OBJECT
   Q_PROPERTY(QString sourceName READ sourceName NOTIFY stateChanged)
   Q_PROPERTY(QString statusText READ statusText NOTIFY stateChanged)
+  // The full text of a failure that stopped reception, or left it unable to
+  // start; empty when nothing is blocking.
+  //
+  // statusText is one elided line, which is right for a running commentary and
+  // wrong for a failure: an operator was shown "Live audio error: The selected
+  // audio input is un..." and lost exactly the half that says what to do about
+  // it. This carries the same message uncut so a dialog can present it, and it
+  // is a separate property because a presentation layer must not have to
+  // recognise failures by looking for the word "error" in prose written for a
+  // human and liable to be reworded.
+  Q_PROPERTY(QString blockingError READ blockingError NOTIFY stateChanged)
   Q_PROPERTY(bool sourceLoaded READ sourceLoaded NOTIFY stateChanged)
   Q_PROPERTY(bool playing READ playing NOTIFY stateChanged)
   Q_PROPERTY(int sourceMode READ sourceMode WRITE setSourceMode NOTIFY stateChanged)
@@ -206,6 +310,11 @@ class ReplayController final : public QObject {
 
   [[nodiscard]] const QString& sourceName() const noexcept;
   [[nodiscard]] const QString& statusText() const noexcept;
+  [[nodiscard]] const QString& blockingError() const noexcept;
+  // The operator has read and dismissed the dialog. Clearing it here rather
+  // than in the presentation layer means a dismissed failure cannot be
+  // resurrected by the next unrelated stateChanged().
+  Q_INVOKABLE void dismissBlockingError();
   [[nodiscard]] bool sourceLoaded() const noexcept;
   [[nodiscard]] bool playing() const noexcept;
   [[nodiscard]] int sourceMode() const noexcept;
@@ -465,6 +574,19 @@ class ReplayController final : public QObject {
 
  private:
   void setStatus(QString status);
+  // Reception stopped, or could not start. The status line gets the message
+  // exactly as before -- it stays a useful one-line commentary -- and the full
+  // text is kept for the dialog as well.
+  //
+  // A refused SDR retune deliberately does not come here. It reports something
+  // that failed without stopping anything: the receiver is still running on
+  // the frequency it was already on, and a dialog the operator has to dismiss
+  // is itself an interruption that an error which stopped nothing has not
+  // earned.
+  void setBlockingError(QString message);
+  // Reception was asked to start, or has started. Whatever failed before is
+  // no longer what the operator is looking at.
+  void clearBlockingError();
   void beginLiveAudioCapture();
   void beginLiveSdrCapture();
   void publishSpectrumConfiguration();
@@ -524,6 +646,7 @@ class ReplayController final : public QObject {
   QObject* character_inference_worker_{nullptr};
   QString source_name_;
   QString status_text_{QStringLiteral("Select Start live RX to begin receiving audio")};
+  QString blocking_error_;
   bool source_loaded_{false};
   bool playing_{false};
   int source_mode_{0};
@@ -568,6 +691,7 @@ class ReplayController final : public QObject {
   cwassistant::core::OfflineCallsignDatabase offline_callsign_database_;
   bool callsign_database_correction_enabled_{false};
   QString own_callsign_;
+  DecoderChannelPresentationCache channel_presentation_;
   QString keying_model_{QStringLiteral("adaptive-threshold")};
   // Mirrors the operator preference so the current gate can be read back, and
   // so the pair can be resent to a worker whenever the decoder configuration

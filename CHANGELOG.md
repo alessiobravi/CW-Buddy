@@ -6,7 +6,67 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- A recorded SigMF capture can now be scored, not only played back.
+  `cwa_capture_replay` accepts either half of a `.sigmf-data`/`.sigmf-meta` pair
+  alongside the WAV clips it already read, and routes the wide complex block
+  through the same two-stage chain the live receiver uses -- overview transform,
+  subband decimator, decoder transform -- before the channel bank sees it, so a
+  replayed score is comparable with what the operator saw. A capture block fed
+  straight to the decoder is not audio: every filter and timing constant in the
+  bank is sized for the decode region rather than for the hardware passband.
+
+  The decoder window is chosen per capture, defaulting to the recording's own
+  centre frequency and overridable, because the centre is frequently not where
+  the signals are: a receiver watching a pileup 16 kHz down from where it was
+  tuned records a capture whose centre holds nothing. A window whose slice
+  leaves the acquired passband is refused up front, naming the frequencies that
+  do not fit -- the decimator's own answer is to accept no samples while the
+  overview spectrum keeps painting normally, which reads as a decoder that
+  silently stopped and is not one.
+
+  The report names the sample rate, every capture segment, the recorded stop
+  reason and whether the file ends mid-sample, so a short recording an operator
+  ended is no longer indistinguishable from one that failed. An annotation
+  sidecar's digest covers both halves of the pair, since the sidecar carries the
+  rate and segment centres that decide what a track's absolute RF means.
+
+
 ### Fixed
+
+- The application no longer freezes for seconds at a time when several stations
+  are decoding. Every publish of the decoded-channel model re-derived two things
+  for every visible stream on the thread that draws: whether the operator's own
+  callsign appears in the transcript, and the advisory callsign suggestion. The
+  first uppercased a copy of the whole cumulative transcript and split it, so
+  its cost grew for as long as the application stayed open. Measured over 24
+  streams at 23 publishes a second with the transcripts an hour on a busy band
+  produces, the two cost about two seconds of interface time for every second of
+  reception -- which is why an empty band was responsive and a full one was not.
+
+  Both are now derived only when the evidence they are drawn from changes, and
+  the transcript scan no longer copies, compiles or allocates. The same publishes
+  cost between 2 and 7 milliseconds when no stream changed, and 63 milliseconds
+  with every stream changing on every publish. The suggestion an operator sees is
+  unchanged: the function producing it is not modified, and the scan is checked
+  against the implementation it replaced across a corpus of transcripts.
+
+  Worth recording because it was the obvious answer and it was wrong:
+  constructing the regular expression inside the loop, which is what a reviewer
+  names first, is 0.4% of what that line costs, and hoisting it recovers nothing
+  measurable. The advisory search, the other candidate, is bounded by its own
+  2048-character window and never exceeded a fifth of the total.
+
+- A failure that stops reception is published whole instead of being cut off
+  mid-word. The status line is a single elided row, which suits a running
+  commentary and not a failure: "Live audio error: The selected audio input is
+  un..." lost precisely the half that said to reconnect the device or choose
+  another. Blocking failures -- a recording that will not open, an audio input or
+  SDR that will not start, permission denied, no SDR device chosen -- are now
+  carried in full alongside the status line, and cleared when reception next
+  starts or is retried. A refused SDR retune is not treated as blocking: it stops
+  nothing, and an error that stopped nothing has not earned a dialog.
 
 - The Ctrl+Right drag that sizes the SDR decode region now measures the gesture
   in pixels rather than in hertz. Whether a gesture is a click or a drag is a

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -14,10 +15,13 @@
 #include "cwassistant/core/cw_channel_bank.hpp"
 #include <sstream>
 #include "cwassistant/core/cw_vocabulary.hpp"
+#include "cwassistant/core/iq_replay_source.hpp"
+#include "cwassistant/core/iq_writer.hpp"
 #include "cwassistant/core/spectrum_analyzer.hpp"
 #include "cwassistant/core/wav_replay_source.hpp"
 #include "support/decoder_evaluation.hpp"
 #include "support/file_sha256.hpp"
+#include "support/iq_replay_chain.hpp"
 #include "support/receiver_annotations.hpp"
 
 namespace {
@@ -321,127 +325,97 @@ void evaluateAnnotations(
                 unmatched_callsigns / reviewed_minutes) << '\n';
 }
 
-int replay(
-    const std::string& path,
-    const cwassistant::test::ReceiverAnnotationManifest* annotations) {
-  using namespace std::chrono_literals;
-  using namespace cwassistant::core;
-
-  WavReplaySource source;
-  if (!source.open(path, {.kind = StreamKind::Audio})) {
-    std::cerr << path << ": " << source.last_error() << '\n';
-    return 1;
-  }
-  if (annotations != nullptr && annotations->sample_rate_hz !=
-                                    static_cast<std::uint32_t>(
-                                        source.stream_descriptor()
-                                            .sample_rate_hz)) {
-    std::cerr << path << ": annotation sample rate does not match audio\n";
-    return 2;
-  }
-  if (annotations != nullptr) {
-    if (!cwassistant::test::receiverAnnotationsFitAudio(
-            *annotations, source.total_frames())) {
-      std::cerr << path << ": annotation data exceeds audio duration\n";
-      return 2;
-    }
-  }
-  if (annotations != nullptr &&
-      cwassistant::test::fileSha256(path) != annotations->audio_sha256) {
-    std::cerr << path << ": annotation audio SHA-256 does not match\n";
-    return 2;
-  }
-  source.start();
-  SpectrumAnalyzer analyzer({.audio_upper_frequency_hz = 3'000.0});
-  CwChannelBank channels;
+// Everything a replay accumulates about the decode, independent of which kind
+// of recording produced the samples. Split out of the audio replay when the
+// SigMF path arrived: the two sources differ entirely in how a block reaches
+// the channel bank and not at all in what is observed once it has, so a second
+// copy of this bookkeeping would be two scores that drift apart silently.
+struct ReplayState {
   std::unordered_set<std::uint64_t> published_ids;
-  std::unordered_map<std::uint64_t, CwChannelSnapshot> latest_published;
+  std::unordered_map<std::uint64_t, cwassistant::core::CwChannelSnapshot>
+      latest_published;
   std::unordered_map<std::uint64_t, ObservedTrack> observations;
-  std::size_t maximum_tracks = 0;
-  std::size_t maximum_published = 0;
+  std::size_t maximum_tracks{0};
+  std::size_t maximum_published{0};
+};
 
-  RealtimeSampleBlock block;
-  while (source.read(block, 0ms)) {
-    for (const auto& spectrum : analyzer.process(block)) {
-      static_cast<void>(channels.updateSpectrum(
-          spectrum.timestamp_ns, spectrum.lower_frequency_hz,
-          spectrum.upper_frequency_hz, spectrum.bins_dbfs));
+void observeBlock(
+    const std::string& path,
+    const std::vector<cwassistant::core::CwTrackDiagnostic>& diagnostics,
+    const std::vector<cwassistant::core::CwChannelSnapshot>& published,
+    const std::uint64_t current_sample, const double elapsed_seconds,
+    ReplayState& state) {
+  for (const auto& diagnostic : diagnostics) {
+    auto [entry, inserted] = state.observations.try_emplace(diagnostic.id);
+    auto& observed = entry->second;
+    if (inserted) {
+      observed.id = diagnostic.id;
+      observed.first_sample = current_sample;
     }
-    const auto& published = channels.processSamples(block);
-    const auto diagnostics = channels.allTrackDiagnostics();
-    const std::uint64_t current_sample =
-        source.position_frames() == 0U ? 0U : source.position_frames() - 1U;
-    for (const auto& diagnostic : diagnostics) {
-      auto [entry, inserted] = observations.try_emplace(diagnostic.id);
-      auto& observed = entry->second;
-      if (inserted) {
-        observed.id = diagnostic.id;
-        observed.first_sample = current_sample;
-      }
-      observed.last_sample = current_sample;
-      observed.frequency_hz = diagnostic.presentation_frequency_hz;
-      const bool changed = observed.points.empty() ||
-          observed.points.back().text != diagnostic.text ||
-          observed.points.back().provisional_text != diagnostic.provisional_text ||
-          std::abs(observed.points.back().frequency_hz -
-                   diagnostic.presentation_frequency_hz) > 0.01;
-      if (changed) {
-        observed.points.push_back({current_sample, diagnostic.text,
-                                   diagnostic.provisional_text,
-                                   diagnostic.presentation_frequency_hz});
-      }
-    }
-    maximum_tracks = std::max(maximum_tracks, diagnostics.size());
-    maximum_published = std::max(maximum_published, published.size());
-    const double elapsed_seconds =
-        static_cast<double>(source.position_frames()) /
-        source.stream_descriptor().sample_rate_hz;
-    std::unordered_set<std::uint64_t> current_published_ids;
-    for (const auto& channel : published) {
-      current_published_ids.insert(channel.id);
-      latest_published[channel.id] = channel;
-      auto& observed = observations[channel.id];
-      observed.published_callsign = channel.callsign;
-      observed.published = true;
-      std::vector<std::string> published_callsigns = channel.qso_participants;
-      if (!channel.callsign.empty())
-        published_callsigns.push_back(channel.callsign);
-      std::sort(published_callsigns.begin(), published_callsigns.end());
-      published_callsigns.erase(
-          std::unique(published_callsigns.begin(), published_callsigns.end()),
-          published_callsigns.end());
-      if (observed.publication_points.empty() ||
-          !observed.publication_points.back().published ||
-          observed.publication_points.back().callsigns != published_callsigns) {
-        observed.publication_points.push_back(
-            {current_sample, true, std::move(published_callsigns)});
-      }
-      if (!published_ids.insert(channel.id).second) continue;
-      std::cout << "published path=\"" << path << "\" time_s="
-                << elapsed_seconds << " id=" << channel.id
-                << " color=" << static_cast<unsigned>(channel.color_index)
-                << " frequency_hz=" << channel.frequency_hz
-                << " presentation_frequency_hz="
-                << channel.presentation_frequency_hz
-                << " wpm=" << channel.wpm
-                << " acoustic_wpm=" << channel.acoustic_wpm
-                << " cadence_fit="
-                << channel.acoustic_cadence_confidence
-                << " confidence=" << channel.verification_confidence
-                << " text=\"" << channel.text << "\""
-                << " refined_text=\"" << channel.refined_text << "\"\n";
-    }
-    for (auto& [id, observed] : observations) {
-      if (!current_published_ids.contains(id) &&
-          !observed.publication_points.empty() &&
-          observed.publication_points.back().published) {
-        observed.publication_points.push_back(
-            {current_sample, false, {}});
-      }
+    observed.last_sample = current_sample;
+    observed.frequency_hz = diagnostic.presentation_frequency_hz;
+    const bool changed = observed.points.empty() ||
+        observed.points.back().text != diagnostic.text ||
+        observed.points.back().provisional_text != diagnostic.provisional_text ||
+        std::abs(observed.points.back().frequency_hz -
+                 diagnostic.presentation_frequency_hz) > 0.01;
+    if (changed) {
+      observed.points.push_back({current_sample, diagnostic.text,
+                                 diagnostic.provisional_text,
+                                 diagnostic.presentation_frequency_hz});
     }
   }
+  state.maximum_tracks = std::max(state.maximum_tracks, diagnostics.size());
+  state.maximum_published =
+      std::max(state.maximum_published, published.size());
+  std::unordered_set<std::uint64_t> current_published_ids;
+  for (const auto& channel : published) {
+    current_published_ids.insert(channel.id);
+    state.latest_published[channel.id] = channel;
+    auto& observed = state.observations[channel.id];
+    observed.published_callsign = channel.callsign;
+    observed.published = true;
+    std::vector<std::string> published_callsigns = channel.qso_participants;
+    if (!channel.callsign.empty())
+      published_callsigns.push_back(channel.callsign);
+    std::sort(published_callsigns.begin(), published_callsigns.end());
+    published_callsigns.erase(
+        std::unique(published_callsigns.begin(), published_callsigns.end()),
+        published_callsigns.end());
+    if (observed.publication_points.empty() ||
+        !observed.publication_points.back().published ||
+        observed.publication_points.back().callsigns != published_callsigns) {
+      observed.publication_points.push_back(
+          {current_sample, true, std::move(published_callsigns)});
+    }
+    if (!state.published_ids.insert(channel.id).second) continue;
+    std::cout << "published path=\"" << path << "\" time_s="
+              << elapsed_seconds << " id=" << channel.id
+              << " color=" << static_cast<unsigned>(channel.color_index)
+              << " frequency_hz=" << channel.frequency_hz
+              << " presentation_frequency_hz="
+              << channel.presentation_frequency_hz
+              << " wpm=" << channel.wpm
+              << " acoustic_wpm=" << channel.acoustic_wpm
+              << " cadence_fit="
+              << channel.acoustic_cadence_confidence
+              << " confidence=" << channel.verification_confidence
+              << " text=\"" << channel.text << "\""
+              << " refined_text=\"" << channel.refined_text << "\"\n";
+  }
+  for (auto& [id, observed] : state.observations) {
+    if (!current_published_ids.contains(id) &&
+        !observed.publication_points.empty() &&
+        observed.publication_points.back().published) {
+      observed.publication_points.push_back({current_sample, false, {}});
+    }
+  }
+}
 
-  for (const auto& [id, channel] : latest_published) {
+void reportDecode(const std::string& path, const ReplayState& state,
+                  const cwassistant::core::CwChannelBank& channels,
+                  const double duration_seconds) {
+  for (const auto& [id, channel] : state.latest_published) {
     std::cout << "final path=\"" << path << "\" id=" << id
               << " frequency_hz=" << channel.frequency_hz
               << " timing_quality=" << channel.verification_timing_quality
@@ -504,16 +478,330 @@ int replay(
 
   const auto verification = channels.verificationDiagnostics();
   std::cout << "summary path=\"" << path << "\" duration_s="
-            << source.duration_seconds() << " maximum_tracks="
-            << maximum_tracks << " maximum_published=" << maximum_published
+            << duration_seconds << " maximum_tracks="
+            << state.maximum_tracks << " maximum_published="
+            << state.maximum_published
             << " verified_transitions=" << verification.verified_transitions
             << " decoder_reacquisitions="
             << verification.decoder_reacquisitions
             << " expired_unverified="
             << verification.expired_unverified_tracks << '\n';
-  if (annotations != nullptr)
-    evaluateAnnotations(*annotations, observations, source.total_frames());
+}
+
+int replayAudio(
+    const std::string& path,
+    const cwassistant::test::ReceiverAnnotationManifest* annotations) {
+  using namespace std::chrono_literals;
+  using namespace cwassistant::core;
+
+  WavReplaySource source;
+  if (!source.open(path, {.kind = StreamKind::Audio})) {
+    std::cerr << path << ": " << source.last_error() << '\n';
+    return 1;
+  }
+  if (annotations != nullptr && annotations->sample_rate_hz !=
+                                    static_cast<std::uint32_t>(
+                                        source.stream_descriptor()
+                                            .sample_rate_hz)) {
+    std::cerr << path << ": annotation sample rate does not match audio\n";
+    return 2;
+  }
+  if (annotations != nullptr) {
+    if (!cwassistant::test::receiverAnnotationsFitAudio(
+            *annotations, source.total_frames())) {
+      std::cerr << path << ": annotation data exceeds audio duration\n";
+      return 2;
+    }
+  }
+  if (annotations != nullptr &&
+      cwassistant::test::fileSha256(path) != annotations->audio_sha256) {
+    std::cerr << path << ": annotation audio SHA-256 does not match\n";
+    return 2;
+  }
+  source.start();
+  SpectrumAnalyzer analyzer({.audio_upper_frequency_hz = 3'000.0});
+  CwChannelBank channels;
+  ReplayState state;
+
+  RealtimeSampleBlock block;
+  while (source.read(block, 0ms)) {
+    for (const auto& spectrum : analyzer.process(block)) {
+      static_cast<void>(channels.updateSpectrum(
+          spectrum.timestamp_ns, spectrum.lower_frequency_hz,
+          spectrum.upper_frequency_hz, spectrum.bins_dbfs));
+    }
+    const auto& published = channels.processSamples(block);
+    const std::uint64_t current_sample =
+        source.position_frames() == 0U ? 0U : source.position_frames() - 1U;
+    observeBlock(path, channels.allTrackDiagnostics(), published,
+                 current_sample,
+                 static_cast<double>(source.position_frames()) /
+                     source.stream_descriptor().sample_rate_hz,
+                 state);
+  }
+
+  reportDecode(path, state, channels, source.duration_seconds());
+  if (annotations != nullptr) {
+    evaluateAnnotations(*annotations, state.observations,
+                        source.total_frames());
+  }
   return 0;
+}
+
+// The decoder window and how it was arrived at. Kept separate from the parsed
+// command line so that what the replay actually decoded is reportable: a
+// window taken from the capture's own centre and one an operator typed are the
+// same numbers by the time the decimator sees them, and a reader of the output
+// has to be able to tell which happened.
+struct CaptureReplayRequest {
+  bool have_center_frequency{false};
+  double center_frequency_hz{0.0};
+  double bandwidth_hz{cwassistant::test::kDefaultIqDecoderBandwidthHz};
+};
+
+// An RF frequency needs more than six significant digits before it is a
+// frequency at all: the stream default prints 7'015'005 Hz as 7.01501e+06,
+// which cannot be compared with an annotation, a band plan or another track
+// 70 Hz away. Restored on the way out so an audio replay in the same run keeps
+// the output it has always produced.
+class ScopedRfPrecision {
+ public:
+  // Both streams. Every guard below reports the window it refused on cerr,
+  // and a refusal that cannot name the frequency it refused is no more usable
+  // than a decode that cannot name the frequency it found.
+  ScopedRfPrecision()
+      : previous_out_(std::cout.precision(10)),
+        previous_err_(std::cerr.precision(10)) {}
+  ~ScopedRfPrecision() {
+    std::cout.precision(previous_out_);
+    std::cerr.precision(previous_err_);
+  }
+  ScopedRfPrecision(const ScopedRfPrecision&) = delete;
+  ScopedRfPrecision& operator=(const ScopedRfPrecision&) = delete;
+
+ private:
+  std::streamsize previous_out_;
+  std::streamsize previous_err_;
+};
+
+std::string_view blockStatusName(
+    const cwassistant::core::IqBlockStatus status) {
+  using cwassistant::core::IqBlockStatus;
+  switch (status) {
+    case IqBlockStatus::Accepted: return "accepted";
+    case IqBlockStatus::AcceptedAfterDiscontinuity:
+      return "accepted_after_discontinuity";
+    case IqBlockStatus::RejectedStreamKind: return "not_complex_iq";
+    case IqBlockStatus::RejectedDescriptor: return "window_outside_passband";
+    case IqBlockStatus::RejectedSampleCount: return "empty_block";
+    case IqBlockStatus::RejectedNonFiniteSample: return "non_finite_sample";
+    case IqBlockStatus::RejectedSampleMagnitude: return "sample_over_range";
+  }
+  return "unknown";
+}
+
+int replayCapture(const std::string& path,
+                  const cwassistant::test::ReceiverAnnotationManifest*
+                      annotations,
+                  const CaptureReplayRequest& request) {
+  using namespace std::chrono_literals;
+  using namespace cwassistant::core;
+
+  const ScopedRfPrecision precision;
+  IqReplaySource source;
+  if (!source.open(path, {.kind = StreamKind::ComplexIq})) {
+    std::cerr << path << ": " << source.last_error() << '\n';
+    return 1;
+  }
+  const std::string data_path = IqReplaySource::dataPathFor(path);
+  const std::string metadata_path = IqWriter::metadataPathFor(data_path);
+  const auto& metadata = source.capture_metadata();
+  const auto& segments = source.capture_segments();
+  std::cout << "capture path=\"" << data_path << "\" sample_rate_hz="
+            << metadata.sample_rate_hz << " samples=" << source.total_frames()
+            << " declared_samples=" << source.declared_sample_count()
+            << " duration_s=" << source.duration_seconds()
+            << " center_frequency_hz=" << metadata.center_frequency_hz
+            << " segments=" << segments.size()
+            << " format="
+            << (metadata.format == IqSampleFormat::Cf32Le ? "cf32_le"
+                                                          : "ci16_le")
+            // A short recording is normal when the writer says why it stopped.
+            // Printed next to the duration so a reader is never left deciding
+            // between "the operator pressed stop" and "the capture failed".
+            << " stop_reason=\"" << source.recorded_stop_reason() << "\""
+            << " ends_mid_sample=" << (source.ends_mid_sample() ? 1 : 0)
+            << " hardware=\"" << metadata.hardware << "\""
+            << " description=\"" << metadata.description << "\"\n";
+  for (std::size_t index = 0; index < segments.size(); ++index) {
+    std::cout << "capture_segment path=\"" << data_path << "\" index="
+              << index << " sample_start=" << segments[index].sample_start
+              << " frequency_hz=" << segments[index].frequency_hz
+              << " datetime=\"" << segments[index].datetime_utc << "\"\n";
+  }
+
+  // The capture's own centre is the only default that cannot be wrong about
+  // the recording, but it is frequently wrong about the operator: a receiver
+  // tuned 16 kHz away from the signals it was watching produces a capture
+  // whose centre holds nothing at all. The sidecar's description records the
+  // window that was actually in use, which is why it is printed above.
+  cwassistant::test::IqDecoderWindow window =
+      cwassistant::test::defaultIqDecoderWindow(source);
+  window.bandwidth_hz = request.bandwidth_hz;
+  if (request.have_center_frequency)
+    window.center_frequency_hz = request.center_frequency_hz;
+  std::size_t covered_segments = 0;
+  for (const auto& segment : segments) {
+    if (cwassistant::test::iqDecoderWindowFitsPassband(
+            window, {.kind = StreamKind::ComplexIq,
+                     .sample_rate_hz = metadata.sample_rate_hz,
+                     .center_frequency_hz = segment.frequency_hz,
+                     .channel_count = 1})) {
+      ++covered_segments;
+    }
+  }
+  std::cout << "decoder_window path=\"" << data_path << "\" center_frequency_hz="
+            << window.center_frequency_hz
+            << " bandwidth_hz=" << window.bandwidth_hz
+            << " source=" << (request.have_center_frequency ? "requested"
+                                                            : "capture_center")
+            << " covered_segments=" << covered_segments << '/'
+            << segments.size() << '\n';
+  if (covered_segments == 0) {
+    // Refused rather than replayed. The decimator would answer
+    // RejectedDescriptor for every block while the overview transform kept
+    // painting a normal spectrum, and the report would read as a decoder that
+    // found nothing in a busy band.
+    std::cerr << data_path << ": decoder window "
+              << window.center_frequency_hz << " Hz +/- "
+              << window.bandwidth_hz * 0.5
+              << " Hz lies outside the captured passband ("
+              << metadata.sample_rate_hz << " Hz wide); nothing would reach "
+                 "the decoder\n";
+    return 2;
+  }
+
+  cwassistant::test::IqReplayChain chain;
+  if (!chain.configure(window)) {
+    std::cerr << data_path << ": the decimator refused a "
+              << window.bandwidth_hz << " Hz decoder window\n";
+    return 2;
+  }
+
+  if (annotations != nullptr) {
+    // The capture rate, not the decoder branch rate. Annotation sample
+    // positions index the recording, which is what total_frames() counts and
+    // what the observations below are stamped with.
+    if (annotations->sample_rate_hz !=
+        static_cast<std::uint32_t>(metadata.sample_rate_hz)) {
+      std::cerr << data_path << ": annotation sample rate does not match the "
+                   "capture\n";
+      return 2;
+    }
+    if (!cwassistant::test::receiverAnnotationsFitAudio(
+            *annotations, source.total_frames())) {
+      std::cerr << data_path << ": annotation data exceeds capture duration\n";
+      return 2;
+    }
+    // Both halves of the pair. The payload alone would let the sidecar -- and
+    // with it the declared sample rate and every capture segment's centre
+    // frequency, which decide what a track's absolute RF means -- be rewritten
+    // under an annotation set that still verified.
+    if (cwassistant::test::filesSha256({data_path, metadata_path}) !=
+        annotations->audio_sha256) {
+      std::cerr << data_path << ": annotation capture SHA-256 does not match "
+                   "the .sigmf-data and .sigmf-meta pair\n";
+      return 2;
+    }
+    // Tracks from a complex capture carry absolute RF, so annotations must
+    // too. An audio sidecar's frequencies are hundreds of hertz; against a
+    // 7 MHz capture every event would simply miss, and the report would blame
+    // the decoder for a coordinate system.
+    double lowest_hz = std::numeric_limits<double>::infinity();
+    double highest_hz = -std::numeric_limits<double>::infinity();
+    for (const auto& segment : segments) {
+      lowest_hz = std::min(lowest_hz,
+                           segment.frequency_hz - metadata.sample_rate_hz * 0.5);
+      highest_hz = std::max(
+          highest_hz, segment.frequency_hz + metadata.sample_rate_hz * 0.5);
+    }
+    for (const auto& event : annotations->events) {
+      if (event.frequency_hz < lowest_hz || event.frequency_hz > highest_hz) {
+        std::cerr << data_path << ": annotation frequency "
+                  << event.frequency_hz << " Hz lies outside the captured RF "
+                     "span " << lowest_hz << ".." << highest_hz
+                  << " Hz; a capture's annotations are absolute RF\n";
+        return 2;
+      }
+    }
+  }
+
+  if (!source.start()) {
+    std::cerr << data_path << ": " << source.last_error() << '\n';
+    return 1;
+  }
+  CwChannelBank channels;
+  ReplayState state;
+
+  RealtimeSampleBlock block;
+  while (source.read(block, 0ms)) {
+    const auto frame = chain.process(block);
+    // Stamped with the capture position rather than the decoder branch's own
+    // sample count, so an annotation written against the recording and a track
+    // observed through the decimator are on one timeline.
+    const std::uint64_t current_sample =
+        source.position_frames() == 0U ? 0U : source.position_frames() - 1U;
+    if (frame.block != nullptr) {
+      for (const auto& spectrum : frame.spectra) {
+        const auto view = chain.detectorView(spectrum);
+        // Unaveraged bins and no snapshot rebuild, exactly as the live worker
+        // feeds detection: averaging is a display setting and must not decide
+        // which signals are discovered.
+        static_cast<void>(channels.updateSpectrum(
+            spectrum.timestamp_ns, view.lower_frequency_hz,
+            view.upper_frequency_hz, view.bins_dbfs, false));
+      }
+      const auto& published = channels.processSamples(*frame.block);
+      observeBlock(data_path, channels.allTrackDiagnostics(), published,
+                   current_sample,
+                   static_cast<double>(source.position_frames()) /
+                       metadata.sample_rate_hz,
+                   state);
+    }
+    chain.advance();
+  }
+
+  std::cout << "capture_chain path=\"" << data_path << "\" wide_blocks="
+            << chain.wideBlocks() << " accepted_blocks="
+            << chain.acceptedBlocks() << " rejected_blocks="
+            << chain.rejectedBlocks() << " decoder_blocks="
+            << chain.decoderBlocks() << " decoder_samples="
+            << chain.decoderSamples() << " decoder_sample_rate_hz="
+            << chain.decoderSampleRateHz() << " detector_frames="
+            << chain.detectorFrames();
+  // Named, not counted. A capture that retunes into a segment the window does
+  // not cover rejects blocks halfway through an otherwise normal replay, and
+  // "some blocks were refused" does not say whether the window left the
+  // passband or the samples themselves were bad.
+  if (chain.rejectedBlocks() > 0U)
+    std::cout << " rejection=" << blockStatusName(chain.lastRejection());
+  std::cout << '\n';
+  reportDecode(data_path, state, channels, source.duration_seconds());
+  if (annotations != nullptr) {
+    evaluateAnnotations(*annotations, state.observations,
+                        source.total_frames());
+  }
+  return 0;
+}
+
+int replay(const std::string& path,
+           const cwassistant::test::ReceiverAnnotationManifest* annotations,
+           const CaptureReplayRequest& request) {
+  // Either half of a SigMF pair is accepted, because an operator handing over
+  // a capture reaches for whichever name their file browser showed them.
+  if (path.ends_with(".sigmf-data") || path.ends_with(".sigmf-meta"))
+    return replayCapture(path, annotations, request);
+  return replayAudio(path, annotations);
 }
 
 }  // namespace
@@ -541,38 +829,89 @@ void loadShippedDictionaries() {
       read(directory + "/cw-distinctive-tokens.txt")));
 }
 
+// Locale-independent, and refuses anything the whole field is not, so a
+// mistyped frequency becomes a diagnosed argument rather than a silently
+// truncated one.
+bool parseFrequencyArgument(const std::string_view text, double& value) {
+  std::istringstream input{std::string(text)};
+  input.imbue(std::locale::classic());
+  input >> value;
+  return input && input.peek() == std::char_traits<char>::eof() &&
+         std::isfinite(value) && value > 0.0;
+}
+
 }  // namespace
 
 int main(const int argc, char** argv) {
   loadShippedDictionaries();
-  if (argc < 2) {
-    std::cerr << "usage: cwa_capture_replay [--annotations sidecar.tsv] "
-                 "<audio.wav> [audio.wav ...]\n";
-    return 2;
-  }
-  int first_audio = 1;
+  const auto usage = [] {
+    std::cerr << "usage: cwa_capture_replay [--annotations sidecar.tsv]\n"
+                 "                          [--decoder-center-hz <Hz>]\n"
+                 "                          [--decoder-bandwidth-hz <Hz>]\n"
+                 "                          <recording> [recording ...]\n"
+                 "  recording: an audio .wav, or either half of a SigMF pair\n"
+                 "             (.sigmf-data / .sigmf-meta).\n"
+                 "  The decoder window applies to SigMF captures only and\n"
+                 "  defaults to the capture's own centre frequency at "
+              << cwassistant::test::kDefaultIqDecoderBandwidthHz
+              << " Hz wide.\n";
+  };
   cwassistant::test::ReceiverAnnotationManifest annotations;
   const cwassistant::test::ReceiverAnnotationManifest* annotation_pointer =
       nullptr;
-  if (argc >= 4 && std::string_view(argv[1]) == "--annotations") {
-    if (argc != 4) {
-      std::cerr << "annotation mode binds one sidecar to exactly one WAV\n";
+  CaptureReplayRequest request;
+  int index = 1;
+  for (; index < argc; ++index) {
+    const std::string_view argument{argv[index]};
+    if (!argument.starts_with("--")) break;
+    if (index + 1 >= argc) {
+      std::cerr << argument << " needs a value\n";
+      usage();
       return 2;
     }
-    std::ifstream input(argv[2]);
-    std::string error;
-    if (!input.is_open() || !cwassistant::test::parseReceiverAnnotations(
-                                input, annotations, error)) {
-      std::cerr << "annotation sidecar: "
-                << (error.empty() ? "cannot open file" : error) << '\n';
+    const std::string_view value{argv[++index]};
+    if (argument == "--annotations") {
+      std::ifstream input{std::string(value)};
+      std::string error;
+      if (!input.is_open() || !cwassistant::test::parseReceiverAnnotations(
+                                  input, annotations, error)) {
+        std::cerr << "annotation sidecar: "
+                  << (error.empty() ? "cannot open file" : error) << '\n';
+        return 2;
+      }
+      annotation_pointer = &annotations;
+    } else if (argument == "--decoder-center-hz") {
+      if (!parseFrequencyArgument(value, request.center_frequency_hz)) {
+        std::cerr << "--decoder-center-hz: not a frequency: " << value << '\n';
+        return 2;
+      }
+      request.have_center_frequency = true;
+    } else if (argument == "--decoder-bandwidth-hz") {
+      if (!parseFrequencyArgument(value, request.bandwidth_hz)) {
+        std::cerr << "--decoder-bandwidth-hz: not a width: " << value << '\n';
+        return 2;
+      }
+    } else {
+      std::cerr << "unknown option " << argument << '\n';
+      usage();
       return 2;
     }
-    annotation_pointer = &annotations;
-    first_audio = 3;
+  }
+  if (index >= argc) {
+    usage();
+    return 2;
+  }
+  // One sidecar describes one recording: its sample positions and its digest
+  // are both specific to that file.
+  if (annotation_pointer != nullptr && argc - index != 1) {
+    std::cerr << "annotation mode binds one sidecar to exactly one "
+                 "recording\n";
+    return 2;
   }
   int status = 0;
-  for (int index = first_audio; index < argc; ++index) {
-    status = std::max(status, replay(argv[index], annotation_pointer));
+  for (; index < argc; ++index) {
+    status = std::max(status,
+                      replay(argv[index], annotation_pointer, request));
   }
   return status;
 }

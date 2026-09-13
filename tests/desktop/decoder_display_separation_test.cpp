@@ -88,6 +88,102 @@ bool defersManualSelectionUntilSdrSpectrumIsReady(const std::string& source) {
              "emit manualDecoderSelected(static_cast<qulonglong>(channel_id))");
 }
 
+
+// A failure that stopped reception is published as its own property, whole.
+//
+// statusText is a single elided line and always has been; that is right for a
+// running commentary and wrong for a failure. An operator was shown
+//
+//     Live audio error: The selected audio input is un...
+//
+// and the half that got cut -- "unavailable. Reconnect it or select another
+// input." -- is the half that says what to do. A presentation layer cannot be
+// asked to recognise a failure by looking for the word "error" inside prose
+// written for a human, because that guess breaks the first time a message is
+// reworded, so the controller says which failures are blocking.
+//
+// Text-level, because these four sites are lambdas attached to worker signals
+// that only fire when real hardware fails. The two blocking sites a test can
+// reach without a device are asserted behaviourally in
+// spectrum_waterfall_startup_test.cpp.
+bool publishesBlockingFailuresWhole(const std::string& source) {
+  return contains(source, "const QString& ReplayController::blockingError()") &&
+         contains(source, "void ReplayController::setBlockingError(QString message)") &&
+         contains(source, "void ReplayController::dismissBlockingError()") &&
+         contains(source,
+                  "setBlockingError(QStringLiteral(\"WAV replay error: %1\")"
+                  ".arg(message));") &&
+         contains(source,
+                  "setBlockingError(\n                QStringLiteral("
+                  "\"Live audio error: %1\").arg(message));") &&
+         contains(source,
+                  "setBlockingError(\n                QStringLiteral("
+                  "\"Live SDR error: %1\").arg(message));") &&
+         contains(source,
+                  "setBlockingError(QStringLiteral(\n          \"Audio-input "
+                  "permission was denied.") &&
+         contains(source,
+                  "setBlockingError(QStringLiteral(\n        \"Select a "
+                  "discovered SDR device in Settings before starting RX.\"));");
+}
+
+// A refused retune reports something that failed without stopping anything:
+// the receiver is still running on the frequency it was already on. A dialog
+// the operator has to dismiss is itself an interruption, and an error that
+// stopped nothing has not earned one, so this stays on the status line.
+bool leavesNonBlockingFailuresOnTheStatusLine(const std::string& source) {
+  return contains(source,
+                  "setStatus(QStringLiteral(\"Live SDR retune error: %1\")"
+                  ".arg(message));") &&
+         !contains(source,
+                   "setBlockingError(QStringLiteral(\"Live SDR retune error");
+}
+
+// A dismissed failure must not come back on the next unrelated state change,
+// so reception starting successfully clears it -- for a recording that opened,
+// for live audio that started, and for an SDR that started.
+bool clearsBlockingFailureWhenReceptionStarts(const std::string& source) {
+  return contains(source,
+                  "source_loaded_ = true;\n            playing_ = false;\n"
+                  "            blocking_error_.clear();") &&
+         contains(source,
+                  "blocking_error_.clear();\n            status_text_ =\n"
+                  "                QStringLiteral(\"Live RX: %1") &&
+         contains(source,
+                  "blocking_error_.clear();\n            status_text_ = "
+                  "QStringLiteral(\n                \"Live SDR: %1") &&
+         contains(source,
+                  "clearBlockingError();\n  setStatus(QStringLiteral("
+                  "\"Starting live audio from %1") &&
+         contains(source,
+                  "clearBlockingError();\n  setStatus(QStringLiteral("
+                  "\"Starting live SDR from %1");
+}
+
+// The per-channel presentation work must not be redone for a stream whose
+// evidence did not move.
+//
+// rebuildDecoderModels() runs on the GUI thread for every stream on every
+// publish -- 23 publishes a second across 24 streams on the reporting station.
+// It used to scan the whole cumulative transcript for the operator's callsign
+// by splitting it on a freshly compiled pattern, and to rerun the advisory
+// callsign search, on every one of those. The transcript grows for the life of
+// the stream, so the cost grew with it: measured at 2.8 seconds of GUI thread
+// for every second of publishes at 32,000 characters, against a reported
+// freeze of 2.1 seconds. The behavioural guarantees are asserted in
+// spectrum_waterfall_startup_test.cpp; this keeps the two shapes that caused
+// it from being written back.
+bool derivesChannelPresentationThroughTheCache(const std::string& source) {
+  return contains(source, "channel_presentation_.derive(") &&
+         contains(source, "channel_presentation_.setContext(") &&
+         contains(source, "channel_presentation_.endPublish();") &&
+         contains(source, "channel_presentation_.invalidate();") &&
+         !contains(source, "QRegularExpression(QStringLiteral(\"[^A-Z0-9/]+\"))") &&
+         !contains(source,
+                   "if (const auto suggestion = advisoryCallsignPresentation(\n"
+                   "              item,");
+}
+
 }  // namespace
 
 int main() {
@@ -106,6 +202,10 @@ int main() {
   if (!resetsOnlyOnSignalPathChange(replay_controller)) return 7;
   if (!openingDecoderDoesNotStartMonitoring(replay_controller)) return 8;
   if (!defersManualSelectionUntilSdrSpectrumIsReady(live_worker)) return 9;
+  if (!publishesBlockingFailuresWhole(replay_controller)) return 10;
+  if (!leavesNonBlockingFailuresOnTheStatusLine(replay_controller)) return 11;
+  if (!clearsBlockingFailureWhenReceptionStarts(replay_controller)) return 12;
+  if (!derivesChannelPresentationThroughTheCache(replay_controller)) return 13;
 
   return 0;
 }

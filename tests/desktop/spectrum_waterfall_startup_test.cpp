@@ -1,11 +1,16 @@
 #include <QColor>
+#include <QRegularExpression>
+#include <QStringList>
 #include <QGuiApplication>
 #include <QSGNode>
 #include <QTemporaryFile>
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <limits>
 #include <cstdint>
 #include <iterator>
 #include <numbers>
@@ -715,6 +720,439 @@ int testGeneratedChannelPalette() {
   return 0;
 }
 
+namespace {
+
+// A transcript of roughly `characters` characters, of the shape the decoder
+// actually produces: uppercase Morse traffic with the operator's own callsign
+// absent, so the scan has to read the whole thing before answering.
+QString bandTranscript(const int characters) {
+  static const QStringList words = {
+      QStringLiteral("CQ"),     QStringLiteral("DE"),
+      QStringLiteral("TEST"),   QStringLiteral("599"),
+      QStringLiteral("TU"),     QStringLiteral("K"),
+      QStringLiteral("IK2XYZ"), QStringLiteral("W1AW"),
+      QStringLiteral("UR"),     QStringLiteral("RST"),
+      QStringLiteral("QTH"),    QStringLiteral("BK")};
+  QString text;
+  int index = 0;
+  while (text.size() < characters) {
+    text += words.at(index % words.size());
+    text += QLatin1Char(' ');
+    ++index;
+  }
+  return text.left(characters);
+}
+
+QVariantList bandAlternatives(const QString& tail) {
+  QVariantList alternatives;
+  for (int index = 0; index < 4; ++index) {
+    QVariantMap alternative{
+        {QStringLiteral("text"), tail},
+        {QStringLiteral("cost"), 38.0 + 0.2 * index},
+        {QStringLiteral("confidence"), 0.48},
+        {QStringLiteral("firstObservationId"),
+         QVariant::fromValue<qulonglong>(61)},
+        {QStringLiteral("lastObservationId"),
+         QVariant::fromValue<qulonglong>(80)}};
+    alternatives.push_back(alternative);
+  }
+  return alternatives;
+}
+
+QVariantMap bandChannel(const qulonglong id, const int transcript_characters) {
+  return QVariantMap{
+      {QStringLiteral("id"), QVariant::fromValue<qulonglong>(id)},
+      {QStringLiteral("verifiedCw"), true},
+      {QStringLiteral("callsign"), QString{}},
+      {QStringLiteral("text"), bandTranscript(transcript_characters)},
+      {QStringLiteral("refinedText"),
+       bandTranscript(transcript_characters / 4) +
+           QStringLiteral("CQ DE SV2?L? ")},
+      {QStringLiteral("acousticAlternatives"),
+       bandAlternatives(QStringLiteral("SV2HQL AIPX"))}};
+}
+
+// The scan exactly as it was written before this change: uppercase the whole
+// concatenated transcript, split it on a freshly compiled pattern, and compare
+// every token. Kept here as the reference the replacement has to agree with,
+// because "the operator sees the same thing" is a claim about this function's
+// answers and not about how quickly they are produced.
+bool callingOwnStationByTheOldSplit(const QVariantMap& channel,
+                                    const QString& own_callsign) {
+  if (own_callsign.isEmpty()) return false;
+  const QString heard =
+      channel.value(QStringLiteral("text")).toString() + QStringLiteral(" ") +
+      channel.value(QStringLiteral("refinedText")).toString();
+  for (const QString& token : heard.toUpper().split(
+           QRegularExpression(QStringLiteral("[^A-Z0-9/]+")),
+           Qt::SkipEmptyParts)) {
+    if (token == own_callsign) return true;
+  }
+  return false;
+}
+
+// A publish derives the same answers from the same evidence, however many
+// times it is asked.
+//
+// This is the check that guards the 2.1-second GUI freeze the fix addresses.
+// It asserts a count, not a duration: recomputing once for a stream whose
+// evidence never moved is the claim, and a count says that on every machine.
+int testPublishDerivesUnchangedStreamsOnce() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  if (!database.importText("EM90ZMV\nEA1EYL\nSV2HQL\nNV2HQD\n").accepted) {
+    return 120;
+  }
+
+  cwassistant::desktop::DecoderChannelPresentationCache cache;
+  cache.setContext(QStringLiteral("IZ1ABC"), false);
+
+  QVariantMap channel = bandChannel(1, 600);
+  // What the operator is shown, computed the long way, before any answer has
+  // been retained.
+  QString reference_diagnostic;
+  const auto reference = cwassistant::desktop::advisoryCallsignPresentation(
+      channel, database, &reference_diagnostic, false);
+  if (!reference || reference->callsign != QStringLiteral("SV2HQL")) return 121;
+
+  constexpr int kPublishesPerSecond = 23;
+  for (int publish = 0; publish < kPublishesPerSecond; ++publish) {
+    const auto& derived = cache.derive(1, channel, database);
+    cache.endPublish();
+    // Every publish presents the same suggestion, from the same evidence, as
+    // the uncached call above.
+    if (derived.suggestion != reference->callsign ||
+        derived.suggestion_raw_span != reference->raw_span ||
+        derived.suggestion_source != QStringLiteral("offline-directory") ||
+        derived.suggestion_agreeing_alternatives !=
+            reference->agreeing_alternatives ||
+        derived.suggestion_support != reference->acoustic_support ||
+        derived.suggestion_relative_cost != reference->relative_cost ||
+        derived.suggestion_diagnostic != reference_diagnostic ||
+        derived.calling_own_station) {
+      return 122;
+    }
+  }
+  // Twenty-three publishes of a stream that did not change: one derivation.
+  if (cache.computations() != 1U) return 123;
+
+  // A character arrives. The evidence moved, so the answer is computed again.
+  channel.insert(QStringLiteral("text"),
+                 channel.value(QStringLiteral("text")).toString() +
+                     QStringLiteral("E"));
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 2U) return 124;
+
+  // A refinement that rewrites the transcript without changing its length is
+  // still a change. A memo keyed on lengths or observation identifiers would
+  // miss this and keep presenting a suggestion drawn from evidence that no
+  // longer exists.
+  QString rewritten = channel.value(QStringLiteral("text")).toString();
+  rewritten[4] = QLatin1Char('X');
+  channel.insert(QStringLiteral("text"), rewritten);
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 3U) return 125;
+
+  // Changing an acoustic alternative changes the suggestion's evidence even
+  // though both transcripts are untouched.
+  channel.insert(QStringLiteral("acousticAlternatives"),
+                 bandAlternatives(QStringLiteral("NV2HQD AIPX")));
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 4U) return 126;
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 4U) return 127;
+
+  // Operator settings are evidence too. Each of them invalidates every
+  // retained answer, because each of them can change every stream's answer.
+  cache.setContext(QStringLiteral("IZ9ZZZ"), false);
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 5U) return 128;
+  cache.setContext(QStringLiteral("IZ9ZZZ"), true);
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 6U) return 129;
+  cache.setContext(QStringLiteral("IZ9ZZZ"), true);
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 6U) return 130;
+  cache.invalidate();
+  static_cast<void>(cache.derive(1, channel, database));
+  cache.endPublish();
+  if (cache.computations() != 7U) return 131;
+
+  // A stream that stops being published keeps nothing: channel identifiers are
+  // never reissued, so an entry for a departed stream is a leak.
+  if (cache.retainedStreams() != 1U) return 132;
+  static_cast<void>(cache.derive(2, bandChannel(2, 600), database));
+  cache.endPublish();
+  if (cache.retainedStreams() != 1U) return 133;
+  static_cast<void>(cache.derive(1, channel, database));
+  static_cast<void>(cache.derive(2, bandChannel(2, 600), database));
+  cache.endPublish();
+  if (cache.retainedStreams() != 2U) return 134;
+  return 0;
+}
+
+// The replacement for the transcript split answers exactly what the split
+// answered, on the shapes that actually turn up in a transcript.
+int testOwnStationScanMatchesTheReplacedSplit() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  const QString own = QStringLiteral("IZ1ABC");
+  const QStringList transcripts = {
+      QStringLiteral(""),
+      QStringLiteral("IZ1ABC"),
+      QStringLiteral("CQ DE IZ1ABC K"),
+      QStringLiteral("IZ1ABC DE W1AW"),
+      QStringLiteral("W1AW DE IZ1ABC"),
+      // A longer token that merely contains the callsign is not a call.
+      QStringLiteral("CQ XIZ1ABC K"),
+      QStringLiteral("CQ IZ1ABCD K"),
+      QStringLiteral("CQ IZ1ABC/P K"),
+      QStringLiteral("CQ IZ1AB K"),
+      // Punctuation and line breaks are separators on both sides.
+      QStringLiteral("CQ,IZ1ABC.K"),
+      QStringLiteral("CQ\nIZ1ABC\tK"),
+      QStringLiteral("? IZ1ABC ?"),
+      QStringLiteral("IZ1AB IZ1ABC"),
+      QStringLiteral("IZ1ABX IZ1ABC"),
+      QStringLiteral("IZ1ABCX IZ1ABC"),
+      // A near miss that shares a prefix must not be smuggled in by a scan
+      // that forgets it has already diverged.
+      QStringLiteral("IZ1ABZZZZ"),
+      QStringLiteral("IZ1"),
+      // The decoder emits uppercase; an operator-edited note need not.
+      QStringLiteral("cq de iz1abc k"),
+      QStringLiteral("de Iz1AbC"),
+      bandTranscript(4'000),
+      bandTranscript(4'000) + QStringLiteral(" IZ1ABC")};
+  for (const QString& text : transcripts) {
+    for (const QString& refined : transcripts) {
+      QVariantMap channel{
+          {QStringLiteral("id"), QVariant::fromValue<qulonglong>(9)},
+          {QStringLiteral("verifiedCw"), true},
+          {QStringLiteral("callsign"), QString{}},
+          {QStringLiteral("text"), text},
+          {QStringLiteral("refinedText"), refined},
+          {QStringLiteral("acousticAlternatives"), QVariantList{}}};
+      cwassistant::desktop::DecoderChannelPresentationCache cache;
+      cache.setContext(own, false);
+      const bool derived =
+          cache.derive(9, channel, database).calling_own_station;
+      if (derived != callingOwnStationByTheOldSplit(channel, own)) return 140;
+    }
+  }
+  // No configured callsign is nobody calling, however suggestive the text.
+  QVariantMap channel{
+      {QStringLiteral("id"), QVariant::fromValue<qulonglong>(9)},
+      {QStringLiteral("verifiedCw"), true},
+      {QStringLiteral("callsign"), QString{}},
+      {QStringLiteral("text"), QStringLiteral("CQ DE IZ1ABC K")},
+      {QStringLiteral("refinedText"), QString{}},
+      {QStringLiteral("acousticAlternatives"), QVariantList{}}};
+  cwassistant::desktop::DecoderChannelPresentationCache cache;
+  cache.setContext(QString{}, false);
+  if (cache.derive(9, channel, database).calling_own_station) return 141;
+  return 0;
+}
+
+// A retained answer is not a fresh directory search.
+//
+// A count of derivations already says the search cannot have run twice, but it
+// says so by trusting that the search lives inside a derivation. This shows it
+// directly: the directory is given the entry the suggestion would match, which
+// is a change that a search must notice and a retained answer cannot. The
+// caller is the one that says when the directory moved -- that is what
+// invalidate() is -- so not calling it here is exactly the question being
+// asked.
+int testRetainedSuggestionDoesNotSearchTheDirectory() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  if (!database.importText("EA1EYL\n").accepted) return 150;
+  cwassistant::desktop::DecoderChannelPresentationCache cache;
+  cache.setContext(QStringLiteral("IZ1ABC"), false);
+
+  const QVariantMap channel = bandChannel(11, 600);
+  const auto& first = cache.derive(11, channel, database);
+  cache.endPublish();
+  if (first.suggestion != QStringLiteral("SV2HQL") ||
+      first.suggestion_source != QStringLiteral("acoustic-consensus") ||
+      cache.computations() != 1U) {
+    return 151;
+  }
+
+  // SV2HQL is now listed. A search would say so; the retained answer cannot.
+  if (!database.importText("SV2HQL\n").accepted) return 152;
+  const auto& retained = cache.derive(11, channel, database);
+  cache.endPublish();
+  if (retained.suggestion_source != QStringLiteral("acoustic-consensus") ||
+      cache.computations() != 1U) {
+    return 153;
+  }
+
+  // Told that the directory moved, the next publish searches it again and the
+  // answer changes -- which is what makes the check above meaningful rather
+  // than a test of a stream that was never going to match anything.
+  cache.invalidate();
+  const auto& researched = cache.derive(11, channel, database);
+  cache.endPublish();
+  if (researched.suggestion != QStringLiteral("SV2HQL") ||
+      researched.suggestion_source != QStringLiteral("offline-directory") ||
+      cache.computations() != 2U) {
+    return 154;
+  }
+  return 0;
+}
+
+// The transcript scan that replaced the split does not cost what the split
+// cost, on the transcript length the fault was reported at.
+//
+// This is the one duration worth asserting, and it is asserted as a ratio
+// between the two implementations of the same question, measured back to back
+// on the same data on whatever machine is running. Both sides walk a
+// transcript character by character, so it is a comparison of two scans and
+// not of an optimizer's mood: the split uppercases a copy of the whole
+// transcript, compiles a pattern and allocates a QString per token, and the
+// replacement allocates nothing.
+//
+// The stream is left unverified so that the advisory search declines
+// immediately and what is being timed is the scan.
+int testTranscriptScanIsNoLongerProportionalToTheSplit() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  const QString own = QStringLiteral("IZ1ABC");
+  constexpr int kStreams = 48;
+  constexpr int kTranscriptCharacters = 32'000;
+
+  // Each stream gets its own transcript, built up front, so neither side pays
+  // for constructing its input and neither can reuse the other's cache line.
+  std::vector<QVariantMap> streams;
+  streams.reserve(kStreams);
+  for (int index = 0; index < kStreams; ++index) {
+    QVariantMap channel = bandChannel(static_cast<qulonglong>(700 + index),
+                                      kTranscriptCharacters);
+    channel.insert(QStringLiteral("verifiedCw"), false);
+    channel.insert(QStringLiteral("text"),
+                   channel.value(QStringLiteral("text")).toString() +
+                       QString::number(index));
+    streams.push_back(channel);
+  }
+
+  double split_seconds = std::numeric_limits<double>::infinity();
+  double scan_seconds = std::numeric_limits<double>::infinity();
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    auto started = std::chrono::steady_clock::now();
+    int found = 0;
+    for (const QVariantMap& channel : streams) {
+      if (callingOwnStationByTheOldSplit(channel, own)) ++found;
+    }
+    split_seconds = std::min(
+        split_seconds, std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - started).count());
+    if (found != 0) return 160;
+
+    cwassistant::desktop::DecoderChannelPresentationCache cache;
+    cache.setContext(own, false);
+    started = std::chrono::steady_clock::now();
+    for (int index = 0; index < kStreams; ++index) {
+      if (cache.derive(static_cast<qulonglong>(700 + index), streams[index],
+                       database)
+              .calling_own_station) {
+        ++found;
+      }
+    }
+    scan_seconds = std::min(
+        scan_seconds, std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - started).count());
+    if (found != 0 || cache.computations() != kStreams) return 161;
+  }
+  if (!(split_seconds > 0.0) || !(scan_seconds > 0.0)) return 162;
+
+  const double ratio = split_seconds / scan_seconds;
+  // The replacement has to stay at least eight times cheaper to be worth
+  // having. The bound sits well below what an optimized build measures --
+  // between 34 and 38 across runs here -- because the point is which of the
+  // two scans is running and not how fast this computer is; a bound set just
+  // under the observed number would be the calibrated-on-one-machine mistake.
+  constexpr double kBound = 8.0;
+#ifdef NDEBUG
+  if (ratio < kBound) {
+    std::fprintf(stderr,
+                 "the replaced split cost %.3f ms and its replacement %.3f ms "
+                 "over %d transcripts of %d characters, ratio %.1f "
+                 "(bound %.1f)\n",
+                 split_seconds * 1e3, scan_seconds * 1e3, kStreams,
+                 kTranscriptCharacters, ratio, kBound);
+    return 163;
+  }
+#else
+  // Asserted only in an optimized build, and that is a statement about what
+  // can honestly be measured rather than a convenience. The two sides are not
+  // taxed alike by an unoptimized build: the split is a character loop inside
+  // Qt, compiled once and shipped in the library either way, while the
+  // replacement is reached through the cache and pays for unelided container
+  // lookups and unpropagated constants that the shipped code does not have.
+  // Measured across runs here: optimized, 34 to 38; unoptimized, 6.5 to 7.0,
+  // below any bound worth asserting although the same source is running. The
+  // claim is about the code that ships and continuous integration builds
+  // Release. Reported either way so a developer can watch the number move, and
+  // the derivation count in testPublishDerivesUnchangedStreamsOnce() guards
+  // the other half of the fix in every build with no clock at all.
+  std::fprintf(stderr,
+               "the replaced split cost %.3f ms and its replacement %.3f ms "
+               "over %d transcripts of %d characters, ratio %.1f (bound %.1f, "
+               "not asserted in an unoptimized build)\n",
+               split_seconds * 1e3, scan_seconds * 1e3, kStreams,
+               kTranscriptCharacters, ratio, kBound);
+#endif
+  return 0;
+}
+
+// A failure that stopped reception has to reach the operator whole.
+//
+// statusText is one elided line. An operator was shown "Live audio error: The
+// selected audio input is un..." and lost the half that says what to do, so
+// the full text is published separately for a dialog to present. The two
+// reachable blocking sites are driven here; the rest are worker-signal
+// callbacks that need real hardware to fail, and are covered as a source
+// contract in decoder_display_separation_test.cpp.
+int testBlockingErrorsArePublishedWhole() {
+  cwassistant::desktop::ReplayController controller;
+  if (!controller.blockingError().isEmpty()) return 160;
+
+  // Start RX with no SDR chosen: reception cannot start.
+  controller.startLiveSdr();
+  const QString expected_sdr = QStringLiteral(
+      "Select a discovered SDR device in Settings before starting RX.");
+  if (controller.blockingError() != expected_sdr ||
+      controller.statusText() != expected_sdr) {
+    return 161;
+  }
+  // The status line keeps the message; only the dialog is dismissed.
+  controller.dismissBlockingError();
+  if (!controller.blockingError().isEmpty() ||
+      controller.statusText() != expected_sdr) {
+    return 162;
+  }
+
+  controller.openFile(QUrl(QStringLiteral("https://example.invalid/x.wav")));
+  const QString expected_wav = QStringLiteral("Select a local WAV file.");
+  if (controller.blockingError() != expected_wav ||
+      controller.statusText() != expected_wav) {
+    return 163;
+  }
+  // Asking for a source again clears the previous failure, so a dialog the
+  // operator has already answered cannot return on an unrelated update.
+  controller.openFile(QUrl::fromLocalFile(
+      QStringLiteral("/nonexistent/cw-buddy-lane-k-probe.wav")));
+  if (!controller.blockingError().isEmpty()) return 164;
+  return 0;
+}
+
+
+}  // namespace
+
 int main(int argc, char* argv[]) {
   QGuiApplication application(argc, argv);
   if (const int palette_failure = testGeneratedChannelPalette();
@@ -744,6 +1182,28 @@ int main(int argc, char* argv[]) {
     return vfo_failure;
   }
   if (!testLocalCharacterFrontendBank()) return 21;
+    if (const int publish_failure = testPublishDerivesUnchangedStreamsOnce();
+      publish_failure != 0) {
+    return publish_failure;
+  }
+    if (const int scan_failure = testOwnStationScanMatchesTheReplacedSplit();
+      scan_failure != 0) {
+    return scan_failure;
+  }
+    if (const int directory_failure =
+          testRetainedSuggestionDoesNotSearchTheDirectory();
+      directory_failure != 0) {
+    return directory_failure;
+  }
+  if (const int scan_cost_failure =
+          testTranscriptScanIsNoLongerProportionalToTheSplit();
+      scan_cost_failure != 0) {
+    return scan_cost_failure;
+  }
+    if (const int blocking_failure = testBlockingErrorsArePublishedWhole();
+      blocking_failure != 0) {
+    return blocking_failure;
+  }
   cwassistant::desktop::ReplayController frequency_mapping;
   frequency_mapping.setSourceMode(0);
   frequency_mapping.setRadioFrequencyContext(

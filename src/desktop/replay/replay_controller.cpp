@@ -1,6 +1,5 @@
 #include "replay_controller.hpp"
 
-#include <QRegularExpression>
 #include <QAudioDevice>
 #include <QAudioFormat>
 #include <QAudioSink>
@@ -27,6 +26,7 @@
 #include <cmath>
 #include <limits>
 #include <map>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -508,6 +508,174 @@ std::optional<AdvisoryCallsignPresentation> advisoryCallsignPresentation(
   };
 }
 
+namespace {
+
+// Whether `text` contains `own_callsign` as a whole token, a token being a
+// maximal run of letters, digits and '/'.
+//
+// This asks the question the published transcript scan has always asked. It
+// used to be asked as
+//
+//   heard.toUpper().split(QRegularExpression("[^A-Z0-9/]+"), SkipEmptyParts)
+//
+// which answers it by uppercasing a copy of the entire cumulative transcript,
+// compiling a pattern, and allocating one QString per token of a string that
+// grows for the life of the stream. What costs is the walk, not the pattern:
+// constructing the QRegularExpression measures 7 us against the 1,300 us the
+// split itself costs on an 8,000-character transcript, so hoisting it out of
+// the loop -- the obvious fix -- would have recovered half a percent.
+//
+// The expense is that the walk is proportional to a transcript with no bound
+// on it, which is what turned a working application into a frozen one after an
+// hour on a busy band. The scan below allocates nothing and reads each
+// character once. Measured in an optimized build over 48 transcripts of 32,000
+// characters, the split costs 1.5 ms each and this costs 41 us, and
+// spectrum_waterfall_startup_test.cpp holds that ratio to the two
+// implementations rather than to a duration.
+//
+// Token boundaries are identical to the pattern's for every input the decoder
+// can produce. The one divergence is a character whose Unicode uppercase
+// expands to more than one ASCII character -- 'ß' uppercases to "SS", which
+// the split would have treated as two token characters and this treats as a
+// separator. Neither side can contain one: the transcript is assembled from
+// the Morse alphabet, which is ASCII, and own_callsign_ is a callsign.
+[[nodiscard]] bool mentionsCallsignToken(const QStringView text,
+                                         const QStringView own_callsign)
+    noexcept {
+  if (own_callsign.isEmpty()) return false;
+  qsizetype matched = 0;
+  // The token being read has already diverged from the callsign, so the rest
+  // of it need not be compared -- only its end matters.
+  bool diverged = false;
+  for (const QChar character : text) {
+    const char16_t value = character.unicode();
+    const char16_t upper = (value >= u'a' && value <= u'z')
+        ? static_cast<char16_t>(value - u'a' + u'A')
+        : value;
+    const bool inside_token = (upper >= u'A' && upper <= u'Z') ||
+                              (upper >= u'0' && upper <= u'9') ||
+                              upper == u'/';
+    if (!inside_token) {
+      if (!diverged && matched == own_callsign.size()) return true;
+      matched = 0;
+      diverged = false;
+      continue;
+    }
+    if (diverged) continue;
+    if (matched < own_callsign.size() &&
+        own_callsign[matched].unicode() == upper) {
+      ++matched;
+    } else {
+      diverged = true;
+    }
+  }
+  return !diverged && matched == own_callsign.size();
+}
+
+}  // namespace
+
+void DecoderChannelPresentationCache::setContext(
+    const QString& own_callsign, const bool allow_database_correction) {
+  if (own_callsign_ == own_callsign &&
+      allow_database_correction_ == allow_database_correction) {
+    return;
+  }
+  own_callsign_ = own_callsign;
+  allow_database_correction_ = allow_database_correction;
+  entries_.clear();
+}
+
+void DecoderChannelPresentationCache::invalidate() noexcept {
+  entries_.clear();
+}
+
+const DecoderChannelPresentationCache::Derived&
+DecoderChannelPresentationCache::derive(
+    const qulonglong channel_id, const QVariantMap& channel,
+    const cwassistant::core::OfflineCallsignDatabase& database) {
+  const QString text = channel.value(QStringLiteral("text")).toString();
+  const QString refined_text =
+      channel.value(QStringLiteral("refinedText")).toString();
+  const QString callsign = channel.value(QStringLiteral("callsign")).toString();
+  const QVariantList acoustic_alternatives =
+      channel.value(QStringLiteral("acousticAlternatives")).toList();
+  const bool verified_cw = channel.value(QStringLiteral("verifiedCw")).toBool();
+
+  Entry& entry = entries_[channel_id];
+  entry.publish = publish_;
+  // Compared in the order most likely to differ first, so a stream that is
+  // actively decoding is recognised as changed without comparing the rest.
+  // Equal QStrings still cost a compare of their contents, which is the price
+  // of an exact answer: a memo keyed on lengths or observation identifiers
+  // would miss a refinement that rewrites a transcript without changing its
+  // length, and would then show the operator a suggestion drawn from evidence
+  // that no longer exists.
+  if (entry.valid && entry.text == text && entry.refined_text == refined_text &&
+      entry.verified_cw == verified_cw && entry.callsign == callsign &&
+      entry.acoustic_alternatives == acoustic_alternatives) {
+    return entry.derived;
+  }
+
+  ++computations_;
+  entry.text = text;
+  entry.refined_text = refined_text;
+  entry.callsign = callsign;
+  entry.acoustic_alternatives = acoustic_alternatives;
+  entry.verified_cw = verified_cw;
+  entry.valid = true;
+  entry.derived = Derived{};
+
+  // Somebody is calling the operator on this stream. Detected on the spectrum
+  // model rather than only on an opened card, because the operator has to
+  // notice it before deciding which stream to open -- an alert that only
+  // appears once the card is already open cannot draw attention to a call the
+  // operator has not found yet.
+  //
+  // The two transcripts are scanned separately rather than concatenated: a
+  // token cannot span the separator the concatenation inserted, so the answer
+  // is the same and the copy is not made.
+  entry.derived.calling_own_station =
+      !own_callsign_.isEmpty() &&
+      (mentionsCallsignToken(text, own_callsign_) ||
+       mentionsCallsignToken(refined_text, own_callsign_));
+
+  // Whether a confirmed callsign appears in the operator's offline list. The
+  // operator needs to tell a callsign the directory corroborates from one that
+  // was only heard; both are legitimate, and an unlisted station is common, so
+  // this reports corroboration rather than correctness.
+  entry.derived.callsign_in_database =
+      !callsign.isEmpty() && database.size() > 0U &&
+      database.contains(callsign.toStdString());
+
+  entry.derived.suggestion_diagnostic = QStringLiteral("not-evaluated");
+  if (!callsign.isEmpty()) {
+    entry.derived.suggestion_diagnostic =
+        QStringLiteral("callsign-already-confirmed");
+    return entry.derived;
+  }
+  if (const auto suggestion = advisoryCallsignPresentation(
+          channel, database, &entry.derived.suggestion_diagnostic,
+          allow_database_correction_)) {
+    entry.derived.suggestion = suggestion->callsign;
+    entry.derived.suggestion_raw_span = suggestion->raw_span;
+    entry.derived.suggestion_source = suggestion->database_match
+        ? QStringLiteral("offline-directory")
+        : QStringLiteral("acoustic-consensus");
+    entry.derived.suggestion_agreeing_alternatives =
+        suggestion->agreeing_alternatives;
+    entry.derived.suggestion_support = suggestion->acoustic_support;
+    entry.derived.suggestion_relative_cost = suggestion->relative_cost;
+  }
+  return entry.derived;
+}
+
+void DecoderChannelPresentationCache::endPublish() noexcept {
+  std::erase_if(entries_, [this](const auto& item) {
+    return item.second.publish != publish_;
+  });
+  ++publish_;
+}
+
 class ReplayWorker final : public QObject {
   Q_OBJECT
 
@@ -891,6 +1059,7 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
             position_seconds_ = 0.0;
             source_loaded_ = true;
             playing_ = false;
+            blocking_error_.clear();
             status_text_ = QStringLiteral("Ready: %1 • %2 Hz • %3 s")
                                .arg(name)
                                .arg(sample_rate, 0, 'f', 0)
@@ -901,7 +1070,7 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
   connect(worker, &ReplayWorker::failed, this, [this](const QString& message) {
     source_loaded_ = false;
     playing_ = false;
-    setStatus(QStringLiteral("WAV replay error: %1").arg(message));
+    setBlockingError(QStringLiteral("WAV replay error: %1").arg(message));
   });
   connect(worker, &ReplayWorker::playbackChanged, this,
           [this](const bool playing) {
@@ -1038,6 +1207,7 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
             input_overruns_ = 0;
             live_capturing_ = true;
             rebuildDecoderModels();
+            blocking_error_.clear();
             status_text_ =
                 QStringLiteral("Live RX: %1 • %2 Hz • %3 channel(s)")
                     .arg(name)
@@ -1058,7 +1228,8 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
             live_capturing_ = false;
             rebuildDecoderModels();
             emit liveDspStopRequested();
-            setStatus(QStringLiteral("Live audio error: %1").arg(message));
+            setBlockingError(
+                QStringLiteral("Live audio error: %1").arg(message));
           });
   connect(capture_worker, &LiveAudioCaptureWorker::overrunCountChanged, this,
           [this](const qulonglong count) {
@@ -1081,6 +1252,7 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
             input_overruns_ = 0;
             live_capturing_ = true;
             rebuildDecoderModels();
+            blocking_error_.clear();
             status_text_ = QStringLiteral(
                 "Live SDR: %1 • center %2 Hz • %3 S/s • %4 Hz RF • %5")
                 .arg(source_name_)
@@ -1115,7 +1287,8 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
             live_capturing_ = false;
             rebuildDecoderModels();
             emit liveDspStopRequested();
-            setStatus(QStringLiteral("Live SDR error: %1").arg(message));
+            setBlockingError(
+                QStringLiteral("Live SDR error: %1").arg(message));
           });
   connect(sdr_worker, &SdrCaptureWorker::diagnosticsChanged, this,
           [this](const qulonglong source_overruns,
@@ -1391,6 +1564,9 @@ void ReplayController::configureLocalCharacterDecoder(
 void ReplayController::configureOfflineCallsignDatabase(
     const bool enabled, const QString& database_path) {
   offline_callsign_database_.clear();
+  // Every retained suggestion was derived against the directory that is about
+  // to be replaced, so none of them are answers to the current question.
+  channel_presentation_.invalidate();
   if (!enabled) {
     offline_callsign_database_state_ = QStringLiteral("disabled");
     offline_callsign_database_status_ =
@@ -1538,6 +1714,8 @@ void ReplayController::acceptDecoderChannels(const QVariantList& channels) {
 
 void ReplayController::rebuildDecoderModels() {
   const QVariantList previous_sessions = decoder_sessions_;
+  channel_presentation_.setContext(own_callsign_,
+                                   callsign_database_correction_enabled_);
   decoder_channels_.clear();
   QHash<qulonglong, QVariantMap> by_id;
   const bool mapped_audio_rf = radio_frequency_available_ &&
@@ -1601,71 +1779,38 @@ void ReplayController::rebuildDecoderModels() {
       item.insert(QStringLiteral("localModelCallsign"), QString{});
     }
 
-    // Whether a confirmed callsign appears in the operator's offline list. The
-    // operator needs to tell a callsign the directory corroborates from one
-    // that was only heard; both are legitimate, and an unlisted station is
-    // common, so this reports corroboration rather than correctness.
-    const QString confirmed_callsign =
-        item.value(QStringLiteral("callsign")).toString();
+    // The own-callsign scan and the advisory suggestion both derive from this
+    // stream's transcripts, its confirmed callsign and its acoustic
+    // alternatives, and nothing else. Deriving them here, on the thread that
+    // draws, for every stream on every publish, is what blocked the GUI event
+    // loop for up to 2.1 seconds on a busy band. The cache returns the same
+    // values from the same evidence and recomputes only when the evidence
+    // moves.
+    const auto& derived = channel_presentation_.derive(
+        id, item, offline_callsign_database_);
     item.insert(QStringLiteral("callsignInDatabase"),
-                !confirmed_callsign.isEmpty() &&
-                    offline_callsign_database_.size() > 0U &&
-                    offline_callsign_database_.contains(
-                        confirmed_callsign.toStdString()));
+                derived.callsign_in_database);
     item.insert(QStringLiteral("callsignDatabaseLoaded"),
                 offline_callsign_database_.size() > 0U);
-    // Somebody is calling the operator on this stream. Detected on the
-    // spectrum model rather than only on an opened card, because the operator
-    // has to notice it before deciding which stream to open -- an alert that
-    // only appears once the card is already open cannot draw attention to a
-    // call the operator has not found yet.
-    bool calling_own_station = false;
-    if (!own_callsign_.isEmpty()) {
-      const QString heard =
-          item.value(QStringLiteral("text")).toString() + QStringLiteral(" ") +
-          item.value(QStringLiteral("refinedText")).toString();
-      for (const QString& token :
-           heard.toUpper().split(QRegularExpression(QStringLiteral("[^A-Z0-9/]+")),
-                                 Qt::SkipEmptyParts)) {
-        if (token == own_callsign_) {
-          calling_own_station = true;
-          break;
-        }
-      }
-    }
-    item.insert(QStringLiteral("callingOwnStation"), calling_own_station);
-    item.insert(QStringLiteral("callsignSuggestion"), QString{});
-    item.insert(QStringLiteral("callsignSuggestionRawSpan"), QString{});
-    item.insert(QStringLiteral("callsignSuggestionSource"), QString{});
-    item.insert(QStringLiteral("callsignSuggestionAgreeingAlternatives"), 0);
-    item.insert(QStringLiteral("callsignSuggestionSupport"), 0.0);
-    item.insert(QStringLiteral("callsignSuggestionRelativeCost"), 0.0);
-    QString suggestion_diagnostic = QStringLiteral("not-evaluated");
-    if (item.value(QStringLiteral("callsign")).toString().isEmpty()) {
-      if (const auto suggestion = advisoryCallsignPresentation(
-              item, offline_callsign_database_, &suggestion_diagnostic,
-              callsign_database_correction_enabled_)) {
-        item.insert(QStringLiteral("callsignSuggestion"), suggestion->callsign);
-        item.insert(QStringLiteral("callsignSuggestionRawSpan"), suggestion->raw_span);
-        item.insert(QStringLiteral("callsignSuggestionSource"),
-                    suggestion->database_match
-                        ? QStringLiteral("offline-directory")
-                        : QStringLiteral("acoustic-consensus"));
-        item.insert(QStringLiteral("callsignSuggestionAgreeingAlternatives"),
-                    suggestion->agreeing_alternatives);
-        item.insert(QStringLiteral("callsignSuggestionSupport"),
-                    suggestion->acoustic_support);
-        item.insert(QStringLiteral("callsignSuggestionRelativeCost"),
-                    suggestion->relative_cost);
-      }
-    } else {
-      suggestion_diagnostic = QStringLiteral("callsign-already-confirmed");
-    }
+    item.insert(QStringLiteral("callingOwnStation"),
+                derived.calling_own_station);
+    item.insert(QStringLiteral("callsignSuggestion"), derived.suggestion);
+    item.insert(QStringLiteral("callsignSuggestionRawSpan"),
+                derived.suggestion_raw_span);
+    item.insert(QStringLiteral("callsignSuggestionSource"),
+                derived.suggestion_source);
+    item.insert(QStringLiteral("callsignSuggestionAgreeingAlternatives"),
+                derived.suggestion_agreeing_alternatives);
+    item.insert(QStringLiteral("callsignSuggestionSupport"),
+                derived.suggestion_support);
+    item.insert(QStringLiteral("callsignSuggestionRelativeCost"),
+                derived.suggestion_relative_cost);
     item.insert(QStringLiteral("callsignSuggestionDiagnostic"),
-                suggestion_diagnostic);
+                derived.suggestion_diagnostic);
     decoder_channels_.push_back(item);
     by_id.insert(id, item);
   }
+  channel_presentation_.endPublish();
   decoder_session_order_ = reconcileDecoderSessionOrder(
       decoder_session_order_, previous_sessions, decoder_channels_);
   for (QVariant& value : decoder_channels_) {
@@ -2513,8 +2658,9 @@ void ReplayController::setSdrInputSelection(
 void ReplayController::openFile(const QUrl& url) {
   setSourceMode(1);
   const QString path = url.isLocalFile() ? url.toLocalFile() : QString{};
+  clearBlockingError();
   if (path.isEmpty()) {
-    setStatus(QStringLiteral("Select a local WAV file."));
+    setBlockingError(QStringLiteral("Select a local WAV file."));
     return;
   }
   source_loaded_ = false;
@@ -2548,7 +2694,7 @@ void ReplayController::startLiveAudio() {
           [this](const QPermission&) { startLiveAudio(); });
       return;
     case Qt::PermissionStatus::Denied:
-      setStatus(QStringLiteral(
+      setBlockingError(QStringLiteral(
           "Audio-input permission was denied. Enable microphone access in the operating-system privacy settings."));
       return;
     case Qt::PermissionStatus::Granted:
@@ -2569,6 +2715,7 @@ void ReplayController::beginLiveAudioCapture() {
   source_loaded_ = false;
   input_overruns_ = 0;
   emit sourceReset();
+  clearBlockingError();
   setStatus(QStringLiteral("Starting live audio from %1…").arg(audio_input_name_));
   publishSpectrumConfiguration();
   emit liveDspStartRequested();
@@ -2577,7 +2724,7 @@ void ReplayController::beginLiveAudioCapture() {
 
 void ReplayController::beginLiveSdrCapture() {
   if (sdr_device_id_.isEmpty()) {
-    setStatus(QStringLiteral(
+    setBlockingError(QStringLiteral(
         "Select a discovered SDR device in Settings before starting RX."));
     return;
   }
@@ -2588,6 +2735,7 @@ void ReplayController::beginLiveSdrCapture() {
   live_capturing_ = false;
   input_overruns_ = 0;
   emit sourceReset();
+  clearBlockingError();
   setStatus(QStringLiteral("Starting live SDR from %1…").arg(sdr_device_name_));
   publishSpectrumConfiguration();
   emit liveDspStartRequested();
@@ -2650,6 +2798,23 @@ void ReplayController::setStatus(QString status) {
   status_text_ = std::move(status);
   emit stateChanged();
 }
+
+const QString& ReplayController::blockingError() const noexcept {
+  return blocking_error_;
+}
+
+void ReplayController::setBlockingError(QString message) {
+  blocking_error_ = message;
+  setStatus(std::move(message));
+}
+
+void ReplayController::clearBlockingError() {
+  if (blocking_error_.isEmpty()) return;
+  blocking_error_.clear();
+  emit stateChanged();
+}
+
+void ReplayController::dismissBlockingError() { clearBlockingError(); }
 
 }  // namespace cwassistant::desktop
 
