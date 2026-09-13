@@ -364,7 +364,13 @@ if(CWA_BUILD_TESTS)
     COMMAND cwa_desktop_render_startup_test)
   set_tests_properties(cwa_desktop_render_startup_test PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software"
-    TIMEOUT 10)
+    # Thirty seconds against a test that takes about three and a half. The
+    # margin is for contention, not for the test: a developer running the suite
+    # with -j8 gives every test a fraction of a core, and ten seconds was close
+    # enough to the contended runtime to fail for that reason alone. A timeout
+    # is here to catch a hang, and thirty seconds catches one just as well as
+    # ten while no longer reporting a busy machine as a fault.
+    TIMEOUT 30)
 
   add_test(NAME cwa_desktop_qml_startup_smoke
     COMMAND cw-buddy-desktop --profile ci-smoke --smoke-test)
