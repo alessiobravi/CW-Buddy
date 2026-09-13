@@ -2742,6 +2742,10 @@ void ReplayController::beginLiveAudioCapture() {
   setStatus(QStringLiteral("Starting live audio from %1…").arg(audio_input_name_));
   publishSpectrumConfiguration();
   emit liveDspStartRequested();
+  // After liveDspStartRequested(), for the reason given on the SDR path: the
+  // monitor is a demand the worker has to be holding, and a start is where it
+  // must be restated.
+  publishMonitorConfiguration();
   emit liveStartRequested(audio_input_id_, audio_input_device_name_);
 }
 
@@ -2766,6 +2770,19 @@ void ReplayController::beginLiveSdrCapture() {
   // the decimator's stream state; the window has to be the first thing the
   // freshly started worker is told.
   publishSdrDecoderWindow();
+  // And the monitor with it. Every other setting the DSP worker needs is
+  // restated here -- the spectrum configuration above, the decode window on
+  // the line before -- and the monitor was the one that was not, so the only
+  // thing that ever put a monitor mode into that worker was the operator
+  // happening to press a listen control after it had started. Nothing
+  // reconciled the two copies at a start, which is precisely where they can
+  // part company: start() clears the region demodulator, the in-flight count
+  // and the sample counters, so whatever demand the controller is holding has
+  // to be said again on the other side of it. Cheap -- one queued call
+  // carrying three scalars -- and it makes the controller, not the order in
+  // which an operator happened to press things, the authority on what this
+  // station is listening to.
+  publishMonitorConfiguration();
   emit sdrStartRequested(sdr_device_id_,
                          static_cast<double>(sdr_center_frequency_hz_),
                          static_cast<double>(sdr_sample_rate_hz_),

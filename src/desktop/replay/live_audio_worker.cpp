@@ -730,7 +730,39 @@ QJsonObject LiveAudioDspWorker::buildDiagnosticsRecord(
                       static_cast<qint64>(region_audio_samples_));
   region_audio.insert(QStringLiteral("droppedBuffers"),
                       static_cast<qint64>(dropped_region_audio_buffers_));
+  // The three terms of `wanted`, written out beside it. `wanted:false` on a
+  // station whose operator is pressing the region-listen control says only
+  // that none of the three is set; which one was expected to be, and is not,
+  // is the whole question, and answering it has cost a round trip to the
+  // station rather than being readable off the record. `monitorMode` in
+  // particular is the mode as THIS worker has it, which is the only place the
+  // controller's copy can be checked against.
+  region_audio.insert(QStringLiteral("monitorMode"), monitor_mode_);
+  region_audio.insert(QStringLiteral("remoteAudioSubscribed"),
+                      remote_audio_subscribed_);
+  region_audio.insert(QStringLiteral("captureActive"), capture_active_);
   root.insert(QStringLiteral("regionAudio"), region_audio);
+
+  // The decode region as THIS worker has it, which is not the same question as
+  // what the settings hold. Two of them, deliberately: `requested` is the last
+  // window the controller published, `applied` is the one the channelizer
+  // actually accepted and is carving out of the receiver right now. They
+  // differ whenever a window was refused -- a slice outside the acquired
+  // passband is left unapplied on purpose so the next block can retry -- and
+  // that difference is invisible from the settings side, which only ever sees
+  // the request. Scalars already in hand, so the record costs nothing to
+  // carry them.
+  QJsonObject decoder_window;
+  decoder_window.insert(QStringLiteral("requestedCenterHz"),
+                        sdr_decoder_center_frequency_hz_);
+  decoder_window.insert(QStringLiteral("requestedBandwidthHz"),
+                        sdr_decoder_bandwidth_hz_);
+  decoder_window.insert(QStringLiteral("appliedCenterHz"),
+                        applied_sdr_decoder_center_frequency_hz_);
+  decoder_window.insert(QStringLiteral("appliedBandwidthHz"),
+                        applied_sdr_decoder_bandwidth_hz_);
+  decoder_window.insert(QStringLiteral("inForce"), sdr_decoder_window_applied_);
+  root.insert(QStringLiteral("decoderWindow"), decoder_window);
 
   // Whether the thread that DRAWS is keeping up, which nothing above measures.
   //

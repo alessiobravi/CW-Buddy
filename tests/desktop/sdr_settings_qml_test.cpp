@@ -356,6 +356,41 @@ int main() {
       contains(main_qml, "draggedHz >= 1000")) {
     return 19;
   }
+
+  // What is applied is the box that was drawn, not the coordinate the release
+  // event happens to carry.
+  //
+  // A station reported a decode region that moved to where the button came up
+  // but kept the width it already had, and reverted the instant the button was
+  // released rather than after any delay. One value produces both halves at
+  // once: `dragged` coming out false falls the width back to
+  // appSettings.sdrDecoderBandwidthHz and makes the centre the release point.
+  // For that to happen after a forty-pixel drag the release event's coordinate
+  // has to be at or near the press position -- and this handler used to
+  // overwrite the position tracked through onPositionChanged with it, which
+  // was the only place in the gesture a good value was discarded. The
+  // rectangle and the kHz readout both read the tracked value, so a selection
+  // derived from anything else can disagree with what the operator watched
+  // themselves draw.
+  //
+  // Pinned as source text because nothing in this tree instantiates Main.qml.
+  // This asserts the shape of the handler, not the geometry it produces.
+  //
+  // The middle-button branch above the region guard legitimately reads
+  // mouse.x, so only the part of the handler that owns the drag is searched.
+  const std::size_t region_branch =
+      release_body.find("if (!decoderSelectionActive");
+  if (region_branch == std::string_view::npos ||
+      // The decision and the endpoint still come from the tracked position.
+      !contains(release_body,
+                "var dragged = Math.abs(decoderSelectionCurrentX") ||
+      !contains(release_body,
+                "var lastHz = frequencyAtX(decoderSelectionCurrentX)") ||
+      // And nothing in that branch puts the release coordinate back into it.
+      contains(release_body.substr(region_branch),
+               "decoderSelectionCurrentX = Math.max(")) {
+    return 24;
+  }
   // The rectangle on screen and the region that is applied are one
   // calculation, and the operator can read the width before releasing --
   // without which both clamps correct the gesture silently and a drag that
@@ -511,6 +546,36 @@ int main() {
       !contains(qml, "visible: appSettings.audioInputNamesAmbiguous") ||
       !contains(setup_qml, "visible: appSettings.audioInputNamesAmbiguous")) {
     return 23;
+  }
+
+  // Starting a receiver restates every setting the DSP worker has to be
+  // holding, the monitor included.
+  //
+  // The spectrum configuration and the decode window were already republished
+  // at each start; the monitor was not, so the only thing that ever put a
+  // monitor mode into that worker was the operator pressing a listen control
+  // after it had started, and nothing reconciled the controller's copy with
+  // the worker's at the one moment they can part company. A start clears the
+  // region demodulator, the in-flight count and the sample counters on the
+  // worker's side, which is exactly why the demand has to be said again on the
+  // other side of it. Asserted inside both begin functions rather than
+  // somewhere in the file, because the publisher is also called from every
+  // mode change and an assertion either one satisfies would let a start stop
+  // publishing without anything noticing.
+  for (const std::string_view starter :
+       {"void ReplayController::beginLiveSdrCapture(",
+        "void ReplayController::beginLiveAudioCapture("}) {
+    const std::string_view body =
+        functionBody(controller_implementation, starter);
+    const std::size_t start_request =
+        body.find("emit liveDspStartRequested();");
+    const std::size_t monitor_publish =
+        body.find("publishMonitorConfiguration();");
+    if (body.empty() || start_request == std::string_view::npos ||
+        monitor_publish == std::string_view::npos ||
+        monitor_publish < start_request) {
+      return 25;
+    }
   }
 
   return 0;

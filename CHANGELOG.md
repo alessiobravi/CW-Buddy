@@ -6,6 +6,21 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- The live diagnostics record states what the receive worker is listening to and
+  decoding, rather than leaving both to be inferred from the settings.
+  `regionAudio` now carries all three demands its `wanted` flag is the union of
+  -- the monitor mode as the worker itself holds it, whether a remote observer is
+  subscribed, and whether a capture is running -- so a record showing no region
+  audio says which one is missing instead of only that none is present. A new
+  `decoderWindow` block reports the window the channelizer actually accepted
+  beside the one last requested: a window it refuses is deliberately left
+  unapplied so a later block can retry, and until now that was indistinguishable
+  from a window in force, because settings only ever hold the request. Two faults
+  this week were diagnosed by asking an operator what Settings showed, which
+  answers a different question.
+
 ### Changed
 
 - A monitored stream is published without a station name while the only two
@@ -64,6 +79,25 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 
 ### Fixed
+
+- A decode region dragged on the spectrum is applied as the rectangle that was
+  drawn, not as the coordinate the release event reports. The release handler
+  overwrote the pointer position it had tracked through the drag with the one the
+  release carried, and a release reporting the press position collapses the
+  gesture to a click: the width silently fell back to the one already in force
+  and the region centred on the release point, so the box just drawn was
+  discarded while the region still appeared to move to where the button came up.
+  Nothing is lost by ignoring that coordinate -- a position the release can
+  report that the drag never tracked is a position no rectangle was ever drawn
+  at.
+
+- Starting a receiver restates the monitor selection to the receive worker,
+  alongside the spectrum configuration and the decode window it already
+  restated. Nothing reconciled the two copies of the monitor at a start, which is
+  the one moment they can part company: a start clears the region demodulator and
+  its counters, so the demand has to be repeated on the other side of it.
+  Previously the only thing that ever set a monitor mode on that worker was the
+  operator pressing a listen control after reception had already begun.
 
 - Live audio finds its input again after the operating system reissues the
   device identifier. A restart, a driver reload or a different USB port can all

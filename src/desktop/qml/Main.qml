@@ -1108,8 +1108,33 @@ ApplicationWindow {
                         if (!decoderSelectionActive
                                 || mouse.button !== Qt.RightButton)
                             return
-                        decoderSelectionCurrentX = Math.max(
-                            0, Math.min(width, mouse.x))
+                        // The gesture ends where the pointer was last TRACKED,
+                        // not where the release event says it was.
+                        //
+                        // This used to begin by overwriting the tracked
+                        // position with the release coordinate, and that was
+                        // the only point in the gesture where a good value was
+                        // discarded. A station reported a region that moved to
+                        // where the button came up but kept the width it
+                        // already had, and reverted on release rather than
+                        // after any delay. One value produces both halves at
+                        // once: `dragged` below coming out false falls the
+                        // width back to the setting already in force and makes
+                        // the centre the release point -- which still reads as
+                        // "it moved to where I dropped it" while the box that
+                        // was drawn is thrown away. For that to happen after a
+                        // forty-pixel drag, the release coordinate has to be
+                        // back at the press position.
+                        //
+                        // Nothing is lost by not consulting it. The tracked
+                        // value is what onPositionChanged put there, which is
+                        // the rectangle the operator watched and the figure
+                        // the kHz readout quoted; a position the release could
+                        // report that the tracking never saw is a position no
+                        // rectangle was ever drawn at, so applying it would
+                        // apply a selection nobody made. A click with no
+                        // motion leaves it at the press coordinate, within the
+                        // click threshold of the release either way.
                         var firstHz = frequencyAtX(decoderSelectionStartX)
                         var lastHz = frequencyAtX(decoderSelectionCurrentX)
                         var dragged = Math.abs(decoderSelectionCurrentX

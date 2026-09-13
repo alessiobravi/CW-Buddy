@@ -2,6 +2,7 @@
 #include <QDebug>
 #include <QFile>
 #include <QJsonObject>
+#include <QJsonValue>
 #include <QMetaObject>
 #include <QFileInfo>
 #include <QTemporaryDir>
@@ -29,6 +30,11 @@ constexpr int kDecoderWindowNotInForce = 21;
 constexpr int kGuiBlockMissing = 22;
 constexpr int kGuiLatenessNotReported = 23;
 constexpr int kGuiPeakNotWindowScoped = 24;
+// The window the worker is actually carving out, reported as a number rather
+// than inferred. Two faults in a row were diagnosed by asking the operator
+// what Settings showed, which answers a different question: settings hold a
+// request, and a request the channelizer refused is not a window in force.
+constexpr int kDecoderWindowNotReported = 25;
 
 // Region audio, from 30 up.
 constexpr int kRegionAudioWithoutConsumer = 30;
@@ -50,6 +56,12 @@ constexpr int kRegionMonitorUnbounded = 40;
 // Only `samples` was ever asserted here, so nothing checked that the two
 // booleans agree with the work actually being done.
 constexpr int kRegionAudioFlagsWrong = 41;
+// `wanted` is an OR of three separate demands, and a reader who finds it false
+// while an operator is pressing the region-listen control needs to know which
+// one was supposed to be true. Reported as a station's own record said
+// `wanted:false` with no way to tell whether the monitor mode had reached the
+// worker at all, which cost a round trip to the station to answer.
+constexpr int kRegionAudioDemandNotReported = 42;
 
 // Two properties of the live DSP worker that only a complex-IQ session can
 // show, driven entirely through the block pipe so no receiver is required:
@@ -223,6 +235,31 @@ int runRegionAudioChecks() {
         .value(QString::fromLatin1(name))
         .toBool();
   };
+  // The three demands `wanted` is the OR of, each read back from the same
+  // record. Asserting them is what turns `wanted:false` from a dead end into a
+  // diagnosis: it says which of the three the station is missing, and in
+  // particular whether the monitor mode ever reached this worker.
+  const auto region_demands_agree = [&](const int expected_mode,
+                                        const bool expected_remote,
+                                        const bool expected_capture) {
+    const QJsonObject region =
+        record.value(QStringLiteral("regionAudio")).toObject();
+    const int mode =
+        region.value(QStringLiteral("monitorMode")).toInt(-1);
+    const QJsonValue remote =
+        region.value(QStringLiteral("remoteAudioSubscribed"));
+    const QJsonValue capture = region.value(QStringLiteral("captureActive"));
+    if (mode == expected_mode && remote.isBool() &&
+        remote.toBool() == expected_remote && capture.isBool() &&
+        capture.toBool() == expected_capture) {
+      return true;
+    }
+    qCritical().noquote()
+        << "regionAudio does not state what it is wanted for: expected mode="
+        << expected_mode << "remote=" << expected_remote
+        << "capture=" << expected_capture << "got" << region;
+    return false;
+  };
   // The two booleans against the work: `wanted` is whether a consumer exists
   // and `active` is whether the demodulator is configured and running for it,
   // so both must agree with whether samples are being produced at all.
@@ -330,6 +367,8 @@ int runRegionAudioChecks() {
       return kRegionAudioWithoutConsumer;
     }
     if (!region_flags_agree(false)) return kRegionAudioFlagsWrong;
+    if (!region_demands_agree(0, false, false))
+      return kRegionAudioDemandNotReported;
 
     // 2. The local monitor, in region mode.
     QMetaObject::invokeMethod(worker, "setMonitor", Qt::BlockingQueuedConnection,
@@ -343,6 +382,13 @@ int runRegionAudioChecks() {
     // cannot hear the region reads this record to find out whether the station
     // thinks it is playing, so it must say yes while it is.
     if (!region_flags_agree(true)) return kRegionAudioFlagsWrong;
+    // And the reason it thinks so. Mode 3 is the only demand in force here, so
+    // the record has to name it: the fault this answers is a station whose
+    // record said the region was not wanted while its operator was pressing
+    // REGION, with nothing in the record to say whether the mode had crossed
+    // to this worker or had never left the controller.
+    if (!region_demands_agree(3, false, false))
+      return kRegionAudioDemandNotReported;
     // The rate invariant, at the one place an operator can hear it break: real
     // audio sampled at Fs carries only Fs/2, so a 24 kHz region needs at least
     // 48 kHz or its top half folds onto its bottom half.
@@ -403,6 +449,12 @@ int runRegionAudioChecks() {
     // still say the region is wanted and running.
     static_cast<void>(region_audio_samples());
     if (!region_flags_agree(true)) return kRegionAudioFlagsWrong;
+    // The monitor is off and the subscriber is the only reason for the work,
+    // which is the distinction a reader of a live record has to be able to
+    // make: a non-zero sample count with the monitor off means somebody else
+    // is listening, not that the operator's own control is doing anything.
+    if (!region_demands_agree(0, true, false))
+      return kRegionAudioDemandNotReported;
 
     // 5. A debug capture of an SDR session must produce BOTH files. The IQ is
     //    the forensic payload and the audio is what an operator can actually
@@ -511,6 +563,71 @@ int runComplexIqDiagnosticsChecks() {
       qCritical().noquote() << "decoder window never took effect: detector="
                             << record.value(QStringLiteral("detector"));
       return kDecoderWindowNotInForce;
+    }
+    // And the record says which window that is, in the worker's own terms.
+    // `applied` is what the channelizer accepted, which is the only honest
+    // answer to "what is this station decoding": a window it refused stays
+    // unapplied on purpose so a later block can retry, and from the settings
+    // side that is indistinguishable from a window in force. Both faults this
+    // block exists for were diagnosed by asking the operator what Settings
+    // showed, which answers about the request instead.
+    {
+      const QJsonObject window =
+          record.value(QStringLiteral("decoderWindow")).toObject();
+      const QJsonValue in_force = window.value(QStringLiteral("inForce"));
+      if (!in_force.isBool() || !in_force.toBool() ||
+          window.value(QStringLiteral("appliedCenterHz")).toDouble(-1.0) !=
+              iq_center_frequency_hz ||
+          window.value(QStringLiteral("appliedBandwidthHz")).toDouble(-1.0) !=
+              decoder_bandwidth_hz ||
+          window.value(QStringLiteral("requestedCenterHz")).toDouble(-1.0) !=
+              iq_center_frequency_hz ||
+          window.value(QStringLiteral("requestedBandwidthHz"))
+                  .toDouble(-1.0) != decoder_bandwidth_hz) {
+        qCritical().noquote()
+            << "the record does not state the decode window in force:"
+            << window;
+        return kDecoderWindowNotReported;
+      }
+    }
+    // And the two are genuinely separate readings, which is the only reason
+    // for carrying both. A window the decimator will not accept -- here one
+    // narrower than the 2 kHz floor -- is deliberately left unapplied so a
+    // later block can retry, and from the settings side that is
+    // indistinguishable from a window in force: the decoder simply stops while
+    // the overview spectrum keeps painting. Requesting one here and reading
+    // the record back is what proves `applied` is not a second copy of
+    // `requested` under another name.
+    {
+      constexpr double refused_bandwidth_hz = 1'000.0;
+      QMetaObject::invokeMethod(worker, "setSdrDecoderWindow",
+                                Qt::BlockingQueuedConnection,
+                                Q_ARG(double, iq_center_frequency_hz),
+                                Q_ARG(double, refused_bandwidth_hz));
+      for (std::size_t index = 0; index < 8 && index < iq_blocks.size();
+           ++index) {
+        static_cast<void>(pipe->blocks.try_push(iq_blocks[index]));
+      }
+      QMetaObject::invokeMethod(worker, "drain", Qt::BlockingQueuedConnection);
+      QMetaObject::invokeMethod(worker, "publishLiveDiagnosticsRecord",
+                                Qt::BlockingQueuedConnection);
+      const QJsonObject window =
+          record.value(QStringLiteral("decoderWindow")).toObject();
+      if (window.value(QStringLiteral("requestedBandwidthHz")).toDouble(-1.0) !=
+              refused_bandwidth_hz ||
+          window.value(QStringLiteral("appliedBandwidthHz")).toDouble(-1.0) !=
+              decoder_bandwidth_hz) {
+        qCritical().noquote()
+            << "a refused window is reported as though it were in force:"
+            << window;
+        return kDecoderWindowNotReported;
+      }
+      // Put the working window back, so the checks after this one see the
+      // session they were written for.
+      QMetaObject::invokeMethod(worker, "setSdrDecoderWindow",
+                                Qt::BlockingQueuedConnection,
+                                Q_ARG(double, iq_center_frequency_hz),
+                                Q_ARG(double, decoder_bandwidth_hz));
     }
 
     QMetaObject::invokeMethod(worker, "acceptGuiHeartbeat",
