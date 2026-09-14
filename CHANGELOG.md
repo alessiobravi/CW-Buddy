@@ -8,6 +8,53 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ### Fixed
 
+- A configured SDR LO offset is no longer applied twice to every frequency a
+  direct-SDR session reports. The offset tunes the hardware to `rx + offset` and
+  leaves the decode window at `rx`; the settings clamped it to one margin below
+  Nyquist while the publisher that checks the window against the acquired
+  passband measured its reach with a margin a kilohertz larger. Every offset
+  large enough to have been clamped therefore arrived judged out of reach, and
+  the window was moved onto the acquisition centre -- which is the operator's
+  frequency plus the offset. Decoded streams and the spectrum axis then read one
+  whole LO offset high: 83 kHz at 192 kS/s, 112 kHz at 250 kS/s, 987 kHz at
+  2 MS/s, permanently, while the settings pane went on displaying the frequency
+  it was configured with, because the correction was made downstream of it. The
+  margin is now one definition both sites read. A window that merely overhangs it
+  -- a decode region dragged wider than the passband leaves room for -- is pulled
+  just inside rather than discarded; one that is not in the acquired passband at
+  all, such as a stored 20 m default against a receiver on 40 m, still falls back
+  to the capture centre, because nothing about it can be salvaged.
+
+- Tuning across a band no longer walks the waterfall history out from under its
+  own frequency scale. Retained rows are slid by a whole number of bins on each
+  retune, and the part of the step that would not fit was discarded -- not as
+  noise, but as the same fraction in the same direction every time. At 2 MS/s
+  over 16384 bins a 1 kHz click leaves about 23 Hz behind, so tuning across a
+  band accumulated kilohertz of skew in the history while the live top row and
+  the axis stayed correct, parking a recognisable signature where no signal is.
+  The remainder is now carried and spent as soon as it amounts to a whole bin,
+  holding the history within half a bin of the dial however far an operator
+  tunes.
+
+- A retune no longer labels samples with a frequency they were not received on.
+  Moving the receiver does not empty what the device has already queued, and
+  those samples were handed out stamped with the new centre frequency. The
+  display smear that causes is momentary; the consequence is not, because a track
+  discovered inside such a block fixes its identity origin at that frequency and
+  its reported frequency stays clamped to it for the rest of the track's life --
+  so a band jump mislabelled a station by the whole jump, permanently. The queue
+  is now dropped across a retune, above the backend boundary so every receive
+  provider behaves the same way, and the gap is marked as a discontinuity so
+  filter state is rebuilt rather than joined across it.
+
+- An SDR LO offset set while Radio Sync is off now takes effect at once instead
+  of waiting for the next click of the dial, so an operator tuning by hand is no
+  longer left looking at the LO spur they had just asked to move. An RX
+  transverter offset changed while Radio Sync is on rebuilds the window
+  immediately rather than at the next CAT poll. The acquisition centre and the
+  decode window are also persisted together when the faceplate VFO moves them,
+  because only their separation is meaningful.
+
 - Every frequency a direct-SDR session reports is now read off the decode window
   the channelizer is actually carving out, rather than off the one last asked
   for. The two are separate values on purpose -- a window the channelizer refuses

@@ -1728,6 +1728,12 @@ void AppSettings::setSdrBandwidthHz(const int value) {
     emit settingsChanged();
   }
 }
+void AppSettings::persistSdrRadioWindow() {
+  QSettings settings;
+  settings.setValue(storageKey(QStringLiteral("sdr/centerFrequencyHz")),
+                    QVariant::fromValue(sdr_center_frequency_hz_));
+  persistSdrDecoderWindow();
+}
 void AppSettings::persistSdrDecoderWindow() {
   QSettings settings;
   settings.setValue(storageKey(QStringLiteral("sdr/decoderCenterFrequencyHz")),
@@ -1754,6 +1760,11 @@ void AppSettings::setSdrDecoderBandwidthHz(const int value) {
     persistSdrDecoderWindow();
     emit sdrSettingsChanged();
     emit settingsChanged();
+    // Deliberately not a re-derivation when Radio Sync is off. A wider window
+    // does leave less room for the LO offset, but the publisher clamps the
+    // window into whatever reach remains; rebuilding the acquisition centre
+    // instead would retune the hardware because the operator changed a decode
+    // width, and would discard a region they had dragged.
     if (sdr_follow_radio_vfo_) followSdrToRadioVfo();
   }
 }
@@ -1795,9 +1806,18 @@ std::optional<std::uint64_t> AppSettings::observedRadioRxRfHz() const noexcept {
 }
 
 void AppSettings::setSdrRadioWindow(const std::uint64_t rx_frequency_hz) {
+  // One definition of the margin, shared with the publisher that later checks
+  // the window against the passband. When these two disagreed, every offset
+  // large enough to be clamped here was rejected there and the window was
+  // snapped onto this acquisition centre -- adding the LO offset a second
+  // time to every frequency reported to the operator. Floor rather than
+  // truncate, so an odd sample rate or decode width cannot leave the clamped
+  // offset half a hertz outside the reach measured from the same rule.
   const qint64 available_offset = std::max<qint64>(
-      0, static_cast<qint64>(sdr_sample_rate_hz_ / 2) -
-             static_cast<qint64>(sdr_decoder_bandwidth_hz_ / 2) - 1'000);
+      0, static_cast<qint64>(
+             std::floor(sdrDecoderWindowReachHz(
+                 static_cast<double>(sdr_sample_rate_hz_),
+                 static_cast<double>(sdr_decoder_bandwidth_hz_)))));
   const qint64 offset =
       std::clamp(sdr_radio_lo_offset_hz_, -available_offset, available_offset);
   const qint64 acquisition_center =
@@ -1809,9 +1829,31 @@ void AppSettings::setSdrRadioWindow(const std::uint64_t rx_frequency_hz) {
       sdr_decoder_center_frequency_hz_,
       static_cast<qulonglong>(rx_frequency_hz));
   if (center_changed || decoder_changed) {
+    // Both halves, together. They are one fact -- the decode window means
+    // nothing except as an offset from the acquisition centre -- and this is
+    // the faceplate VFO, which never presses Apply. Writing only the decode
+    // window through here, as the shared persist helper does, restored a pair
+    // whose separation was no longer the configured LO offset.
+    persistSdrRadioWindow();
     emit sdrSettingsChanged();
     emit settingsChanged();
   }
+}
+
+void AppSettings::reapplySdrRadioWindow() {
+  if (sdr_follow_radio_vfo_) {
+    followSdrToRadioVfo();
+    return;
+  }
+  // Radio Sync off: the tuned RX frequency is not arriving from CAT, and the
+  // decode-window centre is where the VFO editor, the dial steps and a
+  // spectrum drag all leave it, so it is the frequency the operator is on.
+  // Re-deriving from it applies a changed LO offset at once, instead of
+  // leaving the acquisition centre on the previous offset until the next
+  // click of the dial happens to rebuild it.
+  if (sdr_decoder_center_frequency_hz_ == 0U) return;
+  setSdrRadioWindow(
+      static_cast<std::uint64_t>(sdr_decoder_center_frequency_hz_));
 }
 
 void AppSettings::followSdrToRadioVfo() {
@@ -1882,7 +1924,11 @@ void AppSettings::setSdrRadioLoOffsetHz(const qint64 value) {
   if (assign_if_changed(sdr_radio_lo_offset_hz_, value)) {
     emit sdrSettingsChanged();
     emit settingsChanged();
-    if (sdr_follow_radio_vfo_) followSdrToRadioVfo();
+    // The offset exists to move the receiver's own LO spur off the operator's
+    // frequency. Applying it only when Radio Sync was on left an operator
+    // tuning the SDR by hand looking at the spur they had just asked to move,
+    // until something else happened to rebuild the acquisition centre.
+    reapplySdrRadioWindow();
   }
 }
 void AppSettings::setSdrAutomaticGain(const bool value) {
@@ -1939,7 +1985,16 @@ CWA_SETTER(setCatFlowControlIndex, cat_flow_control_index_, int)
 CWA_SETTER(setPollIntervalMs, poll_interval_ms_, int)
 CWA_SETTER(setTimeoutMs, timeout_ms_, int)
 CWA_SETTER(setSplitEnabled, split_enabled_, bool)
-CWA_SETTER(setRxTransverterOffsetHz, rx_transverter_offset_hz_, qint64)
+void AppSettings::setRxTransverterOffsetHz(const qint64 value) {
+  if (!assign_if_changed(rx_transverter_offset_hz_, value)) return;
+  emit settingsChanged();
+  // The RX transverter offset is part of turning a dial reading into an
+  // on-air frequency, so with Radio Sync on it changes where the SDR should
+  // be looking and the window is rebuilt now rather than at the next poll.
+  // With Radio Sync off no part of the SDR window is derived from CAT and
+  // there is nothing here to re-derive.
+  if (sdr_follow_radio_vfo_) followSdrToRadioVfo();
+}
 CWA_SETTER(setTxTransverterOffsetHz, tx_transverter_offset_hz_, qint64)
 CWA_SETTER(setCwToneSidebandIndex, cw_tone_sideband_index_, int)
 void AppSettings::setKeyingPort(const QString& value) {

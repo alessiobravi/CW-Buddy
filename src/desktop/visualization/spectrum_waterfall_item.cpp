@@ -329,6 +329,10 @@ bool SpectrumWaterfallItem::zoomed() const noexcept {
       (lower_frequency_hz_ > source_lower_frequency_hz_ + 0.5 ||
        upper_frequency_hz_ < source_upper_frequency_hz_ - 0.5);
 }
+qsizetype SpectrumWaterfallItem::appliedRowShiftBins() const noexcept {
+  return applied_row_shift_bins_;
+}
+
 int SpectrumWaterfallItem::waterfallRowCount() const noexcept {
   return static_cast<int>(waterfall_rows_.size());
 }
@@ -345,6 +349,10 @@ void SpectrumWaterfallItem::acceptFrame(const SpectrumFrame& frame) {
   if (!latest_bins_.isEmpty() && latest_bins_.size() != frame.bins_dbfs.size()) {
     waterfall_rows_.clear();
     has_row_timestamp_ = false;
+    // A carried remainder is measured in bins, so it means nothing once the
+    // bins change width.
+    row_shift_residual_bins_ = 0.0;
+    applied_row_shift_bins_ = 0;
   }
   latest_bins_ = frame.bins_dbfs;
   suppressLocalOscillatorBin(latest_bins_);
@@ -393,14 +401,35 @@ void SpectrumWaterfallItem::acceptFrame(const SpectrumFrame& frame) {
     const qsizetype bins = latest_bins_.size();
     const double bin_width_hz =
         bins > 1 ? next_span_hz / static_cast<double>(bins - 1) : 0.0;
-    const auto shift_bins = bin_width_hz > 0.0
-        ? static_cast<qsizetype>(std::llround(shift_hz / bin_width_hz))
-        : 0;
+    // Rows move in whole bins, but a click of the dial is almost never a
+    // whole number of them, and the part that will not fit is not noise: it
+    // is the same fraction, in the same direction, on every click. At 2 MS/s
+    // over 16384 bins a 1 kHz step is a little over 8.19 bins, so dropping
+    // the remainder leaves about 23 Hz of skew each time, all of it one way.
+    // Tuning across a band accumulates kilohertz of it, and because the live
+    // top row and the axis stay correct the history quietly slides out from
+    // under its own frequency scale -- a signature parked where no signal is.
+    //
+    // So carry the remainder instead of discarding it, and spend it as soon
+    // as it amounts to a whole bin. The carried value is in this item's own
+    // bins, which is the grid the axis and the renderer use, so the history
+    // stays aligned with what is drawn over it.
+    const double wanted_shift_bins = bin_width_hz > 0.0
+        ? shift_hz / bin_width_hz + row_shift_residual_bins_
+        : 0.0;
+    const auto shift_bins =
+        static_cast<qsizetype>(std::llround(wanted_shift_bins));
     if (!same_span || bins <= 1 || std::abs(shift_bins) >= bins) {
       waterfall_rows_.clear();
       has_row_timestamp_ = false;
       conditioner_.reset();
+      // Nothing survives to carry the remainder for.
+      row_shift_residual_bins_ = 0.0;
+      applied_row_shift_bins_ = 0;
     } else if (shift_bins != 0) {
+      row_shift_residual_bins_ =
+          wanted_shift_bins - static_cast<double>(shift_bins);
+      applied_row_shift_bins_ = shift_bins;
       // Vacated bins carry no history and are filled with the row's own
       // quietest value, so newly exposed spectrum reads as empty rather than
       // as a copy of whatever was previously at that edge.
@@ -421,6 +450,10 @@ void SpectrumWaterfallItem::acceptFrame(const SpectrumFrame& frame) {
       // painted a horizontal band across the waterfall while it settled --
       // tuning across a band produced a row of them.
       conditioner_.shiftBins(shift_bins);
+    } else {
+      // Too small to spend this time; it keeps accruing until it is not.
+      row_shift_residual_bins_ = wanted_shift_bins;
+      applied_row_shift_bins_ = 0;
     }
   }
   // Only a source change may move the view. Testing `!preserve_zoom` here
@@ -567,6 +600,8 @@ void SpectrumWaterfallItem::resetFrames() {
   automatic_range_initialized_ = false;
   noise_floor_initialized_ = false;
   conditioner_.reset();
+  row_shift_residual_bins_ = 0.0;
+  applied_row_shift_bins_ = 0;
   estimated_noise_floor_db_ = -120.0;
   if (automatic_range_) {
     effective_lower_bound_db_ = -120.0;

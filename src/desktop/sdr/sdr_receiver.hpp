@@ -68,6 +68,29 @@ struct SdrReceiveConfiguration {
   double gain_db{0.0};
 };
 
+// How far the decode window's centre may sit from the acquisition centre.
+//
+// IqSubbandDecimator::process() refuses a block outright unless
+//   |decoder centre - capture centre| + decoder bandwidth / 2 < Nyquist,
+// so the arithmetic limit is sample rate / 2 - bandwidth / 2. The margin
+// subtracted below that is not decoration: the decimator's anti-alias
+// response is only meaningful with some spectrum left above the window edge.
+//
+// One rule, one definition. It used to be written twice with different
+// numbers -- the LO-offset clamp allowed an offset a kilohertz larger than
+// the decode-window publisher would accept -- so every offset big enough to
+// be clamped was then judged out of reach and snapped onto the acquisition
+// centre, which applies the LO offset a second time to every frequency the
+// operator is shown. Tens of kilohertz at ordinary IQ rates, permanently, and
+// invisibly: the correction is made downstream of the settings pane, which
+// goes on displaying the value it was configured with.
+[[nodiscard]] constexpr double sdrDecoderWindowReachHz(
+    const double sample_rate_hz,
+    const double decoder_bandwidth_hz) noexcept {
+  constexpr double kEdgeMarginHz = 2'000.0;
+  return sample_rate_hz * 0.5 - decoder_bandwidth_hz * 0.5 - kEdgeMarginHz;
+}
+
 struct SdrActualConfiguration {
   double center_frequency_hz{0.0};
   double sample_rate_hz{0.0};
@@ -114,6 +137,9 @@ struct SdrReceiverDiagnostics {
   std::uint64_t read_errors{0};
   std::uint64_t invalid_blocks{0};
   std::uint64_t discontinuities{0};
+  // Samples dropped on purpose across a retune, because they were captured
+  // before the receiver moved and cannot honestly carry the new frequency.
+  std::uint64_t retune_discarded_samples{0};
   std::string last_error;
 };
 
@@ -140,6 +166,11 @@ class SdrReceiver final {
   [[nodiscard]] const SdrActualConfiguration& actualConfiguration() const noexcept;
 
  private:
+  // Empties whatever the backend has already queued, and answers how many
+  // samples that was. Called across a retune; see the definition for why the
+  // rule lives here and not in one provider's backend.
+  [[nodiscard]] std::size_t discardQueuedSamples();
+
   std::unique_ptr<SdrReceiveBackend> backend_;
   SdrReceiveConfiguration configuration_{};
   SdrActualConfiguration actual_{};
@@ -147,6 +178,9 @@ class SdrReceiver final {
   core::IqReceiveValidator validator_{};
   std::uint64_t sequence_{0};
   std::uint64_t synthesized_timestamp_ns_{0};
+  // Scratch for discardQueuedSamples(). Held rather than made on the stack
+  // because the drain runs on the capture thread, in the middle of a retune.
+  core::RealtimeSampleBlock drain_block_{};
 };
 
 // Always available. Without SoapySDR it returns a diagnostic-only backend so

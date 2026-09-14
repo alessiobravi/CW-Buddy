@@ -37,6 +37,7 @@
 #include "cwassistant/core/wav_replay_source.hpp"
 #include "decoder_channel_model.hpp"
 #include "../dxcluster/dx_cluster_client.hpp"
+#include "../sdr/sdr_receiver.hpp"
 #include "../decoder/local_character_decoder.hpp"
 #include "../sdr/sdr_capture_worker.hpp"
 #include "live_audio_worker.hpp"
@@ -1708,14 +1709,34 @@ void ReplayController::publishSdrDecoderWindow() {
   // away from 20 m decoded nothing at all.
   const auto capture_center = static_cast<double>(sdr_center_frequency_hz_);
   const auto bandwidth = static_cast<double>(sdr_decoder_bandwidth_hz_);
-  // A margin below Nyquist, because the decimator's anti-alias response is
-  // only meaningful with some spectrum left above the window edge.
-  constexpr double kEdgeMarginHz = 2'000.0;
-  const double reach = static_cast<double>(sdr_sample_rate_hz_) * 0.5 -
-                       bandwidth * 0.5 - kEdgeMarginHz;
+  // The same rule the LO-offset clamp uses, read from the same definition.
+  // Two spellings of one margin was the defect underneath this function: the
+  // settings would place the window exactly a kilohertz beyond what this test
+  // accepted, so a configured LO offset large enough to be clamped landed
+  // here as "out of reach" and the window was moved onto the acquisition
+  // centre -- which is the operator's frequency plus the LO offset, so every
+  // reported frequency carried that offset twice.
+  const double reach = sdrDecoderWindowReachHz(
+      static_cast<double>(sdr_sample_rate_hz_), bandwidth);
   auto center = static_cast<double>(sdr_decoder_center_frequency_hz_);
-  if (reach <= 0.0 || std::abs(center - capture_center) > reach) {
+  const double offset_from_capture_hz = center - capture_center;
+  if (reach <= 0.0 ||
+      std::abs(offset_from_capture_hz) >
+          static_cast<double>(sdr_sample_rate_hz_) * 0.5) {
+    // Not a window that overhangs the margin: one that is not in the acquired
+    // passband at all, such as a stored 20 m default against a receiver on
+    // 40 m. Nothing about it can be salvaged, so fall back to the centre of
+    // what is actually being received.
     center = capture_center;
+    sdr_decoder_center_frequency_hz_ =
+        static_cast<qulonglong>(std::llround(center));
+  } else if (std::abs(offset_from_capture_hz) > reach) {
+    // Merely overhanging -- a drag that widened the window past the margin,
+    // for instance. Pull it just inside instead of discarding where the
+    // operator is listening, which is what moving it to the capture centre
+    // amounts to.
+    center = std::max(
+        1.0, capture_center + std::clamp(offset_from_capture_hz, -reach, reach));
     sdr_decoder_center_frequency_hz_ =
         static_cast<qulonglong>(std::llround(center));
   }

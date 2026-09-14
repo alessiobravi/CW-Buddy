@@ -87,6 +87,13 @@ class SpectrumWaterfallItem : public QQuickItem {
   // frequency slides its history rather than discarding it, and nothing else
   // observable distinguishes those two outcomes.
   [[nodiscard]] int waterfallRowCount() const noexcept;
+  // How many bins the retained rows were slid by on the last source change.
+  // Exposed because nothing else observable says it: the history is not
+  // readable from outside, and the difference between a slide that carries
+  // its rounding remainder and one that throws it away is only ever a bin
+  // here and there -- which is exactly the skew that accumulates into
+  // kilohertz across a band.
+  [[nodiscard]] qsizetype appliedRowShiftBins() const noexcept;
   [[nodiscard]] double estimatedNoiseFloorDb() const noexcept;
 
  public slots:
@@ -155,6 +162,10 @@ class SpectrumWaterfallItem : public QQuickItem {
   qulonglong dropped_rows_{0};
   QElapsedTimer render_clock_;
   WaterfallConditioner conditioner_;
+  // The part of the last retune's slide that would not fit in whole bins,
+  // kept so the next one can spend it. See acceptFrame().
+  double row_shift_residual_bins_{0.0};
+  qsizetype applied_row_shift_bins_{0};
 };
 
 }  // namespace cwassistant::desktop

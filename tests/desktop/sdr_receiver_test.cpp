@@ -225,15 +225,28 @@ int main() {
              block.sample_count == 3 && block.samples[2].real() == 2.0F,
          "IQ samples, sequence, and hardware timestamp are preserved");
 
+  // Whatever the device had already queued when the retune was asked for was
+  // captured on the old frequency. Publishing it stamped with the new one is
+  // not a passing smear: a track discovered inside that block latches its
+  // identity origin at a frequency it was never received on, and stays
+  // clamped to it for the rest of its life. On a band jump that is tens of
+  // kilohertz of permanent error on a station's reported frequency.
+  fake_view->reads.push_back({.sample_count = 5,
+                              .timestamp_ns = 20'000,
+                              .timestamp_valid = true});
   expect(receiver.retuneCenterFrequency(14'075'000.0, error) &&
              fake_view->retune_calls == 1 &&
              receiver.diagnostics().running,
          "center-only retune preserves the running receiver");
+  expect(receiver.diagnostics().retune_discarded_samples == 5 &&
+             fake_view->reads.empty(),
+         "samples queued before the retune are dropped, not relabelled");
   fake_view->reads.push_back({.sample_count = 2,
                               .timestamp_ns = 22'000,
                               .timestamp_valid = true});
   expect(receiver.pump(block, 1) &&
              block.stream.center_frequency_hz == 14'075'000.0 &&
+             block.sample_count == 2 && block.timestamp_ns == 22'000 &&
              receiver.diagnostics().discontinuities == 1,
          "first retuned block carries authoritative RF and a discontinuity");
   fake_view->retune_result = false;
@@ -250,7 +263,10 @@ int main() {
 
   fake_view->reads.push_back({.sample_count = 2});
   expect(receiver.pump(block, 1), "untimestamped IQ block is published");
-  expect(block.sequence == 3 && block.timestamp_ns == 30'000 &&
+  // Sequence 4, not 3: the retune above discarded a queued block, and a
+  // deliberate hole is marked the same way an overflow's is, so the next
+  // block reads as discontinuous instead of being joined onto the last one.
+  expect(block.sequence == 4 && block.timestamp_ns == 30'000 &&
              receiver.diagnostics().discontinuities == 2,
          "overflow creates an explicit discontinuity before monotonic sample time resumes");
 

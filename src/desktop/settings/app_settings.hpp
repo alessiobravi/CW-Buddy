@@ -799,6 +799,9 @@ class AppSettings final : public QObject {
   Q_INVOKABLE bool requestSdrRxFrequencyHz(qulonglong frequency_hz);
   Q_INVOKABLE void stepSdrRxFrequency(int direction);
   void followSdrToRadioVfo();
+  // Rebuilds the acquisition centre from the frequency currently in force,
+  // whichever side of Radio Sync that frequency comes from.
+  void reapplySdrRadioWindow();
   Q_INVOKABLE void selectSdrDevice(int index);
   Q_INVOKABLE void selectSdrOperatingMode(int index);
   Q_INVOKABLE void selectSdrAntenna(int index);
@@ -938,6 +941,9 @@ class AppSettings final : public QObject {
   // the same reason; it is deliberately not a general "persist on every
   // setter" rule.
   void persistSdrDecoderWindow();
+  // Writes the acquisition centre and the decode window together, because
+  // only their separation is meaningful. See setSdrRadioWindow().
+  void persistSdrRadioWindow();
   void setSdrRadioWindow(std::uint64_t rx_frequency_hz);
   bool writeRadioRxDialFrequency(std::uint64_t dial_frequency_hz);
   void invalidateDirectKeyingAcceptance(QString status);

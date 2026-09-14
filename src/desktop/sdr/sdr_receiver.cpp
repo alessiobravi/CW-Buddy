@@ -4,12 +4,21 @@
 #include <cmath>
 #include <iterator>
 #include <limits>
+#include <span>
 #include <utility>
 
 namespace cwassistant::desktop {
 namespace {
 
 constexpr double kNanosecondsPerSecond = 1'000'000'000.0;
+
+// Bounds on the retune drain. A quarter of a second is longer than any driver
+// queue this program has met and short enough that a click of the dial still
+// feels instant; the read count is the second belt, because a backend that
+// answers every read with samples must not be able to hold the capture thread
+// inside a retune.
+constexpr double kRetuneDrainSeconds = 0.25;
+constexpr int kMaximumRetuneDrainReads = 256;
 
 bool valid_configuration(const SdrReceiveConfiguration& configuration,
                          std::string& error) {
@@ -192,10 +201,55 @@ bool SdrReceiver::retuneCenterFrequency(const double center_frequency_hz,
     error = "The SDR returned an invalid center frequency after retuning.";
     return false;
   }
+  // The hardware has moved, but whatever it had already queued has not:
+  // those samples were captured on the old frequency. Adopting the read-back
+  // here and letting pump() stamp it on them writes a frequency they were
+  // never received at, and nothing downstream can tell. A track discovered
+  // inside such a block latches its identity origin at that frequency and its
+  // presentation frequency stays clamped to it for the rest of the track's
+  // life -- so a band jump does not merely smear the display for a moment, it
+  // mislabels a station by the whole jump, permanently.
+  //
+  // Drop the queue instead. The rule lives here, above the backend boundary,
+  // because every provider has the same queue and an operator must not get a
+  // different answer from each of them.
+  const std::size_t discarded = discardQueuedSamples();
+  if (discarded > 0) {
+    diagnostics_.retune_discarded_samples += discarded;
+    // A deliberate hole is still a hole. Advance the sequence so the next
+    // block reads as discontinuous and overlap/filter state is rebuilt rather
+    // than joined across the gap, exactly as an overflow does. The descriptor
+    // usually changes here too, but not when a device quantises the request
+    // back onto the frequency it was already on.
+    if (sequence_ < std::numeric_limits<std::uint64_t>::max()) ++sequence_;
+  }
   configuration_.center_frequency_hz = center_frequency_hz;
   actual_.center_frequency_hz = actual_center_frequency_hz;
   diagnostics_.last_error.clear();
   return true;
+}
+
+std::size_t SdrReceiver::discardQueuedSamples() {
+  if (!backend_) return 0;
+  const double rate = std::isfinite(actual_.sample_rate_hz)
+      ? std::max(0.0, actual_.sample_rate_hz)
+      : 0.0;
+  const auto budget =
+      static_cast<std::size_t>(rate * kRetuneDrainSeconds);
+  std::size_t discarded = 0;
+  for (int read = 0;
+       read < kMaximumRetuneDrainReads && discarded < budget; ++read) {
+    const SdrReadResult result =
+        backend_->read(std::span<std::complex<float>>(drain_block_.samples),
+                       0);
+    // A timeout is the queue reporting itself empty, which is the answer this
+    // loop is looking for. An error is not worth pursuing here: pump() will
+    // meet it again and report it properly.
+    if (result.timeout || !result.error.empty()) break;
+    if (result.sample_count == 0 && !result.overflow) break;
+    discarded += std::min(result.sample_count, drain_block_.samples.size());
+  }
+  return discarded;
 }
 
 void SdrReceiver::stop() noexcept {

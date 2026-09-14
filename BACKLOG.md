@@ -6,7 +6,36 @@ This is the canonical prioritized backlog. Status values are `todo`, `active`,
 `blocked`, and `done`. Every source, test, build, or automation change must
 review this file and update affected items or the “Last reviewed” note.
 
-Last reviewed: 2026-09-13 (sixty-sixth entry) -- the pileup capture became a
+Last reviewed: 2026-09-14 (sixty-seventh entry) -- three ways an SDR session
+could report a frequency it was not receiving on, and none of them was in the
+decoder.
+
+The largest was arithmetic. The LO-offset clamp and the decode-window reach
+check expressed one rule with two constants a kilohertz apart, so every offset
+big enough to be clamped was then judged out of reach and the window was moved
+onto the acquisition centre -- adding the offset a second time to every reported
+frequency, up to 987 kHz at 2 MS/s, while Settings still displayed the
+configured value. The margin is now defined once and read by both.
+
+The second was rounding. The waterfall slid its history by whole bins per retune
+and dropped the remainder, which is a fixed fraction in a fixed direction, so
+tuning across a band left kilohertz of skew in the history while the axis above
+it stayed correct. It is carried now.
+
+The third was ordering. A retune adopted the hardware read-back before the
+device's queue was emptied, so samples captured on the old frequency were
+published stamped with the new one. A track discovered inside one of those
+blocks keeps that frequency for life, which turns a momentary smear into a
+station permanently mislabelled by the size of the band jump.
+
+Recorded as method, from the audit that preceded these: two defects fixed in the
+decoder branch cannot fire at all today, and only because a bandwidth clamp three
+layers away happens to hold two values equal. That was found by chasing why a
+deliberately broken build still passed. A defect that cannot fire is worth fixing
+and worth a test; it must not be reported as the cause of something an operator
+is watching.
+
+Previous review: 2026-09-13 (sixty-sixth entry) -- the pileup capture became a
 score, and the first thing it scored was a wrong answer nobody could see before.
 
 The replay harness now routes a wide complex block through the receiver's own

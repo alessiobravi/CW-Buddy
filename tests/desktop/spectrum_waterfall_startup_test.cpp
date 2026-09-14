@@ -24,6 +24,7 @@
 #include "decoder/local_character_decoder.hpp"
 #include "replay/decoder_channel_model.hpp"
 #include "replay/replay_controller.hpp"
+#include "sdr/sdr_receiver.hpp"
 #include "visualization/spectrum_waterfall_item.hpp"
 #include "visualization/waterfall_conditioner.hpp"
 
@@ -445,6 +446,165 @@ int testSdrCaptureKeepsDecoderWindowInsidePassband() {
       kSampleRateHz * 0.5) {
     return 81;
   }
+  return 0;
+}
+
+
+// A decode window that overhangs the passband is pulled inside it, not moved
+// onto the acquisition centre -- and a window placed by the configured LO
+// offset is not touched at all.
+//
+// The LO offset exists to move a receiver's own LO spur off the operator's
+// frequency: the hardware is tuned to rx + offset and the decode window stays
+// at rx. The offset is added once in the settings and subtracted once by the
+// decimator's mixer, so nothing else may add it again.
+//
+// It was added again. The settings clamped the offset to one margin below
+// Nyquist and this publisher measured reach with a margin a kilohertz larger,
+// so every offset big enough to have been clamped arrived here judged out of
+// reach, and the window was moved onto the acquisition centre -- which is the
+// operator's frequency plus the offset. Every decoded stream and the spectrum
+// axis then read one whole LO offset high: 83 kHz at 192 kS/s, 112 kHz at
+// 250 kS/s, 987 kHz at 2 MS/s. Permanently, and invisibly, because the
+// correction is made downstream of the settings pane, which went on showing
+// the frequency it was configured with. An operator sees FT8 at 7.074 MHz
+// painted inside the CW segment.
+int testSdrDecoderWindowIsPulledInsideNotSnapped() {
+  cwassistant::desktop::ReplayController controller;
+  std::vector<std::pair<double, double>> windows;
+  QObject::connect(
+      &controller,
+      &cwassistant::desktop::ReplayController::liveSdrDecoderWindowRequested,
+      &controller, [&windows](const double center, const double bandwidth) {
+        windows.emplace_back(center, bandwidth);
+      });
+  const auto drive = [&controller](const qulonglong capture_center_hz,
+                                   const int sample_rate_hz,
+                                   const qulonglong decoder_center_hz,
+                                   const int decoder_bandwidth_hz) {
+    controller.setSdrInputSelection(
+        QStringLiteral("driver=test"), QStringLiteral("Test SDR"),
+        capture_center_hz, sample_rate_hz, 192'000, QStringLiteral("RX"), true,
+        0.0, decoder_center_hz, decoder_bandwidth_hz);
+  };
+
+  constexpr qulonglong kRxHz = 7'030'000ULL;
+  constexpr int kSampleRateHz = 250'000;
+  constexpr int kBandwidthHz = 24'000;
+  const double reach_hz = cwassistant::desktop::sdrDecoderWindowReachHz(
+      static_cast<double>(kSampleRateHz), static_cast<double>(kBandwidthHz));
+  if (std::abs(reach_hz - 111'000.0) > 0.001) return 82;
+
+  // One kilohertz beyond the reach -- exactly what the disagreeing margin
+  // used to hand over. The window belongs 1 kHz above the operator's
+  // frequency, not 112 kHz above it.
+  windows.clear();
+  drive(kRxHz + 112'000ULL, kSampleRateHz, kRxHz, kBandwidthHz);
+  if (windows.empty()) return 83;
+  if (std::abs(windows.back().first -
+               static_cast<double>(kRxHz + 1'000ULL)) > 0.5) {
+    return 84;
+  }
+
+  // A window that is not in the acquired passband at all -- the stored 20 m
+  // default against a receiver on 40 m -- cannot be salvaged and still falls
+  // back to the centre of what is being received, or the decimator refuses
+  // every block while the spectrum paints normally.
+  windows.clear();
+  drive(kRxHz, kSampleRateHz, 14'050'000ULL, kBandwidthHz);
+  if (windows.empty()) return 85;
+  if (std::abs(windows.back().first - static_cast<double>(kRxHz)) > 0.5) {
+    return 86;
+  }
+
+  // And the case the whole fault was made of: a window placed by the LO-offset
+  // clamp is inside the reach by construction, because the clamp and this test
+  // are now the same rule read from one definition. Whatever the sample rate
+  // and decode width, the publisher must leave it exactly where it is.
+  const std::array<std::pair<int, int>, 4> configurations{{
+      {192'000, 24'000},
+      {250'000, 24'000},
+      {2'000'000, 24'000},
+      {250'000, 48'000},
+  }};
+  for (const auto& [sample_rate_hz, bandwidth_hz] : configurations) {
+    // std::floor is what AppSettings::setSdrRadioWindow clamps the offset to.
+    const auto offset_hz = static_cast<qulonglong>(
+        std::floor(cwassistant::desktop::sdrDecoderWindowReachHz(
+            static_cast<double>(sample_rate_hz),
+            static_cast<double>(bandwidth_hz))));
+    windows.clear();
+    drive(kRxHz + offset_hz, sample_rate_hz, kRxHz, bandwidth_hz);
+    if (windows.empty()) return 87;
+    if (std::abs(windows.back().first - static_cast<double>(kRxHz)) > 0.5) {
+      return 88;
+    }
+  }
+  return 0;
+}
+
+
+// Tuning across a band must not walk the waterfall history out from under its
+// own frequency scale.
+//
+// Retained rows are slid by a whole number of bins, but a click of the dial is
+// almost never a whole number of them. The leftover is not noise: it is the
+// same fraction in the same direction every time, so discarding it accumulates
+// in one direction for as long as the operator keeps tuning. At 2 MS/s over
+// 16384 bins a 1 kHz click is a little over 8.19 bins and leaves about 23 Hz
+// behind each time -- kilohertz across a band, while the live top row and the
+// axis stay correct, so the history alone ends up sitting at the wrong
+// frequency and a recognisable signature is read where no signal is.
+int testRetuneSlideCarriesItsRoundingRemainder() {
+  constexpr qsizetype kBins = 1024;
+  constexpr double kSpanHz = 200'000.0;
+  constexpr double kStepHz = 1'000.0;
+  constexpr double kLowerHz = 7'000'000.0;
+  constexpr int kClicks = 9;
+  const double bin_width_hz = kSpanHz / static_cast<double>(kBins - 1);
+  const double step_bins = kStepHz / bin_width_hz;
+  // The premise: a click is not a whole number of bins. Without that there is
+  // nothing to carry and this test would pass on any implementation.
+  if (std::abs(step_bins - std::round(step_bins)) < 0.05) return 92;
+
+  cwassistant::desktop::SpectrumWaterfallItem item;
+  cwassistant::desktop::SpectrumFrame frame;
+  frame.bins_dbfs = QVector<float>(kBins, -90.0F);
+  frame.lower_frequency_hz = kLowerHz;
+  frame.upper_frequency_hz = kLowerHz + kSpanHz;
+  frame.sequence = 1;
+  frame.timestamp_ns = 1'000'000'000ULL;
+  item.acceptFrame(frame);
+
+  qsizetype applied_total = 0;
+  for (int click = 1; click <= kClicks; ++click) {
+    frame.sequence = static_cast<quint64>(click) + 1ULL;
+    frame.timestamp_ns += 20'000'000ULL;
+    frame.lower_frequency_hz = kLowerHz + kStepHz * click;
+    frame.upper_frequency_hz = frame.lower_frequency_hz + kSpanHz;
+    item.acceptFrame(frame);
+    applied_total += item.appliedRowShiftBins();
+    // The history must track the dial to within half a bin at every click,
+    // not drift away from it by a fixed fraction per click.
+    const auto ideal_total = static_cast<qsizetype>(
+        std::llround(static_cast<double>(click) * step_bins));
+    if (applied_total != ideal_total) return 93;
+  }
+  // Without the carry the total is clicks * floor-of-a-click, which is short
+  // of the truth by the whole accumulated remainder.
+  if (applied_total ==
+      static_cast<qsizetype>(std::llround(step_bins)) * kClicks) {
+    return 94;
+  }
+
+  // A span change cannot be slid, so the carried remainder goes with the
+  // history it belonged to rather than being spent against a different grid.
+  frame.sequence += 1ULL;
+  frame.timestamp_ns += 20'000'000ULL;
+  frame.lower_frequency_hz = kLowerHz;
+  frame.upper_frequency_hz = kLowerHz + kSpanHz * 2.0;
+  item.acceptFrame(frame);
+  if (item.appliedRowShiftBins() != 0) return 95;
   return 0;
 }
 
@@ -1172,6 +1332,15 @@ int main(int argc, char* argv[]) {
           testSdrCaptureKeepsDecoderWindowInsidePassband();
       sdr_window_failure != 0) {
     return sdr_window_failure;
+  }
+  if (const int sdr_reach_failure =
+          testSdrDecoderWindowIsPulledInsideNotSnapped();
+      sdr_reach_failure != 0) {
+    return sdr_reach_failure;
+  }
+  if (const int slide_failure = testRetuneSlideCarriesItsRoundingRemainder();
+      slide_failure != 0) {
+    return slide_failure;
   }
   if (const int zoom_failure = testZoomSurvivesFrames();
       zoom_failure != 0) {

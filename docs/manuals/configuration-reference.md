@@ -29,6 +29,31 @@ leaving it disabled keeps every marker explicitly labeled **AF**. It is disabled
 by default so a system microphone or another receiver is never assigned a
 guessed RF frequency.
 
+### SDR LO offset and where frequencies are measured from
+
+A direct SDR is tuned a little away from the frequency you are listening to, so
+that the receiver's own local-oscillator spur does not sit on top of the signal.
+The offset moves the *acquisition* centre; the decode window stays on your
+frequency, and the difference is removed again before anything is decoded. Set
+it in Settings -> SDR. Every frequency CW Buddy reports -- the axis, a decoded
+stream, a spot -- is absolute RF measured after that offset has been taken back
+out, so it should agree with your radio's dial and with the cluster.
+
+How far the decode window may sit from the acquisition centre is bounded by the
+sample rate: the window and its guard have to fit inside the acquired passband.
+A larger offset, or a decode region dragged wider, can push against that bound,
+and the window is then pulled just inside it rather than moved somewhere else. A
+window that is not in the acquired passband at all -- a setting restored from a
+different band -- falls back to the centre of what is actually being received,
+because nothing about it can be recovered.
+
+If reported frequencies ever disagree with your radio, the live diagnostics
+record now names every reference they are built from: the acquisition centre
+asked for beside the one the receiver reports on the samples it delivers, the
+decode window requested beside the one in force, and the slice detection was
+actually read at. Those five numbers localise a disagreement without guesswork.
+
+
 ## SDR page
 
 - **Receiver source** stores whether the profile normally starts from
