@@ -240,9 +240,14 @@ class LiveAudioDspWorker final : public QObject {
   // without it documents the symptom and not the cause: an overloaded front
   // end and a starved one look very different in the same spectrum, and the
   // application has no other overload indicator.
+  // `center_frequency_hz` and `sample_rate_hz` are what the controller ASKED
+  // the receiver for, not what it reports. The worker reads the second half of
+  // that pair off every block descriptor, and the two together are what makes
+  // a disagreement between them visible in the diagnostics record.
   void setSdrCaptureContext(const QString& receiver_label,
                             const QString& antenna, bool automatic_gain,
-                            double gain_db);
+                            double gain_db, double center_frequency_hz,
+                            double sample_rate_hz);
   void setPresentationDiagnostics(const QVariantMap& diagnostics);
   // One tick of the GUI thread's heartbeat, carrying how late that tick was:
   // the elapsed time since the previous tick minus the interval that was
@@ -490,6 +495,28 @@ class LiveAudioDspWorker final : public QObject {
   bool sdr_decoder_window_applied_{false};
   double applied_sdr_decoder_center_frequency_hz_{0.0};
   double applied_sdr_decoder_bandwidth_hz_{0.0};
+  // The slice of the decoder branch's spectrum last handed to detection, as
+  // absolute RF. Recorded because it is the last link in the reference chain
+  // and the only one that was never readable: a station reporting tracks at
+  // the wrong frequency needs an answer to "which reference disagrees with
+  // which", and requested-versus-applied window alone cannot say whether the
+  // bins the detector saw were the ones the applied window describes.
+  double detector_slice_lower_frequency_hz_{0.0};
+  double detector_slice_upper_frequency_hz_{0.0};
+  // The acquisition the controller asked the receiver for. A third reference,
+  // distinct from both decoder windows: the decoder window is carved out of
+  // whatever the hardware is actually tuned to, so a request the hardware did
+  // not honour moves every reported frequency without either decoder-window
+  // field changing at all.
+  double requested_sdr_center_frequency_hz_{0.0};
+  double requested_sdr_sample_rate_hz_{0.0};
+  // And the acquisition as the receiver reports it, read off the descriptor of
+  // the last complex block -- which is the receiver's own read-back of the
+  // hardware, not the value it was asked for. Kept unconditionally, unlike
+  // `capture_iq_center_frequency_hz_`, which only exists while a debug capture
+  // is running and therefore cannot answer this question in the ordinary case.
+  double observed_sdr_center_frequency_hz_{0.0};
+  double observed_sdr_sample_rate_hz_{0.0};
   std::optional<double> pending_manual_frequency_hz_;
   cwassistant::core::CwChannelBank decoder_;
   LocalCharacterFrontendBank character_frontends_;

@@ -6,6 +6,39 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- Every frequency a direct-SDR session reports is now read off the decode window
+  the channelizer is actually carving out, rather than off the one last asked
+  for. The two are separate values on purpose -- a window the channelizer refuses
+  stays unapplied so a later block can retry -- and detection was taking its bins
+  from the applied window while addressing them by the requested one's
+  coordinates. Where the two differ the slice collapses onto a sliver at one
+  edge: detection is handed filtered noise and the decoder falls silent while the
+  overview spectrum keeps painting normally, which is the fault an operator
+  cannot diagnose from the display. The region monitor had the same split, and
+  its cost is audible rather than silent -- the single-sideband shift is half the
+  region's width, so demodulating at the requested width moves every station to a
+  different pitch while the decoder, reading the same samples, still reports it
+  correctly.
+
+- A decoded stream's RF is no longer read up to one spectrum bin high. The
+  channel bank takes the two frequencies it is given as the centres of the first
+  and last bin; the direct-IQ path passed the upper edge of the band instead,
+  stretching the grid by one bin across the decode window. Every track read high
+  in proportion to its distance above the window's lower edge -- about 7 Hz at
+  the top of a 24 kHz window. The audio path had always used the other
+  convention and was unaffected.
+
+- The live diagnostics record states every reference a reported frequency is
+  built from, so a station reporting signals at the wrong frequency can be
+  localised from one record. `decoderWindow` gains the slice detection was
+  actually read at; a new `acquisition` block carries the centre and sample rate
+  the receiver was asked for beside the ones it reports on the samples it
+  delivers. A receiver that lands somewhere other than where it was sent moves
+  every track and every axis label by the difference while both decode-window
+  readings stay exactly as configured, and nothing recorded that until now.
+
 ### Changed
 
 - A station whose callsign both decode paths read is named from that agreement

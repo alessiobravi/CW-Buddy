@@ -538,9 +538,14 @@ class ReplayController final : public QObject {
                                           bool split_active);
   // Receive-only front-end description forwarded to the DSP worker so a debug
   // capture records the gain state that produced its samples.
+  // The acquisition pair carries what the receiver was ASKED for. The worker
+  // already reads what the receiver reports off every block descriptor, and
+  // the diagnostics record needs both to answer which of the two moved.
   void liveSdrCaptureContextRequested(const QString& receiver_label,
                                       const QString& antenna,
-                                      bool automatic_gain, double gain_db);
+                                      bool automatic_gain, double gain_db,
+                                      double center_frequency_hz,
+                                      double sample_rate_hz);
   void debugCaptureChanged();
   // Relayed straight out of the live DSP worker. The controller is a wire
   // here and nothing more: it does not own the diagnostics service, does not

@@ -1260,8 +1260,10 @@ ReplayController::ReplayController(QObject* parent) : QObject(parent) {
             // Forward the gain the hardware actually applied, not the value
             // that was requested, so a later IQ capture documents the real
             // front-end state.
-            emit liveSdrCaptureContextRequested(sdr_device_name_, sdr_antenna_,
-                                                automatic_gain, gain_db);
+            emit liveSdrCaptureContextRequested(
+                sdr_device_name_, sdr_antenna_, automatic_gain, gain_db,
+                static_cast<double>(sdr_center_frequency_hz_),
+                static_cast<double>(sdr_sample_rate_hz_));
             source_name_ = sdr_device_name_;
             sample_rate_ = sample_rate_hz;
             duration_seconds_ = 0.0;
@@ -2671,6 +2673,15 @@ void ReplayController::setSdrInputSelection(
     // decoder move together instead of the tracks vanishing on the first
     // click of the dial.
     emit sdrRetuneRequested(static_cast<double>(sdr_center_frequency_hz_));
+    // And restate the acquisition the worker is to compare its block
+    // descriptors against. A retune does not restart the receiver, so the
+    // `started` signal does not fire again; without this the record's
+    // requested acquisition would stay at the frequency the session opened on
+    // and every later retune would read as a receiver that had gone astray.
+    emit liveSdrCaptureContextRequested(
+        sdr_device_name_, sdr_antenna_, sdr_automatic_gain_, sdr_gain_db_,
+        static_cast<double>(sdr_center_frequency_hz_),
+        static_cast<double>(sdr_sample_rate_hz_));
   }
 }
 

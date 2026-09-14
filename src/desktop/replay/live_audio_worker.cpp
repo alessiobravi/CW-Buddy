@@ -392,6 +392,12 @@ void LiveAudioDspWorker::start() {
   sdr_decoder_window_applied_ = false;
   applied_sdr_decoder_center_frequency_hz_ = 0.0;
   applied_sdr_decoder_bandwidth_hz_ = 0.0;
+  // Nothing has been sliced for detection yet, and a leftover slice from the
+  // previous session would read as a window in force in the next record.
+  detector_slice_lower_frequency_hz_ = 0.0;
+  detector_slice_upper_frequency_hz_ = 0.0;
+  observed_sdr_center_frequency_hz_ = 0.0;
+  observed_sdr_sample_rate_hz_ = 0.0;
   pending_manual_frequency_hz_.reset();
   decoder_.reset();
   character_frontends_.reset();
@@ -443,6 +449,12 @@ void LiveAudioDspWorker::stop() {
   sdr_decoder_window_applied_ = false;
   applied_sdr_decoder_center_frequency_hz_ = 0.0;
   applied_sdr_decoder_bandwidth_hz_ = 0.0;
+  // Nothing has been sliced for detection yet, and a leftover slice from the
+  // previous session would read as a window in force in the next record.
+  detector_slice_lower_frequency_hz_ = 0.0;
+  detector_slice_upper_frequency_hz_ = 0.0;
+  observed_sdr_center_frequency_hz_ = 0.0;
+  observed_sdr_sample_rate_hz_ = 0.0;
   pending_manual_frequency_hz_.reset();
   decoder_.reset();
   character_frontends_.reset();
@@ -762,7 +774,39 @@ QJsonObject LiveAudioDspWorker::buildDiagnosticsRecord(
   decoder_window.insert(QStringLiteral("appliedBandwidthHz"),
                         applied_sdr_decoder_bandwidth_hz_);
   decoder_window.insert(QStringLiteral("inForce"), sdr_decoder_window_applied_);
+  // And the slice those bins were actually taken at, which is the last link in
+  // the chain and the one no other field can be used to infer. A reader who
+  // finds `detectorLowerHz`/`detectorUpperHz` straddling `appliedCenterHz` a
+  // bandwidth wide knows detection was reading the window the record claims;
+  // anything else says the bins and the coordinates came from two different
+  // windows, whatever the four numbers above agree on.
+  decoder_window.insert(QStringLiteral("detectorLowerHz"),
+                        detector_slice_lower_frequency_hz_);
+  decoder_window.insert(QStringLiteral("detectorUpperHz"),
+                        detector_slice_upper_frequency_hz_);
   root.insert(QStringLiteral("decoderWindow"), decoder_window);
+
+  // The acquisition the decode window is carved out of, as a request and as
+  // the receiver reports it. Two numbers rather than one because they are two
+  // facts: `requested` is what the controller asked the hardware for, and
+  // `observed` is the descriptor the receiver stamped on the last complex
+  // block, which is its own read-back of the tuner rather than the value it
+  // was told. Every reported frequency in the direct-IQ path is
+  // observed-centre plus a baseband offset, so a receiver that silently landed
+  // somewhere other than where it was sent moves every track and every axis
+  // label by the difference while both decode-window readings above stay
+  // exactly as configured -- a divergence that had no witness at all before
+  // these fields, and cost a round trip to the station to even localise.
+  QJsonObject acquisition;
+  acquisition.insert(QStringLiteral("requestedCenterHz"),
+                     requested_sdr_center_frequency_hz_);
+  acquisition.insert(QStringLiteral("requestedSampleRateHz"),
+                     requested_sdr_sample_rate_hz_);
+  acquisition.insert(QStringLiteral("observedCenterHz"),
+                     observed_sdr_center_frequency_hz_);
+  acquisition.insert(QStringLiteral("observedSampleRateHz"),
+                     observed_sdr_sample_rate_hz_);
+  root.insert(QStringLiteral("acquisition"), acquisition);
 
   // Whether the thread that DRAWS is keeping up, which nothing above measures.
   //
@@ -1333,7 +1377,11 @@ void LiveAudioDspWorker::setRadioFrequencyContext(const bool available,
 void LiveAudioDspWorker::setSdrCaptureContext(const QString& receiver_label,
                                               const QString& antenna,
                                               const bool automatic_gain,
-                                              const double gain_db) {
+                                              const double gain_db,
+                                              const double center_frequency_hz,
+                                              const double sample_rate_hz) {
+  requested_sdr_center_frequency_hz_ = center_frequency_hz;
+  requested_sdr_sample_rate_hz_ = sample_rate_hz;
   sdr_receiver_label_ = receiver_label;
   sdr_antenna_ = antenna;
   sdr_automatic_gain_ = automatic_gain;
@@ -1512,7 +1560,14 @@ void LiveAudioDspWorker::produceRegionAudio(
       block.stream.kind != cwassistant::core::StreamKind::ComplexIq) {
     return;
   }
-  const double bandwidth_hz = sdr_decoder_bandwidth_hz_;
+  // The applied width, for the same reason the detector slice uses it: `block`
+  // here IS the channelizer's output, so the region these samples carry is the
+  // one the channelizer was configured with. Demodulating them as though they
+  // were the requested width shifts the whole region by half the difference --
+  // the single-sideband shift is W/2 and W is the wrong W -- so every station
+  // in it would be heard at the wrong pitch while the decoder, reading the
+  // same samples, reported them correctly.
+  const double bandwidth_hz = applied_sdr_decoder_bandwidth_hz_;
   const double input_rate_hz = block.stream.sample_rate_hz;
   if (!region_audio_active_ ||
       region_demodulator_.config().bandwidth_hz != bandwidth_hz ||
@@ -1593,6 +1648,12 @@ void LiveAudioDspWorker::drain() {
     ++drained;
     processing_complex_iq_ =
         block.stream.kind == cwassistant::core::StreamKind::ComplexIq;
+    if (processing_complex_iq_) {
+      // Recorded off every block rather than once at start, because this is
+      // the number a retune changes and a retune does not restart the worker.
+      observed_sdr_center_frequency_hz_ = block.stream.center_frequency_hz;
+      observed_sdr_sample_rate_hz_ = block.stream.sample_rate_hz;
+    }
     const std::size_t wanted_fft_size =
         block.stream.kind == cwassistant::core::StreamKind::ComplexIq ? 16'384U
                                                                       : 2'048U;
@@ -1732,17 +1793,36 @@ void LiveAudioDspWorker::drain() {
         continue;
       }
       const double bin_width_hz = snapshot.bin_width_hz;
-      const double requested_lower_hz =
-          sdr_decoder_center_frequency_hz_ - sdr_decoder_bandwidth_hz_ * 0.5;
-      const double requested_upper_hz =
-          sdr_decoder_center_frequency_hz_ + sdr_decoder_bandwidth_hz_ * 0.5;
+      // The APPLIED window, not the requested one. `snapshot` was produced by
+      // `decoder_analyzer_` from the channelizer's output, and the channelizer
+      // is carving out the applied window: its bins run from
+      // applied centre - rate/2 upwards. Slicing them at bin positions derived
+      // from a window that is not in force asks for bins of one spectrum by
+      // the coordinates of another, and the two coincide only while the two
+      // windows agree. They do not agree whenever a request was refused --
+      // which is exactly the state `applied_*` exists to make visible -- and
+      // the slice then lands wherever the arithmetic happens to put it: a
+      // requested window offset from the applied one by more than its own
+      // width clamps to a single bin at one edge, so detection is handed one
+      // bin of filtered noise and the decoder goes quiet while the overview
+      // spectrum keeps painting normally.
+      //
+      // Reachability today is bounded by the settings, which clamp the decode
+      // bandwidth into the range the channelizer accepts, so `applySdr...`
+      // does not currently fail and the two windows do agree by the time this
+      // runs. That is a property of a clamp three layers away, not of this
+      // code, and it is not what the separation was built to rely on.
+      const double applied_lower_hz = applied_sdr_decoder_center_frequency_hz_ -
+                                      applied_sdr_decoder_bandwidth_hz_ * 0.5;
+      const double applied_upper_hz = applied_sdr_decoder_center_frequency_hz_ +
+                                      applied_sdr_decoder_bandwidth_hz_ * 0.5;
       const auto first_bin = static_cast<std::size_t>(std::clamp(
-          std::ceil((requested_lower_hz - snapshot.lower_frequency_hz) /
+          std::ceil((applied_lower_hz - snapshot.lower_frequency_hz) /
                     bin_width_hz),
           0.0,
           static_cast<double>(snapshot.instantaneous_bins_dbfs.size() - 1U)));
       const auto last_bin = static_cast<std::size_t>(std::clamp(
-          std::floor((requested_upper_hz - snapshot.lower_frequency_hz) /
+          std::floor((applied_upper_hz - snapshot.lower_frequency_hz) /
                      bin_width_hz),
           static_cast<double>(first_bin),
           static_cast<double>(snapshot.instantaneous_bins_dbfs.size() - 1U)));
@@ -1752,12 +1832,25 @@ void LiveAudioDspWorker::drain() {
       const auto detector_bins = std::span<const float>(
           snapshot.instantaneous_bins_dbfs.data() + first_bin,
           last_bin - first_bin + 1U);
-      ++detector_frames_;
-      static_cast<void>(decoder_.updateSpectrum(
-          snapshot.timestamp_ns, detector_lower_hz,
+      // `lower` and `upper` name the CENTRES of the first and last bin, not
+      // the edges of the band they cover: the channel bank divides the span by
+      // one less than the bin count and reads bin k at
+      // lower + k * (upper - lower) / (n - 1). The audio path has always fed
+      // it that way -- the analyzer's audio bounds are first_bin * width and
+      // last_bin * width -- and passing the band's upper EDGE here instead
+      // stretched the grid by one bin across the window, so every track in the
+      // IQ path read high by up to one bin width (about 7 Hz in a 24 kHz
+      // window) in proportion to its distance above the window's lower edge.
+      const double detector_upper_hz =
           detector_lower_hz +
-              static_cast<double>(detector_bins.size()) * bin_width_hz,
-          detector_bins, false));
+          static_cast<double>(detector_bins.size() - 1U) * bin_width_hz;
+      detector_slice_lower_frequency_hz_ = detector_lower_hz;
+      detector_slice_upper_frequency_hz_ = detector_upper_hz;
+      ++detector_frames_;
+      static_cast<void>(decoder_.updateSpectrum(snapshot.timestamp_ns,
+                                                detector_lower_hz,
+                                                detector_upper_hz,
+                                                detector_bins, false));
     }
     if (pending_manual_frequency_hz_.has_value() &&
         !decoder_snapshots.empty()) {

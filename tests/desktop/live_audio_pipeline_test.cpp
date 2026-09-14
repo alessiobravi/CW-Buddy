@@ -1,6 +1,7 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <QFile>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QMetaObject>
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <numbers>
 #include <string_view>
@@ -35,6 +37,12 @@ constexpr int kGuiPeakNotWindowScoped = 24;
 // what Settings showed, which answers a different question: settings hold a
 // request, and a request the channelizer refused is not a window in force.
 constexpr int kDecoderWindowNotReported = 25;
+// The frequency reference, from 26 up.
+constexpr int kNoTrackForCarrier = 26;
+constexpr int kTrackRfWrong = 27;
+constexpr int kTrackRfWrongAfterRetune = 28;
+constexpr int kDetectorSliceNotReported = 29;
+constexpr int kDetectorSliceFollowsRefusedWindow = 45;
 
 // Region audio, from 30 up.
 constexpr int kRegionAudioWithoutConsumer = 30;
@@ -291,7 +299,7 @@ int runRegionAudioChecks() {
   constexpr double kMirrorAudioHz =
       kRegionBandwidthHz * 0.5 - kCarrierOffsetHz;
   constexpr std::size_t kIqBlockSamples = 2'048;
-  constexpr std::size_t kIqBlockCount = 160;
+  constexpr std::size_t kIqBlockCount = 200;
   std::vector<cwassistant::core::RealtimeSampleBlock> iq_blocks(kIqBlockCount);
   double phase = 0.0;
   for (std::size_t index = 0; index < iq_blocks.size(); ++index) {
@@ -412,6 +420,40 @@ int runRegionAudioChecks() {
       qCritical().noquote() << "region monitor is mirrored: wanted=" << wanted
                             << "mirror=" << mirror;
       return kRegionMonitorMirrored;
+    }
+
+    // 2b. A window the channelizer refuses must not move what the operator
+    //     hears. The samples reaching the demodulator are the channelizer's
+    //     output, so the region they carry is the APPLIED one; demodulating
+    //     them as though they were the width that was merely requested gets
+    //     the single-sideband shift wrong -- it is half the region's width --
+    //     and every station in the region arrives at a different pitch while
+    //     the decoder, reading the very same samples, still reports them
+    //     correctly. A station listening to a region it cannot reconcile with
+    //     the frequencies on screen is exactly the complaint this began with.
+    {
+      constexpr double kRefusedBandwidthHz = 1'000.0;
+      QMetaObject::invokeMethod(worker, "setSdrDecoderWindow",
+                                Qt::BlockingQueuedConnection,
+                                Q_ARG(double, kIqCenterHz),
+                                Q_ARG(double, kRefusedBandwidthHz));
+      monitor_audio.clear();
+      feed(24);
+      const std::size_t refused_skip =
+          std::min<std::size_t>(4'096, monitor_audio.size() / 4);
+      const double still_wanted = magnitude_at(monitor_audio, monitor_rate_hz,
+                                               kExpectedAudioHz, refused_skip);
+      if (still_wanted < 0.05) {
+        qCritical().noquote()
+            << "a refused decode window moved the region audio: no tone left at"
+            << kExpectedAudioHz << "Hz:" << still_wanted;
+        return kRegionMonitorWrongPitch;
+      }
+      QMetaObject::invokeMethod(worker, "setSdrDecoderWindow",
+                                Qt::BlockingQueuedConnection,
+                                Q_ARG(double, kIqCenterHz),
+                                Q_ARG(double, kRegionBandwidthHz));
+      monitor_audio.clear();
     }
 
     // 3. The bound. Region audio crosses to the thread that plays, and that
@@ -670,6 +712,298 @@ int runComplexIqDiagnosticsChecks() {
   return result;
 }
 
+// What a decoded stream's frequency actually MEANS, driven end to end through
+// the real worker.
+//
+// A station reported streams and a spectrum axis tens of kilohertz away from
+// the truth -- FT8 at 7.074 MHz appearing inside the CW segment -- and
+// reported it as intermittent. Everything in the direct-IQ path is absolute
+// RF, and it stays absolute only because three references agree: the
+// descriptor the receiver stamps on each block, the window the channelizer was
+// configured with, and the bin grid the detector's slice is expressed on. Each
+// is maintained in a different object on a different thread, so "they agree"
+// is an assertion and not a fact, and nothing here asserted it.
+//
+// A synthesised carrier at a known absolute RF is the only honest test of
+// that: it is the one number all three references have to reproduce, and it
+// does not move when the receiver does.
+int runSdrFrequencyReferenceChecks() {
+  auto pipe = std::make_shared<cwassistant::desktop::LiveAudioPipe>();
+  QThread dsp_thread;
+  auto* worker = new cwassistant::desktop::LiveAudioDspWorker(pipe);
+  worker->moveToThread(&dsp_thread);
+  QObject::connect(&dsp_thread, &QThread::finished, worker,
+                   &QObject::deleteLater);
+
+  QJsonObject record;
+  QObject::connect(
+      worker,
+      &cwassistant::desktop::LiveAudioDspWorker::diagnosticsRecordProduced,
+      worker, [&record](const QJsonObject& published) { record = published; },
+      Qt::DirectConnection);
+
+  constexpr double kIqSampleRateHz = 192'000.0;
+  constexpr double kAcquisitionCenterHz = 14'050'000.0;
+  constexpr double kDecoderBandwidthHz = 24'000.0;
+  // Nine kilohertz above the window centre: inside the 24 kHz window, far
+  // enough from it that a grid stretched or shifted by the width of the window
+  // cannot still land on the right answer, and nowhere near the edge where the
+  // channelizer's anti-alias response would be doing the work instead.
+  constexpr double kCarrierHz = kAcquisitionCenterHz + 9'000.0;
+  // The receiver moves 50 kHz; the station does not. 50 + 12 kHz of window
+  // still fits inside the 96 kHz Nyquist of the acquired passband, so the
+  // channelizer keeps accepting blocks and the move is a retune rather than a
+  // window falling out of the passband. Deliberately NOT the 60 kHz decimated
+  // output rate: a move of exactly that aliases a carrier the mixer failed to
+  // follow back onto the very bin it should have been at, so the one arrangement
+  // that cannot fail is the one that looks most natural to choose.
+  constexpr double kRetunedCenterHz = kAcquisitionCenterHz + 50'000.0;
+  // A frequency the receiver was asked for and did not deliver. Nothing in the
+  // pipeline reconciles the two, which is the point: the record is the only
+  // place the disagreement can become visible.
+  constexpr double kRequestedAcquisitionCenterHz =
+      kAcquisitionCenterHz + 1'500.0;
+  constexpr std::size_t kIqBlockSamples = 2'048;
+
+  std::uint64_t next_sample = 0;
+  std::uint64_t next_sequence = 0;
+  // A real noise floor, about 48 dB below the carrier, from a fixed generator
+  // so every run sees the same spectrum.
+  //
+  // It is not realism for its own sake. A synthesised tone on an otherwise
+  // EMPTY spectrum leaves only rounding noise, and the detector's candidate
+  // search will happily pick a peak out of that and go on crediting a track
+  // that has not been seen since the receiver moved -- so an assertion that
+  // the carrier's track is still being fed passes on a path that lost the
+  // signal entirely. With a floor present, a slice the carrier is no longer
+  // in contains nothing that can be mistaken for it.
+  std::uint64_t noise_state = 0x9E3779B97F4A7C15ULL;
+  const auto noise = [&noise_state]() {
+    noise_state ^= noise_state << 13U;
+    noise_state ^= noise_state >> 7U;
+    noise_state ^= noise_state << 17U;
+    return 0.002F * (static_cast<float>(noise_state >> 40U) / 8'388'608.0F -
+                     1.0F);
+  };
+  const auto feed = [&](const double acquisition_center_hz,
+                        const std::size_t blocks) {
+    for (std::size_t produced = 0; produced < blocks;) {
+      std::size_t pushed = 0;
+      while (produced < blocks && pushed < 8) {
+        cwassistant::core::RealtimeSampleBlock block;
+        block.stream.kind = cwassistant::core::StreamKind::ComplexIq;
+        block.stream.sample_rate_hz = kIqSampleRateHz;
+        block.stream.center_frequency_hz = acquisition_center_hz;
+        block.stream.channel_count = 1;
+        block.sequence = next_sequence;
+        block.timestamp_ns = static_cast<std::uint64_t>(
+            static_cast<long double>(next_sample) * 1'000'000'000.0L /
+            kIqSampleRateHz);
+        block.sample_count = kIqBlockSamples;
+        for (std::size_t sample = 0; sample < block.sample_count; ++sample) {
+          // Absolute time, so the carrier's phase runs continuously through
+          // the retune exactly as a real station's does. Restarting it would
+          // let a path that reacquires the signal from scratch pass.
+          const double time =
+              static_cast<double>(next_sample + sample) / kIqSampleRateHz;
+          const double phase = 2.0 * std::numbers::pi *
+                               (kCarrierHz - acquisition_center_hz) * time;
+          block.samples[sample] = {
+              0.5F * static_cast<float>(std::cos(phase)) + noise(),
+              0.5F * static_cast<float>(std::sin(phase)) + noise()};
+        }
+        if (!pipe->blocks.try_push(block)) break;
+        next_sample += block.sample_count;
+        ++next_sequence;
+        ++produced;
+        ++pushed;
+      }
+      QMetaObject::invokeMethod(worker, "drain", Qt::BlockingQueuedConnection);
+    }
+  };
+
+  // The track nearest the carrier: how far off it is, and how much spectral
+  // evidence it has accumulated. Read from `allTrackDiagnostics`, not from the
+  // published channel model, because a frequency is wrong or right long before
+  // a track is verified enough to be shown, and this is a test of the
+  // coordinate system rather than of verification.
+  //
+  // The observation count is load-bearing and not decoration. A track that has
+  // stopped being seen does not vanish -- the bank parks it, precisely so an
+  // operator does not lose an identified station across a retune -- so its
+  // frequency stays readable in the record long after the decoder has ceased
+  // to find anything there. Asserting the frequency alone therefore passes on
+  // a path that has lost the signal entirely and is merely remembering where
+  // it used to be, which is exactly the state a stale mixer leaves behind.
+  struct CarrierTrack {
+    double error_hz{std::numeric_limits<double>::quiet_NaN()};
+    qint64 spectral_observations{0};
+  };
+  const auto carrierTrack = [&record]() {
+    const QJsonArray tracks = record.value(QStringLiteral("tracks")).toArray();
+    CarrierTrack best;
+    for (const QJsonValue& value : tracks) {
+      const QJsonObject track = value.toObject();
+      const double frequency_hz =
+          track.value(QStringLiteral("frequencyHz")).toDouble(0.0);
+      if (frequency_hz <= 0.0) continue;
+      const double error = frequency_hz - kCarrierHz;
+      if (!std::isfinite(best.error_hz) ||
+          std::abs(error) < std::abs(best.error_hz)) {
+        best.error_hz = error;
+        best.spectral_observations =
+            track.value(QStringLiteral("spectralObservations")).toInteger(0);
+      }
+    }
+    return best;
+  };
+  const auto publish = [&worker]() {
+    QMetaObject::invokeMethod(worker, "publishLiveDiagnosticsRecord",
+                              Qt::BlockingQueuedConnection);
+  };
+  // Half the decoder branch's own bin spacing: 60 kHz over an 8192-point
+  // transform, so 3.66 Hz. Tight on purpose. Every divergence this phase
+  // exists to catch is larger than the window itself, and a tolerance loose
+  // enough to absorb a bin would also absorb the grid being stretched by one.
+  constexpr double kToleranceHz = 60'000.0 / 8'192.0 / 2.0;
+
+  dsp_thread.start();
+  const int result = [&]() -> int {
+    QMetaObject::invokeMethod(worker, "start", Qt::BlockingQueuedConnection);
+    QMetaObject::invokeMethod(worker, "setSdrDecoderWindow",
+                              Qt::BlockingQueuedConnection,
+                              Q_ARG(double, kAcquisitionCenterHz),
+                              Q_ARG(double, kDecoderBandwidthHz));
+    // What the controller asked the receiver for, stated exactly as the
+    // controller states it at a start and at every retune. Deliberately a
+    // frequency the blocks below do NOT carry: the record has to be able to
+    // show a receiver that landed somewhere other than where it was sent,
+    // which it can only do if the two halves are kept apart.
+    QMetaObject::invokeMethod(worker, "setSdrCaptureContext",
+                              Qt::BlockingQueuedConnection,
+                              Q_ARG(QString, QStringLiteral("test receiver")),
+                              Q_ARG(QString, QStringLiteral("Antenna A")),
+                              Q_ARG(bool, false), Q_ARG(double, 20.0),
+                              Q_ARG(double, kRequestedAcquisitionCenterHz),
+                              Q_ARG(double, kIqSampleRateHz));
+
+    // 1. The carrier's absolute RF, straight out of the decoder.
+    feed(kAcquisitionCenterHz, 100);
+    publish();
+    CarrierTrack carrier = carrierTrack();
+    if (!std::isfinite(carrier.error_hz)) {
+      qCritical().noquote()
+          << "no track was formed for the synthesised carrier; detector="
+          << record.value(QStringLiteral("detector"));
+      return kNoTrackForCarrier;
+    }
+    if (std::abs(carrier.error_hz) > kToleranceHz) {
+      qCritical().noquote()
+          << "a track's reported RF is not the carrier's true RF: off by"
+          << carrier.error_hz << "Hz at" << kCarrierHz;
+      return kTrackRfWrong;
+    }
+
+    // And the record says which bins that answer was read off. Without it a
+    // wrong frequency cannot be localised any further than "somewhere in the
+    // chain", which is what cost a round trip to the station.
+    {
+      const QJsonObject window =
+          record.value(QStringLiteral("decoderWindow")).toObject();
+      const double lower =
+          window.value(QStringLiteral("detectorLowerHz")).toDouble(-1.0);
+      const double upper =
+          window.value(QStringLiteral("detectorUpperHz")).toDouble(-1.0);
+      const QJsonObject acquisition =
+          record.value(QStringLiteral("acquisition")).toObject();
+      if (std::abs(lower - (kAcquisitionCenterHz - kDecoderBandwidthHz * 0.5)) >
+              1'000.0 ||
+          std::abs(upper - (kAcquisitionCenterHz + kDecoderBandwidthHz * 0.5)) >
+              1'000.0 ||
+          acquisition.value(QStringLiteral("observedCenterHz")).toDouble(-1.0) !=
+              kAcquisitionCenterHz ||
+          acquisition.value(QStringLiteral("observedSampleRateHz"))
+                  .toDouble(-1.0) != kIqSampleRateHz ||
+          acquisition.value(QStringLiteral("requestedCenterHz"))
+                  .toDouble(-1.0) != kRequestedAcquisitionCenterHz ||
+          acquisition.value(QStringLiteral("requestedSampleRateHz"))
+                  .toDouble(-1.0) != kIqSampleRateHz) {
+        qCritical().noquote()
+            << "the record does not state the references a frequency was read "
+               "against: window="
+            << window << "acquisition=" << acquisition;
+        return kDetectorSliceNotReported;
+      }
+    }
+
+    // 2. The receiver moves and the station does not. The decode window is
+    //    republished unchanged, exactly as it is when an operator retunes
+    //    without touching the window, so nothing but the block descriptor
+    //    tells the decoder branch that the samples have moved under it.
+    const qint64 observations_before = carrier.spectral_observations;
+    feed(kRetunedCenterHz, 130);
+    publish();
+    carrier = carrierTrack();
+    if (!std::isfinite(carrier.error_hz) ||
+        std::abs(carrier.error_hz) > kToleranceHz ||
+        carrier.spectral_observations <= observations_before) {
+      qCritical().noquote()
+          << "a track's reported RF did not survive a receiver retune: off by"
+          << carrier.error_hz << "Hz at" << kCarrierHz << "with"
+          << carrier.spectral_observations
+          << "spectral observations against" << observations_before
+          << "before the retune";
+      return kTrackRfWrongAfterRetune;
+    }
+
+    // 3. A window the channelizer refuses. The bins the detector is handed
+    //    still come from the window in force, so they must still be sliced by
+    //    it: taking them at coordinates derived from the refused request asks
+    //    for one spectrum's bins by another spectrum's frequencies, and a
+    //    request this much narrower than what is in force collapses the slice
+    //    onto a sliver of the applied window that the carrier is not in.
+    {
+      constexpr double kRefusedBandwidthHz = 1'000.0;
+      QMetaObject::invokeMethod(worker, "setSdrDecoderWindow",
+                                Qt::BlockingQueuedConnection,
+                                Q_ARG(double, kAcquisitionCenterHz),
+                                Q_ARG(double, kRefusedBandwidthHz));
+      feed(kRetunedCenterHz, 40);
+      publish();
+      const QJsonObject window =
+          record.value(QStringLiteral("decoderWindow")).toObject();
+      const double lower =
+          window.value(QStringLiteral("detectorLowerHz")).toDouble(-1.0);
+      const double upper =
+          window.value(QStringLiteral("detectorUpperHz")).toDouble(-1.0);
+      if (upper - lower < kDecoderBandwidthHz * 0.9) {
+        qCritical().noquote()
+            << "detection was sliced by a window the channelizer refused:"
+            << window;
+        return kDetectorSliceFollowsRefusedWindow;
+      }
+      const qint64 observations_before_refusal = carrier.spectral_observations;
+      carrier = carrierTrack();
+      if (!std::isfinite(carrier.error_hz) ||
+          std::abs(carrier.error_hz) > kToleranceHz ||
+          carrier.spectral_observations <= observations_before_refusal) {
+        qCritical().noquote()
+            << "a refused window stopped or moved a track's reported RF: off by"
+            << carrier.error_hz << "Hz at" << kCarrierHz << "with"
+            << carrier.spectral_observations
+            << "spectral observations against" << observations_before_refusal
+            << "before the refusal";
+        return kDetectorSliceFollowsRefusedWindow;
+      }
+    }
+    return 0;
+  }();
+  QMetaObject::invokeMethod(worker, "stop", Qt::BlockingQueuedConnection);
+  dsp_thread.quit();
+  dsp_thread.wait();
+  return result;
+}
+
 // Audio-input resolution, from 50 up.
 //
 // A station rebooted his PC and reception refused to start: "the selected
@@ -806,6 +1140,10 @@ int main(int argc, char* argv[]) {
   if (const int complex_iq_result = runComplexIqDiagnosticsChecks();
       complex_iq_result != 0) {
     return complex_iq_result;
+  }
+  if (const int frequency_reference_result = runSdrFrequencyReferenceChecks();
+      frequency_reference_result != 0) {
+    return frequency_reference_result;
   }
   if (const int backpressure_result = runSpectrumBackpressureChecks();
       backpressure_result != 0) {

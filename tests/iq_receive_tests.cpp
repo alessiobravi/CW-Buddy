@@ -555,10 +555,121 @@ void testRegionAudioIdleUntilConfigured() {
          "an unconfigured region demodulator reserves nothing");
 }
 
+// A station reported decoded streams, and the spectrum axis, sitting tens of
+// kilohertz away from where the signals really were -- FT8 at 7.074 MHz
+// appearing inside the CW segment -- and reported it as intermittent rather
+// than as a fixed error. Intermittent points at a reference that can DIVERGE,
+// and the decoder branch has exactly one such reference: the decimator is told
+// the decode window as an absolute RF frequency, while the samples it is fed
+// carry their own absolute centre, which moves under it every time the
+// operator retunes.
+//
+// The arithmetic that connects them is `config_.center_frequency_hz -
+// input.stream.center_frequency_hz`, evaluated per block, and the whole
+// correctness of every reported frequency rests on that difference being taken
+// against the centre of THESE samples rather than against a remembered one.
+// Cache it -- at configure time, or at the first block, which is the obvious
+// optimisation for a value that changes rarely -- and nothing fails loudly:
+// the stream stays continuous, blocks keep being accepted, the decimated block
+// is still stamped with the decode window's absolute centre, and every
+// frequency reported out of it is simply wrong by however far the receiver
+// moved. That is the shape of the fault the operator described.
+void testDecoderWindowSurvivesAcquisitionRetune() {
+  using namespace cwassistant::core;
+  constexpr double input_rate = 240'000.0;
+  constexpr double first_center = 14'100'000.0;
+  // Deliberately a "tens of kHz" move, the magnitude the operator reported.
+  constexpr double retuned_center = 14'137'000.0;
+  constexpr double decoder_center = 14'110'000.0;
+  constexpr double decoder_bandwidth = 24'000.0;
+  constexpr double output_rate = 60'000.0;
+  constexpr std::size_t fft_size = 8'192;
+  // One fixed station. It does not move when the receiver does, which is the
+  // entire point: its absolute RF is the invariant both phases must reproduce.
+  constexpr double carrier_hz = decoder_center + 9'000.0;
+
+  IqSubbandDecimator channelizer(
+      {.center_frequency_hz = decoder_center,
+       .bandwidth_hz = decoder_bandwidth,
+       .maximum_output_sample_rate_hz = output_rate});
+  SpectrumAnalyzer analyzer({.fft_size = fft_size,
+                             .averaging_frames = 1,
+                             .frame_rate_hz = 60});
+
+  std::uint64_t sample_offset = 0;
+  std::uint64_t sequence = 0;
+  // The measured absolute RF of the strongest bin in the last spectrum a phase
+  // produced, or NaN if the phase produced none.
+  const auto measurePeakHz = [&](const double acquisition_center,
+                                 const std::size_t blocks) {
+    SpectrumSnapshot last;
+    bool have_last = false;
+    bool center_stamped = true;
+    for (std::size_t block_index = 0; block_index < blocks; ++block_index) {
+      RealtimeSampleBlock input;
+      input.stream = {.kind = StreamKind::ComplexIq,
+                      .sample_rate_hz = input_rate,
+                      .center_frequency_hz = acquisition_center,
+                      .channel_count = 1};
+      input.sequence = sequence++;
+      input.timestamp_ns = static_cast<std::uint64_t>(
+          static_cast<long double>(sample_offset) * 1'000'000'000.0L /
+          input_rate);
+      input.sample_count = input.samples.size();
+      for (std::size_t index = 0; index < input.sample_count; ++index) {
+        // Absolute time, so the carrier's PHASE is continuous across the
+        // retune as a real station's would be. Restarting it at each phase
+        // would hide a decimator that reacquired the signal from scratch.
+        const double time =
+            static_cast<double>(sample_offset + index) / input_rate;
+        const double phase = 2.0 * std::numbers::pi *
+                             (carrier_hz - acquisition_center) * time;
+        input.samples[index] = {static_cast<float>(std::cos(phase)),
+                                static_cast<float>(std::sin(phase))};
+      }
+      sample_offset += input.sample_count;
+      RealtimeSampleBlock decoded;
+      const auto status = channelizer.process(input, decoded);
+      if (status != IqBlockStatus::Accepted &&
+          status != IqBlockStatus::AcceptedAfterDiscontinuity) {
+        continue;
+      }
+      if (decoded.stream.center_frequency_hz != decoder_center) {
+        center_stamped = false;
+      }
+      for (auto& snapshot : analyzer.process(decoded)) {
+        last = std::move(snapshot);
+        have_last = true;
+      }
+    }
+    expect(center_stamped,
+           "the decoder branch is stamped with the decode window's own "
+           "absolute RF centre, whatever the receiver is tuned to");
+    if (!have_last) return std::numeric_limits<double>::quiet_NaN();
+    const auto peak = static_cast<std::size_t>(std::distance(
+        last.bins_dbfs.begin(),
+        std::max_element(last.bins_dbfs.begin(), last.bins_dbfs.end())));
+    return last.lower_frequency_hz +
+           static_cast<double>(peak) * last.bin_width_hz;
+  };
+
+  const double before_hz = measurePeakHz(first_center, 40);
+  expect(std::isfinite(before_hz) &&
+             std::abs(before_hz - carrier_hz) <= output_rate / fft_size,
+         "a station in the decode window reports its true absolute RF");
+  // The receiver moves 37 kHz; the station does not move at all.
+  const double after_hz = measurePeakHz(retuned_center, 40);
+  expect(std::isfinite(after_hz) &&
+             std::abs(after_hz - carrier_hz) <= output_rate / fft_size,
+         "a station keeps its true absolute RF after the receiver retunes "
+         "under the decode window");
+}
+
 }  // namespace
 
 int main() {
   testValidationAndTelemetry();
+  testDecoderWindowSurvivesAcquisitionRetune();
   testWideSpectrumCoordinates();
   testBoundedDecoderSubband();
   testWideIqAcrossBlocksAndDiscovery();
