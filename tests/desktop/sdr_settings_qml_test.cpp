@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <string>
 #include <string_view>
@@ -576,6 +577,60 @@ int main() {
         monitor_publish < start_request) {
       return 25;
     }
+  }
+
+  // The Ctrl+Right region drag must not fall through to the plain right-click
+  // that re-points the region at its existing width. An operator reported
+  // exactly that outcome -- "the region width is discarded... the previous
+  // width recentered as I clicked only right click" -- and there are three
+  // ways in: the release handler returns early and never sets the guard, the
+  // click reports its modifiers after Control was let go, or a lock key sets a
+  // bit that a strict equality against Qt.ControlModifier does not expect.
+  //
+  // So what the gesture is gets decided where it begins. The press claims the
+  // click, the click refuses while a selection is outstanding, and the
+  // modifier comparison ignores keys nobody deliberately holds.
+  // Sliced between two QML handler names rather than with functionBody, which
+  // looks for a closing brace in the first column and so spans to the end of
+  // an indented QML file -- it would find the assignment in the release
+  // handler and report a press that never claims anything as correct.
+  const std::size_t press_at = main_qml.find("onPressed: function(mouse)");
+  const std::size_t after_press =
+      main_qml.find("onPositionChanged: function(mouse)", press_at);
+  if (press_at == std::string::npos || after_press == std::string::npos) {
+    std::cerr << "the spectrum hit area no longer has the handlers this "
+                 "contract is about\n";
+    return 25;
+  }
+  const std::string press_body =
+      main_qml.substr(press_at, after_press - press_at);
+  if (press_body.find("suppressSelectionClick = true") == std::string::npos) {
+    std::cerr << "the press does not claim the click that follows it, so an "
+                 "early return from the release leaves the plain right-click "
+                 "free to re-point the region\n";
+    return 26;
+  }
+  if (main_qml.find("mouse.modifiers === required") != std::string::npos) {
+    std::cerr << "the modifier test is a strict equality, so Num Lock or a "
+                 "group switch changes what a gesture means\n";
+    return 27;
+  }
+  if (main_qml.find("mouse.modifiers & intentionalModifiers") ==
+      std::string::npos) {
+    std::cerr << "the modifier test does not mask the keys nobody holds on "
+                 "purpose\n";
+    return 28;
+  }
+  const std::string clicked_body = std::string(functionBody(main_qml,
+      "onClicked: function(mouse)"));
+  const std::size_t guard = clicked_body.find("if (decoderSelectionActive)");
+  const std::size_t repoint =
+      clicked_body.find("appSettings.sdrDecoderCenterFrequencyHz =");
+  if (guard == std::string::npos || repoint == std::string::npos ||
+      guard > repoint) {
+    std::cerr << "the click can re-point the region while a region selection "
+                 "is outstanding\n";
+    return 29;
   }
 
   return 0;

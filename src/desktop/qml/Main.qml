@@ -1010,8 +1010,19 @@ ApplicationWindow {
                                   * (spectrumDisplay.upperFrequencyHz
                                      - spectrumDisplay.lowerFrequencyHz)
                     }
+                    // Lock keys are not intentions. Num Lock sets
+                    // Qt.KeypadModifier on Windows and a group switch sets its
+                    // own bit, so a strict equality against Qt.ControlModifier
+                    // failed for an operator holding exactly Control with Num
+                    // Lock on -- and a gesture that depends on which lamps are
+                    // lit on the keyboard is a gesture nobody can rely on.
+                    // Only the keys a person deliberately holds are compared.
+                    readonly property int intentionalModifiers:
+                        Qt.ShiftModifier | Qt.ControlModifier
+                        | Qt.AltModifier | Qt.MetaModifier
                     function hasExactModifiers(mouse, required) {
-                        return mouse.modifiers === required
+                        return (mouse.modifiers & intentionalModifiers)
+                                === required
                     }
                     function streamIdAtX(positionX) {
                         if (width <= 0 || spectrumDisplay.upperFrequencyHz
@@ -1064,6 +1075,16 @@ ApplicationWindow {
                             decoderSelectionStartX = mouse.x
                             decoderSelectionCurrentX = mouse.x
                             decoderSelectionActive = true
+                            // Claimed here rather than on release. Every exit
+                            // from the release handler has to leave this set,
+                            // including the early ones, because the click that
+                            // follows is the plain right-click that re-points
+                            // the region at its existing width -- which is
+                            // precisely the wrong outcome for a gesture whose
+                            // whole purpose was to choose a new width, and is
+                            // indistinguishable from the drag having been
+                            // ignored.
+                            suppressSelectionClick = true
                             mouse.accepted = true
                         }
                     }
@@ -1239,6 +1260,25 @@ ApplicationWindow {
                         // and release already handled. Acting again here would
                         // give one gesture two outcomes, which is the thing
                         // this mapping exists to stop.
+                        //
+                        // Whether a selection happened is remembered from the
+                        // press, above, rather than re-read from the modifiers
+                        // this click reports: a release can arrive with
+                        // Control already let go, and then the test below sees
+                        // a bare right-click and re-points the region at the
+                        // width the operator had just replaced. What the
+                        // gesture was is decided when it begins.
+                        if (decoderSelectionActive) {
+                            // The release handler did not run to completion --
+                            // it returns early if the release reports a button
+                            // or a state it does not recognise. Clear the
+                            // selection here so the rubber band cannot be left
+                            // drawn on screen with no gesture behind it, and
+                            // still refuse to re-point the region, because a
+                            // selection was begun whatever the release said.
+                            decoderSelectionActive = false
+                            return
+                        }
                         if (hasExactModifiers(mouse, Qt.ControlModifier))
                             return
                         if (!hasExactModifiers(mouse, Qt.NoModifier)) return

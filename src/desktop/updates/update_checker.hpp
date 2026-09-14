@@ -22,6 +22,23 @@ struct UpdateActionVisibility {
 [[nodiscard]] bool isTransientFailure(QNetworkReply::NetworkError error,
                                       int http_status) noexcept;
 [[nodiscard]] int retryDelayMs(int completed_attempts) noexcept;
+// Whether a transfer that reported no error nonetheless ended short of what
+// the server said it would send.
+//
+// A download that stops early is not always an error the network stack
+// reports: a gateway that times out mid-body, or a connection closed after the
+// headers, can leave a short payload behind a perfectly successful reply. The
+// bytes are then hashed, the hash does not match, and the operator is told the
+// download was corrupted or tampered with -- which sends them looking for a
+// bad release when the release is intact and the transfer simply did not
+// finish. The two failures need different answers: a short transfer is worth
+// retrying, and a complete transfer whose contents are wrong is not.
+//
+// A declared length of zero or less means the server did not say, which is not
+// evidence of anything; only a payload demonstrably shorter than an announced
+// length counts.
+[[nodiscard]] bool isIncompleteTransfer(qint64 declared_content_length,
+                                        qint64 received_bytes) noexcept;
 [[nodiscard]] UpdateActionVisibility updateActionVisibility(
     bool update_available, bool platform_supported,
     bool download_verified) noexcept;

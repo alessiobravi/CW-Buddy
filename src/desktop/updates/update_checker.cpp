@@ -44,6 +44,12 @@ constexpr auto kManifestUrl =
 
 namespace update_detail {
 
+bool isIncompleteTransfer(const qint64 declared_content_length,
+                          const qint64 received_bytes) noexcept {
+  if (declared_content_length <= 0) return false;
+  return received_bytes < declared_content_length;
+}
+
 bool isTransientFailure(const QNetworkReply::NetworkError error,
                         const int http_status) noexcept {
   if (http_status == 404 || http_status == 408 || http_status == 425 ||
@@ -312,8 +318,30 @@ void UpdateChecker::handleChecksumsReply(QNetworkReply* reply) {
                        error);
     return;
   }
-  pending_checksums_text_ = reply->readAll();
+  const auto checksums_payload = reply->readAll();
+  const auto checksums_declared_length =
+      reply->header(QNetworkRequest::ContentLengthHeader).toLongLong();
   reply->deleteLater();
+  // A truncated checksum list would otherwise present as "no published
+  // checksum for this file", which reads as a release that was published
+  // wrongly rather than as a transfer that did not finish.
+  if (update_detail::isIncompleteTransfer(checksums_declared_length,
+                                          checksums_payload.size())) {
+    if (checksums_attempts_ < update_detail::kMaximumAttempts) {
+      setStatus(QStringLiteral("Checksum list ended early; retrying…"));
+      emit stateChanged();
+      QTimer::singleShot(update_detail::retryDelayMs(checksums_attempts_), this,
+                         [this] { requestChecksums(); });
+      return;
+    }
+    finishDownload(false, QStringLiteral(
+                              "The checksum list ended after %1 of %2 bytes; "
+                              "nothing was verified.")
+                              .arg(checksums_payload.size())
+                              .arg(checksums_declared_length));
+    return;
+  }
+  pending_checksums_text_ = checksums_payload;
 
   setStatus(QStringLiteral("Downloading update…"));
   emit stateChanged();
@@ -360,7 +388,33 @@ void UpdateChecker::handleArtifactReply(QNetworkReply* reply) {
   const auto file_name =
       QFileInfo(QUrl(pending_artifact_url_).path()).fileName();
   const auto payload = reply->readAll();
+  const auto declared_length =
+      reply->header(QNetworkRequest::ContentLengthHeader).toLongLong();
   reply->deleteLater();
+
+  // Before hashing, not after. A transfer that stopped early hashes to
+  // something that is not the published checksum, and reporting that as a
+  // checksum failure accuses the release of being corrupt when the bytes
+  // simply never arrived. Retried like any other transient failure, because
+  // that is what it is.
+  if (update_detail::isIncompleteTransfer(declared_length, payload.size())) {
+    const bool retry = artifact_attempts_ < update_detail::kMaximumAttempts;
+    if (retry) {
+      setStatus(QStringLiteral("Download ended early; retrying…"));
+      emit stateChanged();
+      QTimer::singleShot(update_detail::retryDelayMs(artifact_attempts_), this,
+                         [this] { requestArtifact(); });
+      return;
+    }
+    finishDownload(false,
+                   QStringLiteral(
+                       "Download of %1 ended after %2 of %3 bytes. The "
+                       "release was not reached; nothing was verified.")
+                       .arg(file_name)
+                       .arg(payload.size())
+                       .arg(declared_length));
+    return;
+  }
 
   const auto expected_hash = expectedHashFor(pending_checksums_text_, file_name);
   const auto local_hash =

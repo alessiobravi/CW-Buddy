@@ -8,6 +8,33 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ### Fixed
 
+- Ctrl+Right sizes the decode region again. Three separate ways let the gesture
+  fall through to the plain right-click that re-points the region at its
+  existing width, which is the outcome an operator saw: the region moved to
+  where they released and kept the width they had just replaced, which is
+  indistinguishable from the drag being ignored. The release handler set the
+  guard that suppresses the following click, so any early return from it left
+  that click free to act; the click then re-read the modifiers it was given,
+  which need not still include Control by the time a release is delivered; and
+  the comparison was a strict equality, so Num Lock -- which sets a keypad bit
+  on Windows -- made a gesture mean something different depending on which lamps
+  were lit on the keyboard. What a gesture is is now decided where it begins:
+  the press claims the click that follows it, the click refuses to re-point
+  while a selection is outstanding, and only keys somebody deliberately holds
+  are compared.
+
+- A download that ends early is reported as a failed download rather than as a
+  failed checksum. A gateway timing out mid-body, or a connection closed after
+  the headers, can leave a short payload behind a reply the network stack calls
+  successful; those bytes were then hashed and the operator was told the release
+  had been corrupted or tampered with. An intact release was accused on the
+  strength of a transfer that never finished, which wastes the operator's time
+  and spends the credibility of the one message that must be believed when it is
+  real. The announced length is checked before anything is hashed, at both the
+  artifact and the checksum list, and a short transfer is retried like any other
+  transient failure. A server that announces no length is not evidence of
+  anything and is left alone.
+
 - A configured SDR LO offset is no longer applied twice to every frequency a
   direct-SDR session reports. The offset tunes the hardware to `rx + offset` and
   leaves the decode window at `rx`; the settings clamped it to one margin below
