@@ -1068,6 +1068,25 @@ ApplicationWindow {
                         // sizes it. A click without a drag keeps the width,
                         // which is the same distinction the sizing already
                         // makes.
+                        // Reported unconditionally, into the session log an
+                        // operator opts into with --log-file. Three rounds of
+                        // inference about why this gesture does not size the
+                        // region were each wrong, because every explanation
+                        // was consistent with what could be seen from outside.
+                        // These are the four values the decision is actually
+                        // made from, so the next report answers it instead of
+                        // narrowing it.
+                        if (mouse.button === Qt.RightButton) {
+                            console.log("region-gesture press"
+                                        + " modifiers=" + mouse.modifiers
+                                        + " intentional="
+                                        + (mouse.modifiers
+                                           & intentionalModifiers)
+                                        + " wantCtrl=" + Qt.ControlModifier
+                                        + " sourceMode="
+                                        + replayController.sourceMode
+                                        + " enabled=" + enabled)
+                        }
                         if (mouse.button === Qt.RightButton
                                 && hasExactModifiers(mouse,
                                                      Qt.ControlModifier)
@@ -1187,6 +1206,12 @@ ApplicationWindow {
                         // frequency that is merely the middle of a selection,
                         // which is rarely where a signal is. Deciding what to
                         // decode is CTRL+RIGHT on the signal itself.
+                        console.log("region-gesture release"
+                                    + " startX=" + decoderSelectionStartX
+                                    + " endX=" + decoderSelectionCurrentX
+                                    + " dragged=" + dragged
+                                    + " bandwidthHz=" + bandwidthHz
+                                    + " centreHz=" + selectedCenterHz)
                         appSettings.setSdrDecoderWindow(selectedCenterHz,
                                                         bandwidthHz)
                         decoderSelectionActive = false
@@ -1286,9 +1311,14 @@ ApplicationWindow {
                         // an audio card there is no window to move, so the
                         // gesture has nothing to do rather than falling back
                         // to the manual session it used to also perform.
-                        if (replayController.sourceMode === 2)
+                        if (replayController.sourceMode === 2) {
+                            console.log("region-gesture repoint"
+                                        + " modifiers=" + mouse.modifiers
+                                        + " -- the plain right-click moved the"
+                                        + " region and left its width alone")
                             appSettings.sdrDecoderCenterFrequencyHz =
                                 Math.round(frequencyAtX(mouse.x))
+                        }
                     }
                 }
                 Rectangle {

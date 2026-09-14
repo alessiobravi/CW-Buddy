@@ -917,6 +917,21 @@ devices apart any more, so a choice would be a guess -- and the wrong guess
 would put a different radio on the decoder without anything on screen saying so.
 Pick the one you want in Settings.
 
+**Sizing the decode region.** Hold Ctrl and drag with the right button across
+the spectrum to set both where the region sits and how wide it is; the width the
+drag will apply is shown while you move, so the 2 kHz floor and the 24 kHz
+ceiling correct the gesture where you can see it rather than silently on
+release. A plain right-click, with no Ctrl, moves the region to where you
+clicked and leaves its width alone. Releasing a Ctrl+Right drag never falls back
+to that: what the gesture is gets settled when you press, so letting go of Ctrl
+before the button, or having Num Lock on, cannot turn a resize into a move.
+
+**If an update will not install.** A download that stops part way is reported as
+a download that failed, and retried. It is worth knowing that this is different
+from a checksum failure, which means the bytes arrived and were not the bytes
+that were published -- that one is never retried automatically and should not
+be. If you see it, the release itself is suspect, not your connection.
+
 **How a stream earns its name.** CW Buddy decodes each signal along two
 independent paths -- a literal reading and a refined one that re-times the same
 evidence -- and a callsign both of them read, as a whole word, on a prefix some
