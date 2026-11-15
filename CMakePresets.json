@@ -9,21 +9,25 @@
     {
       "name": "dev",
       "displayName": "Developer build",
+      "description": "Debug build of the whole application, Qt layer included, with every test. The desktop application defaults to OFF in CMakeLists.txt, which left this preset building the core alone and running 38 of the 56 tests: the documented workflow has to compile what it is documented to verify. Requires Qt 6.5 or newer; add -DCWA_BUILD_DESKTOP=OFF for a core-only build on a machine without Qt.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/dev",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CWA_BUILD_DESKTOP": "ON",
         "CWA_BUILD_TESTS": "ON"
       }
     },
     {
       "name": "release",
       "displayName": "Release build",
+      "description": "Optimized build of the same targets as dev. It builds the desktop application for the same reason: a release preset that cannot produce the program this project ships, and that runs a smaller test set than the debug preset beside it, is a check that can pass what dev fails. The packaging configuration is gated on CWA_BUILD_DESKTOP too, so without it nothing here is packageable. Requires Qt 6.5 or newer; add -DCWA_BUILD_DESKTOP=OFF for a core-only build on a machine without Qt.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/release",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
+        "CWA_BUILD_DESKTOP": "ON",
         "CWA_BUILD_TESTS": "ON"
       }
     }

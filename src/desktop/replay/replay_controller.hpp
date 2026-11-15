@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../visualization/spectrum_frame.hpp"
+#include "cwassistant/core/cw_channel_bank.hpp"
 #include "cwassistant/core/cw_character_decoder.hpp"
 #include "cwassistant/core/cw_spot_registry.hpp"
 #include "cwassistant/core/offline_callsign_database.hpp"
@@ -717,10 +718,21 @@ class ReplayController final : public QObject {
   QString keying_model_{QStringLiteral("adaptive-threshold")};
   // Mirrors the operator preference so the current gate can be read back, and
   // so the pair can be resent to a worker whenever the decoder configuration
-  // has been replaced wholesale underneath it. The defaults match the core
-  // decoder's own: weak-signal decoding off, with a measured 12.0 dB gate.
-  bool decode_weak_signals_{false};
-  double minimum_decode_snr_db_{12.0};
+  // has been replaced wholesale underneath it.
+  //
+  // Both defaults are read from the channel bank's own configuration instead
+  // of being written out a second time here. Startup pushes the operator's
+  // stored preference down from AppSettings, so these are only ever the
+  // values in force before that push arrives -- which is exactly how the
+  // figure here went stale and sat at three times the gate the decoder
+  // actually applies. A threshold that exists in several copies is a
+  // threshold that will eventually disagree with itself, so the core holds
+  // the one copy, and the measurements behind its value are documented beside
+  // it rather than restated here.
+  bool decode_weak_signals_{
+      cwassistant::core::CwChannelBankConfig{}.decode_weak_signals};
+  double minimum_decode_snr_db_{
+      cwassistant::core::CwChannelBankConfig{}.minimum_decode_snr_db};
   QString offline_callsign_database_state_{QStringLiteral("disabled")};
   QString offline_callsign_database_status_{
       QStringLiteral("Offline callsign suggestions disabled.")};

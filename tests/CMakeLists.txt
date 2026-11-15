@@ -23,6 +23,33 @@ add_executable(cwa_transmit_scheduler_tests cw_transmit_scheduler_tests.cpp)
 target_link_libraries(cwa_transmit_scheduler_tests PRIVATE cwa_core)
 add_test(NAME cwa_transmit_scheduler_tests COMMAND cwa_transmit_scheduler_tests)
 
+# Numerical conditioning that no functional test can see, because every
+# individual block is decoded correctly and only the accumulation over
+# millions of them is wrong. Two cases cover the mixing oscillators a track
+# carries across block boundaries, which drift without bound if they are not
+# renormalized. The third is not a regression test at all: it pins the
+# deliberate one-LSB asymmetry between what WavWriter emits at full scale and
+# what WavReplaySource decodes, so that the next reader to notice it finds the
+# reasoning rather than repeating the attempt to "correct" it.
+add_executable(cwa_core_numerics_tests core_numerics_tests.cpp)
+target_link_libraries(cwa_core_numerics_tests PRIVATE cwa_core)
+add_test(NAME cwa_core_numerics_tests COMMAND cwa_core_numerics_tests)
+
+# Contracts that hold regardless of what the decoder is doing: a latched
+# transmit fault stays latched, and the shared dictionaries load exactly once
+# however many callers race for them first.
+#
+# Deliberately without CWA_DICTIONARY_DIR, unlike every other target here. The
+# race this proves is in the lazy first load, and the path it races on is the
+# compiled-in fallback; the test unsets the variable itself so that an
+# environment pointing at the shipped files cannot quietly route it past the
+# code under test. Threads::Threads because the race needs real concurrent
+# first callers, and GCC against an older glibc needs -pthread at link time.
+find_package(Threads REQUIRED)
+add_executable(cwa_core_integrity_tests core_integrity_tests.cpp)
+target_link_libraries(cwa_core_integrity_tests PRIVATE cwa_core Threads::Threads)
+add_test(NAME cwa_core_integrity_tests COMMAND cwa_core_integrity_tests)
+
 add_executable(cwa_hardware_acceptance_tests hardware_acceptance_tests.cpp)
 target_link_libraries(cwa_hardware_acceptance_tests PRIVATE cwa_core)
 add_test(NAME cwa_hardware_acceptance_tests COMMAND cwa_hardware_acceptance_tests)
@@ -70,7 +97,8 @@ target_compile_definitions(cwa_sdr_settings_qml_test PRIVATE
   CWA_APP_SETTINGS_HPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/settings/app_settings.hpp"
   CWA_APP_SETTINGS_CPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/settings/app_settings.cpp"
   CWA_REPLAY_CONTROLLER_HPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/replay/replay_controller.hpp"
-  CWA_REPLAY_CONTROLLER_CPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/replay/replay_controller.cpp")
+  CWA_REPLAY_CONTROLLER_CPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/replay/replay_controller.cpp"
+  CWA_DESKTOP_MAIN_CPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/main.cpp")
 add_test(NAME cwa_sdr_settings_qml_test
   COMMAND cwa_sdr_settings_qml_test)
 

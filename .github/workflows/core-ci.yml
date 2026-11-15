@@ -1,6 +1,13 @@
 name: Cross-platform Core CI
 
 on:
+  # A pull request gates the merge, and a push to main gates the release:
+  # every push to main publishes one, and this matrix is the only build that
+  # proves the core still compiles and passes on all four platforms with no Qt
+  # present. Without the push trigger a release could be published from a main
+  # that no dependency-free job had ever seen.
+  push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -47,6 +54,12 @@ jobs:
 
   project-records:
     name: Changelog, backlog, and manuals updated
+    # Pull requests only, and deliberately so. The check compares the event's
+    # base revision against its head, and a push event carries neither: run on
+    # a push it would hand the script two empty revisions and fail the release
+    # gate on a comparison it was never given anything to compare. The records
+    # a push publishes were already checked on the pull request that produced
+    # the commit.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     steps:

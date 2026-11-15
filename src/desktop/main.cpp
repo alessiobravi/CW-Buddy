@@ -311,6 +311,18 @@ int main(int argc, char* argv[]) {
       QStringLiteral("smoke-test"),
       QStringLiteral("Load and render the desktop shell, then exit."));
   parser.addOption(smoke_test_option);
+  // Registered so the parser will accept it, though it is not read from here.
+  // Logging has to be installed before anything that might log, which is well
+  // before a parser exists, so the value is taken from a direct scan of argv
+  // further up. Leaving it unregistered made the documented flag unusable: the
+  // scan honoured it, the parser then rejected the whole command line as
+  // carrying an unknown option, and an operator following the manual was told
+  // the flag does not exist.
+  QCommandLineOption log_file_option(
+      QStringLiteral("log-file"),
+      QStringLiteral("Write this session's diagnostic output to a file."),
+      QStringLiteral("path"));
+  parser.addOption(log_file_option);
   parser.process(application);
 
   QQuickStyle::setStyle(QStringLiteral("Material"));

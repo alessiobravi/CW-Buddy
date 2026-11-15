@@ -633,5 +633,187 @@ int main() {
     return 29;
   }
 
+  // Every option the manual tells an operator to pass must be registered with
+  // the parser, even one the parser does not read. --log-file is taken from a
+  // direct scan of argv, because logging has to be installed before a parser
+  // exists; leaving it unregistered meant the scan honoured the flag and the
+  // parser then rejected the whole command line as carrying an unknown option.
+  // An operator following the manual was told the flag does not exist.
+  const std::string main_cpp = readFile(CWA_DESKTOP_MAIN_CPP_PATH);
+  if (main_cpp.empty()) {
+    std::cerr << "the desktop entry point could not be read\n";
+    return 30;
+  }
+  if (main_cpp.find("\"--log-file\"") == std::string::npos) {
+    std::cerr << "--log-file is no longer scanned out of argv before the "
+                 "logger is installed\n";
+    return 31;
+  }
+  // The registration, not the declaration. Asserting that the option object
+  // exists passes against a build where it is constructed and never handed to
+  // the parser, which is exactly the state that made the flag unusable.
+  if (main_cpp.find("parser.addOption(log_file_option)") == std::string::npos) {
+    std::cerr << "--log-file is scanned but never registered with the parser, "
+                 "so passing it is rejected as an unknown option\n";
+    return 32;
+  }
+
+  // The SDR page reports the scan it is waiting for; it does not keep its own
+  // answer. sdrDiscoveryRunning became a read-only binding onto the settings
+  // object, which raises and clears the state on the pooled thread that does
+  // the enumerating -- but the setter it used to have was left behind, and
+  // QML refuses to assign to a read-only property. Every single change to an
+  // SDR setting therefore logged "Cannot assign to read-only property" from a
+  // handler whose only statement could never run.
+  if (!contains(qml,
+                "readonly property bool sdrDiscoveryRunning: "
+                "appSettings.sdrDiscoveryRunning")) {
+    std::cerr << "the SDR waiting state is no longer read from the settings "
+                 "object, so the page can claim progress it cannot observe\n";
+    return 33;
+  }
+  // Any assignment at all, not one spelling of one. Reading the state and
+  // comparing against it stay legal, so the single `=` is what is looked for:
+  // `===` is a test, and `:` is the declaration itself.
+  constexpr std::string_view discovery_state = "sdrDiscoveryRunning";
+  bool assigns_discovery_state = false;
+  for (std::size_t at = qml.find(discovery_state); at != std::string::npos;
+       at = qml.find(discovery_state, at + 1)) {
+    const std::size_t after =
+        qml.find_first_not_of(' ', at + discovery_state.size());
+    if (after != std::string::npos && after + 1 < qml.size() &&
+        qml[after] == '=' && qml[after + 1] != '=') {
+      assigns_discovery_state = true;
+      break;
+    }
+  }
+  if (assigns_discovery_state) {
+    std::cerr << "SettingsPane assigns to sdrDiscoveryRunning, which is a "
+                 "read-only binding: the assignment is refused at runtime and "
+                 "logs an error on every SDR settings change\n";
+    return 33;
+  }
+
+  // The shared slider's handle must not be declared as a plain binding onto
+  // the value it edits.
+  //
+  // A Slider writes its own `value` as it is dragged, and a QML property that
+  // has been written to keeps the written value: the binding is gone for the
+  // rest of that control's life. From the first drag onwards the handle stops
+  // following the property, while the caption beside it goes on reading the
+  // property directly -- so after any clamp or rounding on the C++ side the
+  // two halves of one control show different numbers. Three settings are
+  // presented through this component in more than one pane at once, so the
+  // same value can be left disagreeing with itself across panes as well.
+  //
+  // Only the Slider's own block is searched: the Binding that replaces the
+  // broken declaration legitimately mentions the same expression.
+  const std::string labeled_slider =
+      readFile(std::filesystem::path(CWA_SETTINGS_QML_PATH).parent_path() /
+               "LabeledSlider.qml");
+  const std::size_t handle_begin = labeled_slider.find("Slider {");
+  const std::size_t handle_end = labeled_slider.find("\n    }", handle_begin);
+  const std::string_view handle =
+      handle_begin == std::string::npos || handle_end == std::string::npos
+          ? std::string_view{}
+          : std::string_view(labeled_slider)
+                .substr(handle_begin, handle_end - handle_begin);
+  if (handle.empty() || contains(handle, "value: root.value")) {
+    std::cerr << "LabeledSlider binds the handle straight to root.value, a "
+                 "binding the first drag destroys: the handle then stops "
+                 "following the setting the caption is showing\n";
+    return 34;
+  }
+  if (!contains(labeled_slider, "target: slider") ||
+      !contains(labeled_slider, "property: \"value\"") ||
+      !contains(labeled_slider, "restoreMode: Binding.RestoreBindingOrValue")) {
+    std::cerr << "LabeledSlider no longer re-asserts the handle position when "
+                 "the value it edits changes\n";
+    return 34;
+  }
+
+  // One decode gate, not two. The controller carries a fallback copy of the
+  // operator's threshold for the moments before the startup push reaches it,
+  // and that copy sat at 12.0 dB while the setting being pushed defaulted to
+  // 4.0 -- so any path that skipped the push gated the decoder three times
+  // too high, silently, and nothing in either file could tell which number
+  // was in force. The core's own configuration holds the one value, together
+  // with the measurements behind it.
+  if (!contains(
+          controller_header,
+          "cwassistant::core::CwChannelBankConfig{}.minimum_decode_snr_db")) {
+    std::cerr << "the controller's decode-gate fallback is written out again "
+                 "instead of taken from the channel bank's own default, so "
+                 "the two copies can disagree\n";
+    return 35;
+  }
+
+  // Everything below reads files at the top of the tree. They are found
+  // relative to a path the build system already hands this test, because a
+  // source-text contract about the build cannot add compile definitions of
+  // its own.
+  const std::filesystem::path project_root =
+      std::filesystem::path(CWA_DESKTOP_MAIN_CPP_PATH)
+          .parent_path()   // src/desktop
+          .parent_path()   // src
+          .parent_path();  // the project root
+
+  // The documented developer workflow has to build what it is documented to
+  // verify. CWA_BUILD_DESKTOP defaults OFF, and neither preset set it, so
+  // `cmake --preset dev && ctest --preset dev` compiled no Qt at all and ran
+  // 38 of the 56 tests -- including none of the eighteen the desktop target
+  // registers. Both presets are asserted: a release preset that builds
+  // something smaller than the debug preset beside it is a check that can
+  // pass what dev fails, and the packaging configuration is gated on the same
+  // option.
+  const std::string presets = readFile(project_root / "CMakePresets.json");
+  const std::size_t dev_preset = presets.find("\"name\": \"dev\"");
+  const std::size_t release_preset =
+      presets.find("\"name\": \"release\"", dev_preset);
+  const std::size_t after_configure_presets =
+      presets.find("\"buildPresets\"", release_preset);
+  if (presets.empty() || dev_preset == std::string::npos ||
+      release_preset == std::string::npos ||
+      after_configure_presets == std::string::npos ||
+      !contains(std::string_view(presets).substr(
+                    dev_preset, release_preset - dev_preset),
+                "\"CWA_BUILD_DESKTOP\": \"ON\"") ||
+      !contains(std::string_view(presets).substr(
+                    release_preset, after_configure_presets - release_preset),
+                "\"CWA_BUILD_DESKTOP\": \"ON\"")) {
+    std::cerr << "a configure preset does not build the desktop application, "
+                 "so the documented workflow compiles no Qt and runs a subset "
+                 "of the test suite\n";
+    return 36;
+  }
+
+  // Every push to main publishes a release, and the dependency-free matrix is
+  // the only job that proves the core still builds and passes with no Qt
+  // present. Triggered on pull requests alone it never gated a release at
+  // all. The records job stays pull-request-only on purpose: it diffs the
+  // event's base against its head, and a push carries neither.
+  const std::string core_workflow =
+      readFile(project_root / ".github" / "workflows" / "core-ci.yml");
+  const std::size_t triggers = core_workflow.find("\non:\n");
+  const std::size_t workflow_jobs = core_workflow.find("\njobs:\n", triggers);
+  const std::string_view trigger_block =
+      triggers == std::string::npos || workflow_jobs == std::string::npos
+          ? std::string_view{}
+          : std::string_view(core_workflow)
+                .substr(triggers, workflow_jobs - triggers);
+  if (trigger_block.empty() || !contains(trigger_block, "push:") ||
+      !contains(trigger_block, "branches: [main]")) {
+    std::cerr << "the core matrix does not run on a push to main, so the "
+                 "release it publishes is never gated by the only build that "
+                 "proves the core compiles without Qt\n";
+    return 37;
+  }
+  if (!contains(core_workflow, "if: github.event_name == 'pull_request'")) {
+    std::cerr << "the project-records job is no longer restricted to pull "
+                 "requests, so a push to main runs it with no base and head "
+                 "to compare\n";
+    return 37;
+  }
+
   return 0;
 }

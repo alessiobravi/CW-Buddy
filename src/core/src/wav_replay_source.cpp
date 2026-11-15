@@ -240,6 +240,12 @@ void WavReplaySource::close() noexcept {
 
 float WavReplaySource::decode_sample(const std::byte* bytes) const noexcept {
   if (encoding_ == Encoding::PcmUnsigned8) {
+    // Unsigned 8-bit WAV is offset binary with silence at 128, so its rails
+    // are 0 and 255 and no divisor makes them equidistant from silence. 128
+    // is the only one that keeps silence at exactly zero and the positive
+    // rail inside unity; 127 would push the negative rail 0.8% past full
+    // scale to buy a symmetry the format does not have. Nothing in this
+    // application writes 8-bit, so no round trip depends on the choice.
     return (static_cast<float>(std::to_integer<unsigned int>(bytes[0])) -
             128.0F) /
            128.0F;
@@ -249,6 +255,29 @@ float WavReplaySource::decode_sample(const std::byte* bytes) const noexcept {
     return std::isfinite(value) ? std::clamp(value, -1.0F, 1.0F) : 0.0F;
   }
 
+  // Signed PCM divides by 2^(bits-1), which is deliberately NOT the exact
+  // inverse of WavWriter, and the asymmetry is a decision rather than an
+  // oversight.
+  //
+  // WavWriter multiplies by 32767 because it has to: it clamps to [-1, 1]
+  // first, and 1.0 scaled by 32768 overflows int16. That also keeps its two
+  // rails equidistant from zero, the same choice IqWriter's to_i16()
+  // documents. This reader cannot follow it, because its main job is other
+  // people's recordings rather than this application's own captures, and
+  // 2^(bits-1) is the decode convention those files are written against: it
+  // is what maps the most negative code to exactly -1.0, and being a power
+  // of two it is the only scale that converts every code to a float with no
+  // rounding at all. IqWriter and IqReplaySource get to be exact inverses
+  // because that pair owns both ends of its format; this pair does not.
+  //
+  // So a capture written here and replayed here comes back one part in
+  // 32768 small -- 0.00027 dB, bounded, and the same for every sample.
+  // Nothing in this project compares replayed samples against recorded ones
+  // (cw_capture_replay scores decoded text and callsigns), so that costs
+  // nothing, while matching the convention is worth something on every
+  // foreign file. Changing either constant to close the gap would shift the
+  // decoder's input on all 22 stored captures in exchange for a
+  // bit-exactness no caller asks for.
   if (bits_per_sample_ == 16) {
     const auto value = static_cast<std::int16_t>(read_u16(bytes));
     return static_cast<float>(value) / 32'768.0F;

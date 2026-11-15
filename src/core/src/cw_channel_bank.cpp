@@ -1477,6 +1477,31 @@ const std::vector<CwChannelSnapshot>& CwChannelBank::processSamples(
       stages[2] += alpha * (stages[1] - stages[2]);
       return stages[2];
     };
+    const auto normalize = [](std::complex<float>& oscillator) {
+      const float magnitude = std::abs(oscillator);
+      if (magnitude > 0.0F) oscillator /= magnitude;
+    };
+    // These oscillators live on the track, not on the block, so the in-loop
+    // renormalization below -- which tests the block-local loop index -- was
+    // reading the wrong clock. The audio path publishes 2048-sample blocks
+    // and so happened to satisfy it twice per block; the direct-SDR path
+    // batches decimated samples at a threshold of 512 and its blocks never
+    // reach index 1023, so on that path the unit-magnitude NCOs were never
+    // renormalized at all, for the entire life of the track.
+    //
+    // The error compounds rather than cancels, because the step itself is
+    // not exactly unit magnitude once cos and sin are rounded to float: for
+    // 700 Hz at 48 kHz the step measures 1 - 2.2e-8, and |oscillator| falls
+    // to 0.978 after a million samples and 0.804 after ten million -- nearly
+    // two decibels of invented level change on a track whose signal never
+    // moved. Renormalizing once at the head of every block as well as every
+    // 1024 samples inside it bounds the gap to 1024 multiplies on every
+    // input path, whatever block size that path happens to publish, and
+    // costs three square roots per track per block.
+    normalize(track.center_oscillator);
+    normalize(track.lower_oscillator);
+    normalize(track.upper_oscillator);
+    if (monitored_track) normalize(track_monitor_oscillator);
     for (std::size_t index = 0; index < block.sample_count; ++index) {
       const auto sample =
           block.stream.kind == StreamKind::Audio
@@ -1517,10 +1542,6 @@ const std::vector<CwChannelSnapshot>& CwChannelBank::processSamples(
       track.upper_oscillator *= upper_step;
       if (monitored_track) track_monitor_oscillator *= monitor_step;
       if ((index & 1'023U) == 1'023U) {
-        const auto normalize = [](std::complex<float>& oscillator) {
-          const float magnitude = std::abs(oscillator);
-          if (magnitude > 0.0F) oscillator /= magnitude;
-        };
         normalize(track.center_oscillator);
         normalize(track.lower_oscillator);
         normalize(track.upper_oscillator);

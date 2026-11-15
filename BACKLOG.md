@@ -1,12 +1,121 @@
 # Product backlog
 
-Updated: 2026-09-12
+Updated: 2026-11-16
 
 This is the canonical prioritized backlog. Status values are `todo`, `active`,
 `blocked`, and `done`. Every source, test, build, or automation change must
 review this file and update affected items or the “Last reviewed” note.
 
-Last reviewed: 2026-09-14 (sixty-seventh entry) -- three ways an SDR session
+Last reviewed: 2026-11-16 (sixty-ninth entry) -- five faults found by reading
+rather than by a failure, and the one shape they share.
+
+A full read of the tree turned up five defects no test and no operator report
+had surfaced. None was found by something breaking. Each was found by reading
+one file beside another and noticing they disagreed, which is worth recording
+because it says where to look next.
+
+The largest was numerical. Each track's three mixing oscillators were
+renormalized on a test against the loop index inside a sample block, but the
+oscillators belong to the track and outlive the block, so the test was reading
+the wrong clock. The audio path publishes 2048-sample blocks and satisfied it
+twice per block by luck; the direct-SDR path batches decimated samples at a
+threshold of 512, never reaches the index, and so never renormalized at all. A
+float step is not exactly unit magnitude once its cosine and sine are rounded,
+and the error compounds: 1 - 2.2e-8 per step at 700 Hz and 48 kHz reaches 0.978
+after a million samples and 0.804 after ten million. Measured on the unfixed
+code, a steady tone drifts 0.29 dB over six minutes of 512-sample blocks and
+reads 0.33 dB differently for no reason but the block size it arrived in. This
+sat underneath every recent frequency-accuracy investigation without being
+part of any of them.
+
+Three were in `TransmitGuard`, and the first was live rather than theoretical.
+`disarm()` returned to Disarmed from any state, including Fault, making it a
+second unannounced exit beside `reset_fault()`. The reachable path is not the
+button: `armed()` excludes Fault, so the configuration-change handler takes its
+`else guard_.disarm()` branch, and editing any keying setting while a fault was
+latched with the lines already released discarded the fault. Alongside it,
+`trip_fault()` cleared the recorded key-line state at the one moment the guard
+has most reason to believe the opposite -- the watchdog trips because the line
+was last seen asserted and never seen released -- and TUNE, reachable from a
+confirmed QSO, preserved the exact preview confirmation across an operation
+whose whole purpose may be to move the rig.
+
+The fifth was a data race on first use of the shared Morse alphabet and
+callsign-prefix tables, which lazily loaded behind a plain emptiness test
+rather than the once-guard the CW vocabulary beside them already used. Sixteen
+concurrent first callers reproduced it as a crash on every attempt. The desktop
+is shielded by loading both eagerly at startup, so only a headless host or a
+test could reach it.
+
+One proposed fix was measured and withdrawn. `WavWriter` scales by 32767 and
+`WavReplaySource` divided by 32768, so a round trip was not bit-exact. Making
+them inverses broke an existing assertion, and the justification did not
+survive examination: nothing in this project compares replayed samples against
+recorded ones -- capture replay scores decoded text, and the only exactness
+check in that path pins the file's bytes, not the decoded samples -- while the
+reader's main job is foreign recordings, for which 2^(bits-1) is both the
+standard convention and the only divisor that is an exact power of two and so
+rounds at no code. The writer cannot use 32768 either, because a full-scale
+sample would overflow int16. The asymmetry is inherent, bounded at 0.00027 dB,
+and is now a documented decision pinned by a test rather than a latent
+correction waiting to be made again.
+
+Recorded as method: four of these five are one file disagreeing with another
+that it should have matched -- a loop index against the lifetime of what it
+guards, a fault exit against the only sanctioned fault exit, a lazy load
+against the once-guard beside it, a reader's scale against its own writer's.
+This tree already names that shape in its own comments and has been bitten by
+it before, in the Morse alphabet existing twice and in the LO-offset margin
+defined twice a kilohertz apart. The cheapest remaining place to look is the
+rest of those pairs: the update checker against the callsign-database updater
+that already does origin pinning, size caps and atomic install properly, and
+the WAV writer's duration bound against the IQ writer that fixed the same
+class and cites the WAV path as its counter-example.
+
+Left open deliberately. The channel bank's arithmetic still depends very
+slightly on how the caller chunks the stream, 0.0001 dB between 512- and
+2048-sample blocks, because renormalization is per block rather than on a
+per-track step counter; the counter needs a field in the track structure and is
+worth doing when that header is next open, not in a hot loop at the end of
+other work. The spot-corroboration ranker remains unreachable from the shipping
+application -- the only production call site uses the overload without it, so
+cluster and RBN spots are drawn and never weighed, which `CALL-007` should say
+plainly until it is wired. And a future ADIF transport that hands a record to a
+C interface would truncate at an embedded NUL; the serializer itself is correct
+and the guard belongs in the transport when one exists.
+
+Previous review: 2026-09-14 (sixty-eighth entry) -- a gesture that three fixes
+did not fix, and what that says about fixing from the outside.
+
+Ctrl+Right drag still will not size the decode region. Three separate defects
+were found and fixed on the way here, each real and each mutation-proven: the
+release handler set the guard that suppresses the following click, so an early
+return left that click free to re-point the region; the click re-read its own
+modifiers, which need not still carry Control by the time a release arrives; and
+the modifier comparison was a strict equality, so Num Lock's keypad bit changed
+what a gesture meant. None of them was the operator's fault. The symptom is
+unchanged.
+
+What that costs is worth recording. Every one of those explanations was
+consistent with everything observable from outside the application, which is
+exactly why each looked convincing and why none could be confirmed. The
+reporting station is Windows; nothing in this tree reproduces it; and no test
+here instantiates Main.qml in a QML engine, so the gesture is invisible to the
+suite by construction. Under those conditions a fourth inference is guesswork
+wearing a proof.
+
+The press, the release and the re-point now report the values their decisions
+are made from into the session log. The question they settle is binary and
+cannot be reasoned to from here: does Control reach the handler at all. If it
+does, the press claims the gesture and something after it re-points the region;
+if it does not, the press never claims it, the pointer positions never diverge,
+and the release correctly calls a drag a click.
+
+Recorded as method, because it is the second time this session: when a fault is
+on a platform that cannot be reproduced and a subsystem the suite cannot reach,
+instrument before the first fix rather than after the third.
+
+Previous review: 2026-09-14 (sixty-seventh entry) -- three ways an SDR session
 could report a frequency it was not receiving on, and none of them was in the
 decoder.
 

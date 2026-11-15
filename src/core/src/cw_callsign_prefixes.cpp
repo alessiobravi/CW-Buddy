@@ -239,32 +239,85 @@ CwCallsignPrefixTable& cwMutableSharedCallsignPrefixes() noexcept {
   return table;
 }
 
-const CwCallsignPrefixTable& cwSharedCallsignPrefixes() {
-  auto& table = cwMutableSharedCallsignPrefixes();
-  if (!table.empty()) return table;
-  const char* directory = std::getenv("CWA_DICTIONARY_DIR");
-  if (directory != nullptr) {
-    std::ifstream input(std::string(directory) + "/callsign-prefixes.txt",
-                        std::ios::binary);
-    if (input) {
-      std::ostringstream buffer;
-      buffer << input.rdbuf();
-      static_cast<void>(table.importText(buffer.str()));
+namespace {
+
+// The fallback chain the shared table recovers through, performed on a table
+// the caller has already found empty.
+//
+// noexcept because one of its two callers is declared noexcept and the other
+// is reached from noexcept decode paths: a prefix file that cannot be read
+// has to stay a failure to load rather than become a terminate.
+void loadSharedCallsignPrefixes(CwCallsignPrefixTable& table) noexcept {
+  try {
+    const char* directory = std::getenv("CWA_DICTIONARY_DIR");
+    if (directory != nullptr) {
+      std::ifstream input(std::string(directory) + "/callsign-prefixes.txt",
+                          std::ios::binary);
+      if (input) {
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        static_cast<void>(table.importText(buffer.str()));
+      }
     }
+  } catch (...) {
+    // A read that threw part way through leaves a partial table behind with
+    // the loaded origin recorded against it. Discard it so the compiled-in
+    // copy below takes over whole and names itself as the origin.
+    table.clear();
   }
-  if (!table.empty()) return table;
+  if (!table.empty()) return;
   // Last resort, and the reason the compiled-in copy exists at all. A missing
   // or unreadable file must not be allowed to answer "no such country" for
   // every callsign at once -- that would be a far larger fault than the
   // invented prefixes this table is here to catch. The text below is
   // generated from the same shipped file at build time, so this is not a
   // second table to keep in step: it is the same one, compiled in.
-  static_cast<void>(table.importText(kCwBuiltinCallsignPrefixes,
-                                     CwCallsignPrefixSource::kBuiltin));
-  return table;
+  try {
+    static_cast<void>(table.importText(kCwBuiltinCallsignPrefixes,
+                                       CwCallsignPrefixSource::kBuiltin));
+  } catch (...) {
+    table.clear();
+  }
+}
+
+// Loads the shared table if nothing has loaded one yet.
+//
+// The first use is behind C++ thread-safe static initialization, because it
+// is the only one that can happen on several threads at once: a host that
+// never loaded the table eagerly has every decode thread arriving at an empty
+// table together, and the plain "if empty, import" this replaced had them all
+// building the same std::vector at the same time.
+void ensureSharedCallsignPrefixesLoaded() noexcept {
+  auto& table = cwMutableSharedCallsignPrefixes();
+  static const bool attempted = [&table]() noexcept {
+    if (table.empty()) loadSharedCallsignPrefixes(table);
+    return true;
+  }();
+  static_cast<void>(attempted);
+  // A later clear() still recovers. The application clears the table before
+  // importing the operator's file, and a test does the same to exercise the
+  // fallback, so a once-and-never-again guard would hand both an empty table
+  // -- which admits every invented prefix on the band. Unlike first use, this
+  // path is not concurrent by construction: it can only follow a clear() on
+  // the shared table, which is already an exclusive operation on it.
+  if (table.empty()) loadSharedCallsignPrefixes(table);
+}
+
+}  // namespace
+
+const CwCallsignPrefixTable& cwSharedCallsignPrefixes() {
+  ensureSharedCallsignPrefixesLoaded();
+  return cwMutableSharedCallsignPrefixes();
 }
 
 bool cwCallsignPrefixesLoadedFromBuiltin() noexcept {
+  // Asking where the table came from has to answer for the table the next
+  // lookup will actually use, so it loads one the same way that lookup would.
+  // Reading the recorded origin without doing so answered "not the
+  // compiled-in copy" while nothing was loaded at all -- which is the answer
+  // a perfectly healthy file load gives, and therefore precisely the
+  // backwards reading this flag exists to prevent.
+  ensureSharedCallsignPrefixesLoaded();
   return cwMutableSharedCallsignPrefixes().source() ==
       CwCallsignPrefixSource::kBuiltin;
 }

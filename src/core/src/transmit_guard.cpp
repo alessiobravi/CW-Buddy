@@ -80,11 +80,23 @@ bool TransmitGuard::arm() noexcept {
 }
 
 void TransmitGuard::disarm() noexcept {
+  // Nothing staged survives a disarm, in any state, including a latched
+  // fault. trip_fault() already clears these, so this is belt and braces:
+  // no future path may leave a confirmed message waiting behind a fault for
+  // whatever clears it.
   pending_callsign_.clear();
   pending_message_.clear();
   message_confirmed_ = false;
-  key_down_ = false;
-  key_down_since_ns_ = 0;
+  // A latched fault is left latched. reset_fault() is the single deliberate
+  // way out of Fault, and a disarm must not become a second, unannounced one
+  // -- least of all the disarm an application wires to its own shutdown, or
+  // one a settings change makes on the operator's behalf. Returning here
+  // rather than asserting a state keeps that rule in the guard instead of in
+  // the discipline of every caller.
+  if (state_ == TransmitState::Fault) return;
+  // The observed line state is deliberately not touched. key_down_ is what
+  // the line was last seen doing, and only observe_key_state() is entitled to
+  // say that it changed.
   state_ = TransmitState::Disarmed;
 }
 
@@ -153,6 +165,13 @@ bool TransmitGuard::begin_tune() noexcept {
   if (state_ != TransmitState::Armed && state_ != TransmitState::Confirmed)
     return false;
   tune_return_state_ = state_;
+  // Entering TUNE voids an exact preview confirmation. TUNE is reachable from
+  // Confirmed, it keys the transmitter, and an operator reaches for it to
+  // work on the antenna system or to move the rig -- so the transmission the
+  // confirmation described is no longer the transmission that would go out.
+  // The staged text is kept, because retyping it is not what the second look
+  // is for: the operator confirms the preview again and transmits.
+  message_confirmed_ = false;
   key_down_ = false;
   key_down_since_ns_ = 0;
   state_ = TransmitState::Tuning;
@@ -163,8 +182,22 @@ bool TransmitGuard::observe_key_state(
     const bool key_down, const std::uint64_t timestamp_ns) noexcept {
   if (state_ != TransmitState::Transmitting &&
       state_ != TransmitState::Tuning) {
-    if (key_down) trip_fault();
-    return !key_down;
+    // An observation outside a guarded transmission is still an observation,
+    // and it is the only thing that may move key_down_. Recording the release
+    // here is what lets a latched fault stop reporting a keyed line once the
+    // line is actually seen to drop, now that trip_fault() no longer claims
+    // that on its own.
+    if (!key_down) {
+      key_down_ = false;
+      key_down_since_ns_ = 0;
+      return true;
+    }
+    if (!key_down_) {
+      key_down_ = true;
+      key_down_since_ns_ = timestamp_ns;
+    }
+    trip_fault();
+    return false;
   }
   if (!key_down) {
     key_down_ = false;
@@ -223,8 +256,13 @@ void TransmitGuard::trip_fault() noexcept {
   pending_callsign_.clear();
   pending_message_.clear();
   message_confirmed_ = false;
-  key_down_ = false;
-  key_down_since_ns_ = 0;
+  // The observed line state is left exactly as it was observed. Clearing it
+  // here reported an unkeyed line at the one moment the guard has most
+  // reason to believe the opposite: the continuous-KEY watchdog trips
+  // precisely because the line was seen asserted and never seen released, so
+  // "KEY is down" is the fault's most important fact, not something to erase
+  // on the way into it. It clears when observe_key_state() sees the line
+  // drop, and not before.
   state_ = TransmitState::Fault;
 }
 

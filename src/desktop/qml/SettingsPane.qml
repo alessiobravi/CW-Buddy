@@ -8,13 +8,13 @@ Pane {
     signal done()
     signal setupRequested()
     property bool sdrDiscoveryRequested: false
-    // True from the moment a device scan is asked for until the settings
-    // object publishes a result. It is deliberately driven by the request and
-    // by the completion notification rather than by an assumed duration, so it
-    // never claims progress it cannot observe.
-    // Reported by the application rather than assumed here. Enumeration runs on
-    // a pooled thread now, so this is true for exactly as long as the scan
-    // actually takes and the waiting indicator can animate while it does.
+    // True for exactly as long as a device scan is actually running. The pane
+    // does not own this state and must not: enumeration runs on a pooled
+    // thread, and only the settings object knows when that thread started and
+    // finished, so the value is read from it rather than inferred here from a
+    // request, a notification, or an assumed duration. This page used to clear
+    // a writable copy of its own on the next sdrSettingsChanged(), which ended
+    // the waiting state early whenever an unrelated setting changed mid-scan.
     readonly property bool sdrDiscoveryRunning: appSettings.sdrDiscoveryRunning
 
     function formatFrequencyKhz(frequencyHz) {
@@ -2296,17 +2296,14 @@ Pane {
         }
     }
 
-    Connections {
-        target: appSettings
-        // Discovery publishes everything it found through this one
-        // notification, which is the only observable end of a scan available
-        // today. Clearing on it can end the waiting state early if an
-        // unrelated setting changes mid-scan; it can never leave it running
-        // after the results are in.
-        function onSdrSettingsChanged() {
-            root.sdrDiscoveryRunning = false
-        }
-    }
+    // Nothing listens for the end of a scan here any more. sdrDiscoveryRunning
+    // is a read-only binding onto the settings object, which reports the scan
+    // starting and finishing itself, so a handler clearing it was both a
+    // runtime error on every sdrSettingsChanged() -- QML refuses to assign to
+    // a read-only property -- and a worse answer than the one the binding
+    // already gives. sdrDiscoveryRequested is deliberately not reset with it:
+    // it is the once-per-page latch that stops opening the SDR tab from
+    // probing hardware again, not scan state.
 
     FileDialog {
         id: localDecoderModelDialog

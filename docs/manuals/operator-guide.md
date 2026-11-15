@@ -198,11 +198,15 @@ device.
 
    Enable hardware AGC only when that receiver provides it, otherwise select a
    manual gain.
-4. Set the **Decoder window center (kHz)** and choose one of the offered
-   **Decoder bandwidth** values: 6, 12, 24, 48, or 96 kHz.
+4. Set the **Decoder window center (kHz)** and a **Decoder bandwidth**. The
+   list offers 2, 3, 6, 12 and 24 kHz as quick choices, but the width itself is
+   continuous: dragging the region on the spectrum sets any width between the
+   2 kHz floor and the 24 kHz ceiling, and the box then shows that real width
+   rather than snapping to a listed one.
    CW Buddy will continue to draw the complete acquired passband, but only this
    bounded, down-converted and decimated window reaches CW detection and the
-   stream decoder bank. The 24 kHz default is a practical starting point.
+   stream decoder bank. The 24 kHz default is the widest the window goes, and a
+   practical starting point.
    Configure a signed **SDR LO offset** only when the SDR centre must differ
    from the radio frequency; it is bounded to keep the decode window in view.
 5. In the Receiver workspace select **Live SDR**, then **Start SDR RX**. The
@@ -225,7 +229,7 @@ device.
    points the decode region at that RF. Ctrl+right-drag draws and applies the
    region directly, and a Ctrl+right-click without dragging moves its centre
    and keeps the width; the width is rounded to 100 Hz and bounded to
-   2–96 kHz. Alt+left-click starts a manual decode, which promotes through the
+   2–24 kHz. Alt+left-click starts a manual decode, which promotes through the
    same verification path as an automatically found stream. Clicking the wheel
    button retunes the receiver so that frequency becomes the centre of the
    acquired spectrum.

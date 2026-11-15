@@ -1113,10 +1113,20 @@ class AppSettings final : public QObject {
   // is still detected, followed and drawn in the spectrum either way; only its
   // decoding is withheld, so nothing disappears from the operator's display.
   bool decode_weak_signals_{false};
-  // The default is measured rather than chosen. Across the capture corpus
-  // the weakest track that carried a correctly recovered callsign
-  // measured 19.5 dB, so 12 dB leaves over seven decibels of margin before the
-  // threshold could cost the operator a station that was genuinely readable.
+  // The default is measured rather than chosen, and it has moved once. It was
+  // 12 dB: across the capture corpus the weakest track carrying a correctly
+  // recovered callsign measured 19.5 dB, which left seven decibels of margin.
+  // That corpus is twenty-two recordings through one receiver and was never
+  // the whole population -- on air the gate proved aggressive enough to
+  // suppress workable signals, so it is 4 dB, and corpus recovery is unchanged
+  // at the lower setting. Do not restore 12 on the strength of the corpus
+  // figure alone; it is the measurement the lower value already accounts for.
+  //
+  // The same default is declared in the core, which owns it, at
+  // CwChannelBankConfig::minimum_decode_snr_db. These copies agree today and
+  // the value below is what reaches the decoder, but a limit that exists in
+  // several copies is a limit that will eventually disagree with itself: this
+  // comment and that value had already drifted three times apart once.
   double minimum_decode_snr_db_{4.0};
   bool local_decoder_enabled_{false};
   // Off by default. Two listed stations can differ by one character, so a

@@ -41,7 +41,12 @@ time of each release. The current baseline is ADIF 3.1.7 (2026-03-22).
   band resolution at the edges of the band table, signed transverter offsets in
   both directions, split semantics, the satellite field set, and rejection of
   frequencies that fall outside every band or that underflow. Length prefixes
-  make escaping unnecessary in ADI, so nothing tests for it.
+  make escaping unnecessary in ADI, and that is now asserted rather than
+  assumed: an independent length-honouring reader, sharing no code with the
+  writer, round-trips a callsign containing `<`, an antenna field containing a
+  newline and a rig field containing a NUL, and checks that the fields after
+  each one still parse. The same case pins the reverse direction, so a future
+  escaping layer that altered a byte inside a callsign fails it.
 - CI will download a pinned checksum-verified copy of the official versioned
   table exports, schemas, and test QSO archive; it does not do so yet. Fixtures
   are never uploaded to a live logging or award service.

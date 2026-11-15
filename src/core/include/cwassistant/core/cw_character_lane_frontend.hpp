@@ -68,6 +68,11 @@ class CwCharacterLaneFrontend {
   double center_frequency_hz_{0.0};
   std::complex<float> center_oscillator_{1.0F, 0.0F};
   std::complex<float> feature_oscillator_{1.0F, 0.0F};
+  // Steps taken since each oscillator above was last restored to unit
+  // magnitude. They count the stream rather than the current block, because
+  // the oscillators themselves survive block boundaries.
+  std::size_t center_oscillator_steps_{0};
+  std::size_t feature_oscillator_steps_{0};
   std::array<std::complex<float>, 3> anti_alias_filter_{};
   double resample_accumulator_{0.0};
   std::vector<float> lane_filter_taps_;

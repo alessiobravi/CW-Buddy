@@ -82,9 +82,12 @@ actually read at. Those five numbers localise a disagreement without guesswork.
   operating mode. A disabled selector means the driver exposes no choice.
 - **Decoder window center** and **Decoder bandwidth** select the bounded RF
   region sent to CW detection and the independent stream decoders. The full
-  acquired passband remains visible. The default window is 24 kHz and choices
-  range from 6 to 96 kHz; use the narrowest width that contains the stations of
-  interest to reduce CPU use and decoding latency.
+  acquired passband remains visible. The bandwidth list offers 2, 3, 6, 12 and
+  24 kHz, but the width is continuous between a 2 kHz floor and a 24 kHz
+  ceiling, so a region sized by dragging the spectrum matches no listed entry
+  and the box reports the real width instead. It defaults to 24 kHz, the widest
+  it goes; use the narrowest width that contains the stations of interest to
+  reduce CPU use and decoding latency.
 - **SDR LO offset** adds a signed offset to the SDR hardware centre for
   transverter or independently tuned receiver arrangements. CW Buddy bounds it
   so the decoder window stays inside the acquired passband. The operational
@@ -211,7 +214,7 @@ in full:
 
 Each gesture does one thing. Choosing where to listen does not also create a
 stream, and no gesture tunes the transmitter except the one that says so. The
-decode region is bounded to 2–96 kHz, sized to the nearest 100 Hz, and changes
+decode region is bounded to 2–24 kHz, sized to the nearest 100 Hz, and changes
 only the receive and decoding region.
 Zoom reset uses the explicit **Full span** button so a double-click cannot also
 trigger normal stream selection.
@@ -355,9 +358,14 @@ partial, provisional, and unsupported one-off candidates remain hidden.
 
 Timing acquisition evaluates nine fixed starting hypotheses at 8, 12, 16, 20,
 25, 32, 40, 50, and 60 WPM. The current leader is provisional for at least 2.5
-seconds of signal evidence and locks only after enough decoded symbols and score
-separation. After a locked track has been silent for 2.5 seconds, its stable
-text is retained and timing acquisition restarts for the next transmission.
+seconds of signal evidence, and settles on one of them only after enough
+decoded symbols and enough score separation. Settling chooses which hypothesis
+is presented; it does not stop the others. All nine keep processing for the
+life of the track, and the best complete path is reselected at every
+transmission boundary, so an early wrong choice is recoverable without waiting
+for the track to be lost. After a track has been silent for 2.5 seconds its
+stable text is retained and acquisition begins again for the next
+transmission.
 These acquisition thresholds are internal measured defaults in this build;
 profile controls will be added only with benchmark-backed safe ranges.
 The parallel acoustic lattice is evaluated at most every 500 ms and at a
@@ -416,12 +424,15 @@ fragments rather than copy, so it fills the transcript with one- and
 two-element characters that mean nothing while each such track costs as much
 work as a readable one.
 
-The default is measured rather than chosen. Across the capture corpus the
-weakest track that ever carried a correctly recovered callsign sat at 19.5 dB,
-so 12.0 dB leaves over seven decibels of margin before the threshold could cost
-a station that was genuinely readable. Lower it, or turn the toggle on, when
-working a quiet band where marginal signals are the point; raise it on a
-crowded band where the transcript is filling with noise.
+The default is measured rather than chosen, and it has moved once. It began at
+12.0 dB, a figure taken from the capture corpus, where the weakest track that
+ever carried a correctly recovered callsign sat at 19.5 dB. That corpus is
+twenty-two recordings through a single receiver and was never the whole
+population: on air the gate proved aggressive enough to suppress workable
+signals, so the default is now 4.0 dB. Corpus recovery is unchanged at the
+lower setting. Lower it further, or turn the toggle on, when working a quiet
+band where marginal signals are the point; raise it on a crowded band where the
+transcript is filling with noise.
 
 Both values are stored per profile, and changing either keeps every open track,
 transcript, and confirmed callsign: the setting selects which tracked signals

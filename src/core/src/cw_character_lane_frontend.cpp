@@ -18,6 +18,18 @@ std::uint64_t samplesToNanoseconds(const double samples,
       samples * 1'000'000'000.0 / sample_rate_hz));
 }
 
+// How many steps either oscillator may take before its unit magnitude is
+// restored. Counted on the stream, not on the current block: both
+// oscillators persist across blocks, so a counter that restarted with every
+// block measured the wrong clock and never reached its period at all on a
+// path whose blocks are shorter than it -- the direct-SDR path batches
+// decimated samples at a threshold of 512. A float step is not exactly unit
+// magnitude once cos and sin are rounded, and the error compounds: measured
+// on the 700 Hz at 48 kHz step, whose magnitude is 1 - 2.2e-8, |oscillator|
+// falls to 0.978 after a million multiplies and 0.804 after ten million,
+// which scales every feature this lane emits by the same factor.
+constexpr std::size_t kOscillatorRenormalizeSteps = 1'024;
+
 }  // namespace
 
 CwCharacterLaneFrontend::CwCharacterLaneFrontend(
@@ -138,6 +150,8 @@ void CwCharacterLaneFrontend::reset(
 void CwCharacterLaneFrontend::resetSignalState() noexcept {
   center_oscillator_ = {1.0F, 0.0F};
   feature_oscillator_ = {1.0F, 0.0F};
+  center_oscillator_steps_ = 0;
+  feature_oscillator_steps_ = 0;
   anti_alias_filter_ = {};
   resample_accumulator_ = 0.0;
   std::fill(lane_filter_history_.begin(), lane_filter_history_.end(),
@@ -227,7 +241,8 @@ void CwCharacterLaneFrontend::process(const RealtimeSampleBlock& block) {
           static_cast<double>(index), input_rate);
       acceptWorkingSample(anti_alias_filter_[2], timestamp);
     }
-    if ((index & 1'023U) == 1'023U) {
+    if (++center_oscillator_steps_ >= kOscillatorRenormalizeSteps) {
+      center_oscillator_steps_ = 0;
       const float magnitude = std::abs(center_oscillator_);
       if (magnitude > 0.0F) center_oscillator_ /= magnitude;
     }
@@ -256,6 +271,14 @@ void CwCharacterLaneFrontend::acceptWorkingSample(
       static_cast<float>(std::sin(angle))};
   const float real_sample = 2.0F * (filtered * feature_oscillator_).real();
   feature_oscillator_ *= feature_step;
+  // Stepped once per working sample and, until now, never renormalized on
+  // any path at all -- it multiplies every feature this lane emits, so its
+  // drift is a slow, invisible gain error in the model's input.
+  if (++feature_oscillator_steps_ >= kOscillatorRenormalizeSteps) {
+    feature_oscillator_steps_ = 0;
+    const float magnitude = std::abs(feature_oscillator_);
+    if (magnitude > 0.0F) feature_oscillator_ /= magnitude;
+  }
   const bool was_full = stft_count_ == stft_history_.size();
   stft_history_[stft_index_] = real_sample;
   stft_index_ = (stft_index_ + 1U) % stft_history_.size();

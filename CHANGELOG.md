@@ -8,6 +8,92 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ### Fixed
 
+- A tracked signal no longer drifts in measured level the longer a direct-SDR
+  session runs. The three mixing oscillators each track carries were
+  renormalized on a test against the loop index inside a sample block, but the
+  oscillators belong to the track and outlive every block, so the test was
+  reading the wrong clock. The audio path publishes 2048-sample blocks and
+  happened to satisfy it twice per block; the direct-SDR path batches decimated
+  samples at a threshold of 512 and never reaches the index the test waits for,
+  so on that path the oscillators were never renormalized once, for the whole
+  life of the track. A unit step is not exactly unit magnitude after its cosine
+  and sine are rounded to float, and the error compounds instead of cancelling:
+  at 700 Hz and 48 kHz the step measures 1 - 2.2e-8, and the oscillator's
+  magnitude reaches 0.978 after a million samples and 0.804 after ten million,
+  which is nearly two decibels of invented level change on a signal that never
+  moved. Measured on the unfixed code, a steady tone in 512-sample blocks drifts
+  0.29 dB over six minutes and reads 0.33 dB differently depending only on
+  whether it arrived in 512-sample or 2048-sample blocks; both are now under
+  0.001 dB. The character-refinement lane carried the same pattern, and its
+  feature oscillator had no renormalization anywhere at all.
+
+- A latched transmit fault can no longer be cleared by disarming. `disarm()`
+  returned the guard to Disarmed from any state, which made it a second and
+  unannounced way out of Fault beside `reset_fault()`, the one deliberate exit.
+  This was reachable rather than theoretical: changing any keying setting calls
+  `disarm()` whenever the transmitter was not active at the time, and a latched
+  fault with the lines already released is exactly that case, so editing the
+  keying configuration silently discarded the fault. The guard now holds the
+  rule itself rather than leaving it to the discipline of callers.
+
+- A fault no longer reports that the key line was released when nothing
+  observed it release. Both `trip_fault()` and `disarm()` cleared the recorded
+  line state, which is at its least truthful in the one case that matters: the
+  continuous-key watchdog trips precisely because the line was last seen
+  asserted and never seen released, so "the key is down" is the fault's most
+  important fact rather than something to erase on the way into it. The
+  recorded state now changes only when the line is actually observed to change.
+
+- Entering TUNE voids an exact preview confirmation. TUNE is reachable from a
+  confirmed QSO and keys the transmitter, and an operator reaches for it to work
+  on the antenna system or to move the rig -- so the transmission the operator
+  confirmed is no longer the transmission that would go out. The staged text is
+  kept, because the point of the second look is the confirmation and not the
+  typing: the operator confirms the same preview again and transmits.
+
+- The shipped Morse alphabet and callsign-prefix tables no longer race when
+  several callers reach them first at once. Both lazily loaded behind a plain
+  emptiness test rather than the once-guard the CW vocabulary already used, so
+  concurrent first callers built the same container simultaneously; sixteen
+  threads reproduced it as a crash on every attempt. The desktop happened to be
+  shielded because it loads both eagerly at startup, so this was reachable only
+  from a headless host or a test. Asking either table where it came from now
+  also loads it, which it did not before -- a caller that asked first was told
+  the compiled-in copy was not in use, which is indistinguishable from a file
+  having loaded correctly and is the backwards reading those accessors exist to
+  prevent.
+
+- `--log-file` works when passed. Logging has to be installed before anything
+  can log, which is well before a command-line parser exists, so the value is
+  read by scanning the arguments directly -- but the option was never then
+  registered with the parser, which rejected the whole command line as carrying
+  an unknown option. An operator following the manual was told the documented
+  flag does not exist.
+
+- The SDR settings page no longer raises an error on every settings change. It
+  kept a handler that cleared its own scan-running flag, which had since become
+  a read-only binding onto the value the application reports; the assignment was
+  refused at runtime. The handler was also the worse answer, because it ended
+  the waiting state early whenever an unrelated setting changed mid-scan.
+
+- A slider no longer stops following the value it edits after the first drag. A
+  dragged slider writes its own value, and a property that has been written to
+  keeps what was written, so the declarative binding was destroyed for the rest
+  of that control's life. From then on, whenever the setting was rounded or
+  clamped on the way through, the caption above the slider and the handle itself
+  showed two different numbers with nothing to say which one was in force. The
+  same control is instantiated three times over for several of these settings,
+  so a value could also be left disagreeing with itself between panes.
+
+- The decode-level gate had a second default that disagreed with the one in
+  force. The receive controller declared its own fallback at 12 dB, three times
+  the 4 dB the decoder actually applies, left behind when the measured value
+  moved; the comment beside the real default still argued the case for 12 dB and
+  would have persuaded a reader to put it back. The controller now reads the
+  core's default rather than restating a number, and the surviving comment
+  records why the figure moved so that the corpus measurement behind the older
+  value is not mistaken for an argument against the newer one.
+
 - Ctrl+Right sizes the decode region again. Three separate ways let the gesture
   fall through to the plain right-click that re-points the region at its
   existing width, which is the outcome an operator saw: the region moved to
@@ -114,6 +200,44 @@ All notable changes to CW Buddy are recorded here. The format follows
   readings stay exactly as configured, and nothing recorded that until now.
 
 ### Changed
+
+- Both CMake presets now build the desktop application. It defaults off, so the
+  documented developer workflow configured the core alone and ran 38 of the 56
+  tests -- the Qt layer, which is the program this project ships, was never
+  compiled by the command the documentation tells a contributor to run. The
+  release preset gets it for the same reason and one more: the packaging
+  configuration is gated on the same option, so without it that preset produces
+  nothing installable. Both presets now require Qt 6.5; each preset's
+  description records that, and `-DCWA_BUILD_DESKTOP=OFF` restores a core-only
+  build on a machine without it.
+
+- The dependency-free core matrix runs on pushes to the default branch and not
+  only on pull requests. Every such push publishes a release, and that matrix is
+  the only build proving the core still compiles and passes on all four
+  platforms with no Qt present, so a release could be published from a state no
+  dependency-free job had ever seen. The records check in the same workflow
+  stays restricted to pull requests deliberately: it compares a base revision
+  against a head, and a push carries neither.
+
+- The operator manual and configuration reference are corrected where they had
+  fallen behind the code. The decode region is bounded to 2--24 kHz, not the
+  6--96 kHz the pages still described, and the bandwidth list offers quick
+  choices while the width itself is continuous, so a region sized by dragging
+  the spectrum matches no listed entry and the box reports the real width. The
+  weak-signal threshold defaults to 4.0 dB, which one page stated correctly and
+  then argued against thirteen lines later in a paragraph left behind by the
+  change. Timing acquisition no longer "locks": settling chooses which of the
+  nine speed hypotheses is presented and all nine keep processing for the life
+  of the track, with the best complete path reselected at every transmission
+  boundary -- the configuration reference still described the superseded
+  behaviour, which is the most consequential decoder change this project has
+  made. The README no longer presents the Hamlib path as a linked library when
+  it is a loopback client of the rigctld text protocol, no longer lists ADIF
+  records as being sent to a logger when no transport sends to one yet, and no
+  longer describes the decoder strategy and an inference backend as "both
+  implemented": the explainable timing path is implemented, the character
+  backend ships disabled and bundles no model, and the causal likelihood model
+  and the fusion of the two are designs rather than code.
 
 - A station whose callsign both decode paths read is named from that agreement
   alone. The literal and the lattice-refined texts are independent readings of

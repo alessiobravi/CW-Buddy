@@ -77,7 +77,10 @@ every signal tracked.
   beyond standalone is wired into the application yet)
 - Multiple saved station profiles with a startup chooser and isolated settings,
   allowing separate application instances to operate separate radios
-- Windows OmniRig, portable Hamlib, and CAT4OM network frequency-control paths
+- Windows OmniRig, Hamlib, and CAT4OM network frequency-control paths; the
+  Hamlib path is a client of its `rigctld` text protocol rather than a linked
+  library, and is restricted to a loopback endpoint because that protocol
+  carries neither authentication nor transport security
 - Yaesu FT-450D and FT-818/FT-818ND editable reference configurations
 - Separate configurable serial port and RTS/DTR lines for PTT and keying
 - Human-confirmed QSO initiation with ordinary, DX-pileup, and contest panels
@@ -85,11 +88,15 @@ every signal tracked.
   `<SK>` and `<SOS>`, each keyed as one symbol with no character gap between
   its letters; the table is closed and lives in the application rather than a
   data file, because what may be transmitted is a safety boundary
-- ADIF 3 records sent to Log4OM 2 through its inbound UDP integration
+- ADIF 3 records targeting Log4OM 2's inbound UDP integration (the record
+  format is implemented and tested; no transport sends to it yet)
 - Deterministic replay of audio and IQ captures for decoder regression tests
-- A documented high-accuracy decoder strategy with explainable timing and an
-  optional compact causal inference backend, both implemented, alongside
-  same-frequency pileup separation, which is not yet built
+- A documented high-accuracy decoder strategy with explainable timing, which is
+  implemented, and an optional character-refinement backend, which is built but
+  ships disabled and bundles no model: it runs only against a model the
+  operator supplies. The compact causal likelihood model and the calibrated
+  fusion of the two paths described in the strategy are designs, not code, and
+  same-frequency pileup separation is not yet built
 
 ## Architecture
 
