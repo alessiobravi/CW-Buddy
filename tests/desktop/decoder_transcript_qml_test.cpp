@@ -694,5 +694,32 @@ int main() {
       !contains(manual, "console.log(\"region-gesture repoint\"")) {
     return 24;
   }
+
+  // The spectrum markers are driven by an incremental model, not by the
+  // decoderChannels list reassigned whole.
+  //
+  // Assigning a QVariantList to a Repeater destroys and recreates every
+  // delegate, and this delegate is three Rectangles, a rotated plated Label
+  // and a SequentialAnimation. At the 40 ms publish throttle that was up to
+  // twenty-five full rebuilds a second across as many as sixty-four tracked
+  // signals, whether or not a marker had moved: the list differs whenever
+  // any key of any channel differs, and the levels and the transcript move on
+  // nearly every publish while a marker shows neither. Measured on a probe
+  // Repeater of eight streams, one stream's signal-to-noise moving by a tenth
+  // of a decibel destroyed and rebuilt all eight delegates; over the model
+  // the same publish rebuilds none. A destroyed delegate also restarts the
+  // "CALLING YOU" pulse and the hover magnification, and is how a pointer
+  // press loses its release.
+  //
+  // The hover index deliberately still reads decoderChannels, and must keep
+  // doing so. It needs JavaScript array access over the whole channel, which
+  // a QAbstractItemModel does not offer, and the marker rows carry only the
+  // nineteen keys a marker is drawn from. Replacing it here would break the
+  // hit test without failing anything.
+  if (!contains(manual, "model: replayController.decoderMarkerModel") ||
+      contains(qml, "model: replayController.decoderChannels") ||
+      !contains(manual, "replayController.decoderChannels)")) {
+    return 25;
+  }
   return 0;
 }

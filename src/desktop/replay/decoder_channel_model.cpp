@@ -424,6 +424,158 @@ QVariantList decoderChannelModel(
   return model;
 }
 
+namespace {
+
+// Exactly what the marker delegate in Main.qml reads. Sixteen keys it names
+// on `modelData` directly, plus the three that window.formatStreamFrequency()
+// reads out of the same map. Nothing else from the channel reaches a marker.
+constexpr std::array<const char*, 19> kMarkerKeys{
+    "id",
+    "presentationFrequencyHz",
+    "verifiedCw",
+    "operatorSelected",
+    "active",
+    "keyDown",
+    "color",
+    "callingOwnStation",
+    "callsign",
+    "callsignInDatabase",
+    "callsignSuggestion",
+    "callsignSuggestionSource",
+    "callsignSuggestionRawSpan",
+    "audioFrequencyHz",
+    "filterWidthHz",
+    "driftHzPerSecond",
+    // Read by window.formatStreamFrequency(modelData).
+    "displayFrequencyHz",
+    "frequencyKind",
+    "frequencyLabel",
+};
+
+// Whether the rows already held can be turned into `next` by removals and
+// insertions alone, so that every surviving delegate keeps its identity.
+//
+// Two ids the same would make "the row with this id" ambiguous and the
+// insertion pass below unsound, so a duplicate forces the reset path. The
+// core never issues one; the check costs at most a couple of thousand
+// integer comparisons at the sixty-four-track maximum and removes the need to
+// argue that it cannot.
+[[nodiscard]] bool markerRowsAreReconcilable(const QList<qulonglong>& current,
+                                             const QList<qulonglong>& next) {
+  for (qsizetype outer = 0; outer < next.size(); ++outer) {
+    for (qsizetype inner = outer + 1; inner < next.size(); ++inner) {
+      if (next.at(outer) == next.at(inner)) return false;
+    }
+  }
+  // Every id that survives must still appear after the survivor before it.
+  // Anything else is a genuine reorder, and reproducing one with single-row
+  // moves would be more machinery than a reset is worth for a case the
+  // tracker does not produce.
+  qsizetype cursor = 0;
+  for (const qulonglong id : current) {
+    const qsizetype position = next.indexOf(id);
+    if (position < 0) continue;
+    if (position < cursor) return false;
+    cursor = position + 1;
+  }
+  return true;
+}
+
+}  // namespace
+
+std::span<const char* const> decoderChannelMarkerKeys() noexcept {
+  return {kMarkerKeys.data(), kMarkerKeys.size()};
+}
+
+QVariantMap decoderChannelMarkerRow(const QVariantMap& channel) {
+  QVariantMap row;
+  for (const char* const key : kMarkerKeys) {
+    const QString name = QString::fromLatin1(key);
+    // value() on an absent key yields an invalid QVariant, which reaches QML
+    // as `undefined` -- the same thing the delegate saw when it read the full
+    // channel map directly. Inserting it anyway keeps the key set of a row
+    // fixed, so two rows differ only where their values differ.
+    row.insert(name, channel.value(name));
+  }
+  return row;
+}
+
+DecoderChannelMarkerModel::DecoderChannelMarkerModel(QObject* parent)
+    : QAbstractListModel(parent) {}
+
+int DecoderChannelMarkerModel::rowCount(const QModelIndex& parent) const {
+  return parent.isValid() ? 0 : static_cast<int>(rows_.size());
+}
+
+QVariant DecoderChannelMarkerModel::data(const QModelIndex& index,
+                                         const int role) const {
+  if (!index.isValid() || index.row() < 0 || index.row() >= rows_.size() ||
+      (role != kModelDataRole && role != Qt::DisplayRole)) {
+    return {};
+  }
+  return rows_.at(index.row());
+}
+
+QHash<int, QByteArray> DecoderChannelMarkerModel::roleNames() const {
+  return {{kModelDataRole, QByteArrayLiteral("modelData")}};
+}
+
+void DecoderChannelMarkerModel::replace(const QVariantList& channels) {
+  QVariantList rows;
+  QList<qulonglong> ids;
+  rows.reserve(channels.size());
+  ids.reserve(channels.size());
+  for (const QVariant& value : channels) {
+    const QVariantMap channel = value.toMap();
+    ids.push_back(channel.value(QStringLiteral("id")).toULongLong());
+    rows.push_back(decoderChannelMarkerRow(channel));
+  }
+
+  if (!markerRowsAreReconcilable(ids_, ids)) {
+    beginResetModel();
+    rows_ = std::move(rows);
+    ids_ = std::move(ids);
+    ++resets_;
+    endResetModel();
+    return;
+  }
+
+  // Back to front, so a removal cannot move a row this loop has still to
+  // look at.
+  for (qsizetype row = ids_.size() - 1; row >= 0; --row) {
+    if (ids.contains(ids_.at(row))) continue;
+    beginRemoveRows(QModelIndex{}, static_cast<int>(row),
+                    static_cast<int>(row));
+    ids_.removeAt(row);
+    rows_.removeAt(row);
+    ++removals_;
+    endRemoveRows();
+  }
+
+  // Front to back. Every id still held is now one of `ids`, in the same
+  // relative order, so wherever the held row at this position is not the one
+  // wanted there, the one wanted is new and belongs exactly here.
+  for (qsizetype row = 0; row < ids.size(); ++row) {
+    if (row < ids_.size() && ids_.at(row) == ids.at(row)) continue;
+    beginInsertRows(QModelIndex{}, static_cast<int>(row),
+                    static_cast<int>(row));
+    ids_.insert(row, ids.at(row));
+    rows_.insert(row, rows.at(row));
+    ++insertions_;
+    endInsertRows();
+  }
+
+  // Only now are the two lists the same length and in the same order, so a
+  // row compares against its own replacement.
+  for (qsizetype row = 0; row < rows.size(); ++row) {
+    if (rows_.at(row) == rows.at(row)) continue;
+    rows_[row] = rows.at(row);
+    const QModelIndex changed = index(static_cast<int>(row), 0);
+    ++row_changes_;
+    emit dataChanged(changed, changed, {kModelDataRole});
+  }
+}
+
 QVariantMap verificationDiagnosticsModel(
     const cwassistant::core::CwVerificationDiagnostics& diagnostics) {
   QVariantMap model;

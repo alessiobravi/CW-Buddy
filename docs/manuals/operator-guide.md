@@ -1247,6 +1247,33 @@ clicking these buttons, and never silently replaces itself while running. This
 is separate from an explicitly enabled callsign-database refresh, which only
 replaces its validated local data cache.
 
+**Cancel** appears beside the progress while a download is running and stops
+it, discarding the partial file. You will not often need it, but a transfer
+that stalls otherwise holds the download button disabled through its timeout
+and its retries, with no way to stop waiting.
+
+A download can also be refused before or during the transfer, and the message
+says which of these happened rather than reporting a generic failure:
+
+- **An untrusted location.** The installer and the checksum list have to sit
+  beside the update manifest itself. Anything else — a different host, a
+  different repository, an unencrypted address, a path that climbs out of the
+  release directory — is refused without being fetched. This is what stops
+  whatever serves the manifest from choosing both the file and the checksum it
+  is checked against, which would otherwise make the checksum meaningless.
+- **An unsafe redirect.** Release downloads are legitimately redirected to a
+  separate delivery host, so redirects are allowed, but only encrypted ones
+  without credentials, at most four deep, and only to the release's own host or
+  that delivery host.
+- **Too large.** An installer over 256 MiB, or a manifest or checksum list over
+  64 KiB, is refused. These are far above anything this project publishes and
+  exist so that a server sending something which is not an installer is cut off
+  rather than filling your disk.
+- **A stalled transfer.** Twenty seconds with no data ends the attempt, and it
+  is retried a bounded number of times before being reported. A transfer that
+  simply ends early is reported as an incomplete download rather than as a
+  checksum failure, because those mean very different things.
+
 ## First launch
 
 1. Start `cw-buddy-desktop`.

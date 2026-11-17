@@ -1797,6 +1797,17 @@ const std::vector<CwChannelSnapshot>& CwChannelBank::processSamples(
               robust_space_amplitude > 0.0F &&
               robust_mark_amplitude >=
                   robust_space_amplitude * kMinimumAmplitudeSeparation) {
+            // Deliberately slow, and measured rather than assumed. Raising
+            // this rate is the largest single lever on the generated surface
+            // -- at 0.25 paired full-surface character error falls from
+            // 0.2548 to 0.1597 with every seed set improving -- but it is
+            // paid for on the one benchmark carrying fading, drift and
+            // hand-sent weighting, where held-out character error rises from
+            // 0.4576 to 0.5254 against a 0.55 gate. The 512 ms window holds
+            // only about six elements at 14 WPM, so a fast anchor replaces a
+            // responsive estimate with a lagged one exactly where the lag
+            // costs most. See the keying-level anchor test for the rest of
+            // the sweep.
             constexpr float kRobustAnchorRate = 0.015F;
             const float current_space_amplitude =
                 std::sqrt(std::max(track.keying_space_power, 0.0F));

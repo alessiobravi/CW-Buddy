@@ -31,6 +31,17 @@ add_test(NAME cwa_transmit_scheduler_tests COMMAND cwa_transmit_scheduler_tests)
 # deliberate one-LSB asymmetry between what WavWriter emits at full scale and
 # what WavReplaySource decodes, so that the next reader to notice it finds the
 # reasoning rather than repeating the attempt to "correct" it.
+# The robust keying-level anchor, which nothing tested directly before: that it
+# engages on a clean keyed carrier across the speed range, that band noise
+# publishes no channel and asserts no callsign, and that its enable flag is
+# actually read -- without that last one the surface gate would measure the
+# same path twice and still report every absolute figure it expects. The file
+# header carries the measurements behind the anchor's rate constant.
+add_executable(cwa_keying_level_anchor_tests cw_keying_level_anchor_tests.cpp)
+target_link_libraries(cwa_keying_level_anchor_tests PRIVATE cwa_core)
+add_test(NAME cwa_keying_level_anchor_tests
+  COMMAND cwa_keying_level_anchor_tests)
+
 add_executable(cwa_core_numerics_tests core_numerics_tests.cpp)
 target_link_libraries(cwa_core_numerics_tests PRIVATE cwa_core)
 add_test(NAME cwa_core_numerics_tests COMMAND cwa_core_numerics_tests)

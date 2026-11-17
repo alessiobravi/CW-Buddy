@@ -1,5 +1,9 @@
 #pragma once
 
+#include <QAbstractListModel>
+#include <QByteArray>
+#include <QHash>
+#include <QList>
 #include <QString>
 #include <QVariantList>
 #include <QVariantMap>
@@ -105,6 +109,99 @@ struct LocalDecoderChannelPresentation {
     std::span<const cwassistant::core::CwChannelSnapshot> channels,
     std::span<const LocalDecoderChannelPresentation> local_decoder = {},
     const ChannelColorPalette& palette = sessionChannelColorPalette());
+
+// The keys the spectrum marker delegate reads, in the order it reads them,
+// and no others. Published here so a test can hold the delegate to them: a
+// key the delegate reads and this list omits arrives in QML as `undefined`,
+// which is a marker drawn wrong rather than a build that fails.
+[[nodiscard]] std::span<const char* const> decoderChannelMarkerKeys() noexcept;
+
+// One published channel reduced to what a spectrum marker is drawn from.
+//
+// A full channel map carries forty-two keys, and most of them are the
+// transcript and its derivatives: the raw, refined, provisional and
+// contextual text, the acoustic alternatives, the per-character evidence, the
+// completed transmissions and the sender cadences. A marker draws none of
+// that. It also leaves out the continuously moving scalars the card shows --
+// signal-to-noise, speed and the confidences -- because a marker does not
+// display them either.
+//
+// That exclusion is the whole reason an incremental marker model can stay
+// quiet. The transcript and the levels are what move on nearly every publish;
+// a marker row holds a frequency, a colour, three booleans and a callsign, so
+// a verified stream that is not being retuned and has decoded no new callsign
+// produces a row equal to the one before it, and the model reports nothing.
+//
+// Redaction is inherited rather than re-decided. The fields that could name a
+// station -- callsign, the advisory suggestion and its raw span -- are already
+// empty on an unverified track, and its colour is already the neutral grey,
+// because decoderChannelModel() gates them on `expose_verified_content` and
+// the presentation cache derives a suggestion only from evidence that gating
+// leaves behind. Copying those values forward cannot un-redact them, and a
+// second gate here would be a second place for the rule to drift.
+[[nodiscard]] QVariantMap decoderChannelMarkerRow(const QVariantMap& channel);
+
+// Keeps the QML spectrum-marker delegates alive while the streams behind them
+// change.
+//
+// This is DecoderSessionListModel's problem one panel over, and it was left
+// unsolved for longer. The marker Repeater's model was the plain
+// `decoderChannels` QVariantList, reassigned whole on every decoder publish,
+// so every marker -- three Rectangles, a rotated plated Label and a
+// SequentialAnimation each -- was destroyed and rebuilt up to twenty-five
+// times a second, for as many as sixty-four tracked signals. Reassignment
+// also forced the conversion of all sixty-four forty-two-key channel maps
+// into JavaScript on every publish whether or not anything had moved.
+//
+// Three things follow from rebuilding a delegate rather than updating it, and
+// only the first is a matter of cost. The pulse on a "CALLING YOU" marker
+// restarts from the top each time, so the one alert the operator must not
+// miss flickers instead of breathing. The 90 ms hover magnification restarts
+// with it. And a delegate destroyed between a pointer press and its release
+// swallows the gesture, which is the fault this tree has already been bitten
+// by three times on the decoder cards.
+//
+// So the rows are reconciled instead:
+//
+//  - Rows whose channel id has gone are removed, one row at a time.
+//  - Channel ids that are new are inserted at their final position.
+//  - Every surviving row is compared with its replacement and only a row that
+//    actually differs is reported changed.
+//  - A reorder that is neither of the first two -- the survivors no longer
+//    appearing in their old relative order -- falls back to a full reset,
+//    which is what every publish used to do.
+//
+// The counters exist for the same reason DecoderChannelPresentationCache has
+// one: a publish that changed nothing must not move them, and asserting that
+// is the only way to state the claim without timing anything.
+class DecoderChannelMarkerModel final : public QAbstractListModel {
+ public:
+  explicit DecoderChannelMarkerModel(QObject* parent = nullptr);
+  [[nodiscard]] int rowCount(
+      const QModelIndex& parent = QModelIndex{}) const override;
+  [[nodiscard]] QVariant data(const QModelIndex& index,
+                              int role = Qt::DisplayRole) const override;
+  [[nodiscard]] QHash<int, QByteArray> roleNames() const override;
+
+  // `channels` is the full annotated channel list, exactly as
+  // ReplayController publishes it; the projection to marker rows happens
+  // here so there is one statement of what a marker is drawn from.
+  void replace(const QVariantList& channels);
+
+  [[nodiscard]] qulonglong resets() const noexcept { return resets_; }
+  [[nodiscard]] qulonglong rowChanges() const noexcept { return row_changes_; }
+  [[nodiscard]] qulonglong insertions() const noexcept { return insertions_; }
+  [[nodiscard]] qulonglong removals() const noexcept { return removals_; }
+
+ private:
+  static constexpr int kModelDataRole = Qt::UserRole + 1;
+  QVariantList rows_;
+  QList<qulonglong> ids_;
+  qulonglong resets_{0};
+  qulonglong row_changes_{0};
+  qulonglong insertions_{0};
+  qulonglong removals_{0};
+};
 
 // Aggregate pre-verification pipeline diagnostics (candidate/morse-likely
 // counts and rejection-reason tally) for operator troubleshooting. Never

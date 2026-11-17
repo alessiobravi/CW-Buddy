@@ -238,6 +238,30 @@ if(CWA_BUILD_TESTS)
   add_test(NAME cwa_sdr_receiver_test COMMAND cwa_sdr_receiver_test)
   set_tests_properties(cwa_sdr_receiver_test PROPERTIES TIMEOUT 10)
 
+  # Drives a real QQmlEngine, Repeater and delegate so the claim this model
+  # exists to make -- that a publish which moves one stream's value no longer
+  # destroys and rebuilds every spectrum marker -- is counted rather than
+  # argued. It needs Qml and Quick for that, and the offscreen platform so it
+  # runs on a build machine with no display. It deliberately compiles only
+  # decoder_channel_model.cpp rather than the controller, which keeps the
+  # target to two translation units.
+  qt_add_executable(cwa_decoder_marker_model_test
+    ${PROJECT_SOURCE_DIR}/tests/desktop/decoder_marker_model_test.cpp
+    replay/decoder_channel_model.cpp
+    replay/decoder_channel_model.hpp)
+  target_link_libraries(cwa_decoder_marker_model_test PRIVATE
+    cwa_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick)
+  target_include_directories(cwa_decoder_marker_model_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_definitions(cwa_decoder_marker_model_test PRIVATE
+    CWA_MAIN_QML_PATH="${PROJECT_SOURCE_DIR}/src/desktop/qml/Main.qml"
+    CWA_REPLAY_CONTROLLER_CPP_PATH="${PROJECT_SOURCE_DIR}/src/desktop/replay/replay_controller.cpp")
+  add_test(NAME cwa_decoder_marker_model_test
+    COMMAND cwa_decoder_marker_model_test)
+  set_tests_properties(cwa_decoder_marker_model_test PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QUICK_BACKEND=software"
+    TIMEOUT 30)
+
   qt_add_executable(cwa_hamlib_rigctld_client_test
     ${PROJECT_SOURCE_DIR}/tests/desktop/hamlib_rigctld_client_test.cpp
     radio/hamlib_rigctld_client.cpp
@@ -465,7 +489,12 @@ if(CWA_BUILD_TESTS)
   target_include_directories(cwa_update_checker_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME cwa_update_checker_test COMMAND cwa_update_checker_test)
-  set_tests_properties(cwa_update_checker_test PROPERTIES TIMEOUT 10)
+  # Thirty rather than ten because the suite exercises the real bounded retry
+  # backoff -- three sequences of 400 ms then 1200 ms -- against a scripted
+  # network, so it spends several seconds waiting on purpose. It measures
+  # about four here, and a slower build machine should not read that wait as
+  # a hang.
+  set_tests_properties(cwa_update_checker_test PROPERTIES TIMEOUT 30)
 
   qt_add_executable(cwa_callsign_database_updater_test
     ${PROJECT_SOURCE_DIR}/tests/desktop/callsign_database_updater_test.cpp

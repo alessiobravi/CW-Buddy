@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../visualization/spectrum_frame.hpp"
+#include "decoder_channel_model.hpp"
 #include "cwassistant/core/callsign_evidence.hpp"
 #include "cwassistant/core/cw_channel_bank.hpp"
 #include "cwassistant/core/cw_character_decoder.hpp"
@@ -334,6 +335,17 @@ class ReplayController final : public QObject {
                  NOTIFY decoderChanged)
   Q_PROPERTY(QAbstractItemModel* decoderSessionModel READ decoderSessionModel
                  CONSTANT)
+  // The spectrum markers, incrementally.
+  //
+  // `decoderChannels` above stays what it was, and deliberately. It is read
+  // by the transmit observer and by the waterfall's CW-symbol row, both of
+  // which need the whole channel, and by the hover index in Main.qml, which
+  // needs JavaScript array access that a QAbstractItemModel does not offer.
+  // This carries only what a marker is drawn from, to the one view that
+  // draws markers. CONSTANT because the model object never changes; it
+  // reports its own rows.
+  Q_PROPERTY(QAbstractItemModel* decoderMarkerModel READ decoderMarkerModel
+                 CONSTANT)
   Q_PROPERTY(int decoderSessionCount READ decoderSessionCount
                  NOTIFY decoderChanged)
   Q_PROPERTY(QVariantMap verificationDiagnostics READ verificationDiagnostics
@@ -437,6 +449,7 @@ class ReplayController final : public QObject {
   [[nodiscard]] int decoderChannelCount() const noexcept;
   [[nodiscard]] const QVariantList& decoderSessions() const noexcept;
   [[nodiscard]] QAbstractItemModel* decoderSessionModel() noexcept;
+  [[nodiscard]] QAbstractItemModel* decoderMarkerModel() noexcept;
   [[nodiscard]] int decoderSessionCount() const noexcept;
   [[nodiscard]] const QVariantMap& verificationDiagnostics() const noexcept;
   [[nodiscard]] const QString& localCharacterState() const noexcept;
@@ -811,6 +824,7 @@ class ReplayController final : public QObject {
   QVariantList raw_decoder_channels_;
   QVariantList decoder_sessions_;
   DecoderSessionListModel decoder_session_model_;
+  DecoderChannelMarkerModel decoder_marker_model_;
   QList<qulonglong> decoder_session_order_;
   QVariantMap verification_diagnostics_;
   std::unordered_map<std::uint64_t,

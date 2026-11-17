@@ -6,6 +6,35 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Security
+
+- An application update can no longer be chosen by whatever serves the update
+  manifest. Both the installer's address and the address of the checksum list it
+  is compared against were taken from that manifest with no restriction, so
+  anything able to serve or alter it chose the binary and the hash together, and
+  the checksum verification amounted to a check against transport corruption.
+  An artifact must now sit in the manifest's own directory on the manifest's own
+  origin under a plain file name — checked before the first request and again on
+  the address finally answered — which refuses another host or port, a scheme
+  downgrade, embedded credentials, a query or fragment, a different repository
+  on the same host, a nested path, traversal, and percent-encoded separators.
+  Redirects are checked separately and deliberately less strictly, because a
+  release asset is answered by a redirect to a separate signed delivery host
+  whose name has changed more than once; a redirect must still be encrypted,
+  carry no credentials, stop after four hops, and lead either to the release's
+  own origin or to that delivery host. The bytes are compared against a checksum
+  fetched under the strict rule either way.
+
+- A download is now bounded and interruptible. The installer is capped at
+  256 MiB and the manifest and checksum list at 64 KiB, each refused before any
+  data moves when the size is declared and cut off mid-transfer when it is not;
+  every request times out after twenty seconds; and a transfer that stalls says
+  so and retries, rather than reporting the operating system's word for a
+  cancellation and giving up. There is a Cancel action while a download is in
+  flight, which previously could not be stopped at all. The payload is written
+  and hashed as it arrives rather than held whole in memory, so a partial or
+  unverified download never appears at the path the operator is given.
+
 ### Changed
 
 - What other receivers report hearing is now actually weighed when a callsign is
@@ -28,6 +57,17 @@ All notable changes to CW Buddy are recorded here. The format follows
   what keeps the presentation cache from being defeated by busy-band traffic and
   what lets a report stop counting once it ages out. The evidence is published
   for the operator interface but is not drawn on a decoder card yet.
+
+- The spectrum markers are driven by a model that updates the rows that changed
+  instead of being replaced wholesale, so a decoder update no longer destroys
+  and rebuilds every marker on the spectrum. Measured against a real delegate:
+  one stream's signal-to-noise reading moving by a tenth of a decibel — a value
+  no marker displays — previously destroyed and rebuilt all eight markers in the
+  scene, and now rebuilds none; a newly acquired carrier creates exactly one.
+  The list was never byte-identical between updates, because the text, the
+  confidence and the key probability move constantly, so in practice this
+  happened continuously rather than occasionally. Each marker now carries the
+  nineteen values its delegate actually reads rather than all forty-two.
 
 - The presentation path costs materially less with many signals decoding, which
   is where the reported loss of fluidity actually was once the decoder side was

@@ -1662,7 +1662,27 @@ ApplicationWindow {
                                   + " kHz. TX and mode stay unchanged."
                 }
                 Repeater {
-                    model: replayController.decoderChannels
+                    // An incremental model, not the decoderChannels list.
+                    //
+                    // Assigning a QVariantList to a Repeater destroys and
+                    // recreates every delegate, and this delegate is three
+                    // Rectangles, a rotated plated Label and a
+                    // SequentialAnimation. At the 40 ms publish throttle that
+                    // was up to twenty-five full rebuilds a second, for as
+                    // many as sixty-four tracked signals, whether or not a
+                    // single marker had moved -- the largest remaining
+                    // presentation cost in the application. It also restarted
+                    // the "CALLING YOU" pulse and the hover magnification on
+                    // every publish, and a destroyed delegate is how a
+                    // pointer press loses its release, which is a fault this
+                    // panel's sibling has already produced three times.
+                    //
+                    // decoderMarkerModel carries one role, `modelData`, whose
+                    // value is the same kind of map this delegate always
+                    // read, reduced to the nineteen keys below. Rows that did
+                    // not change are not reported, so an unchanged publish
+                    // leaves every marker exactly as it is.
+                    model: replayController.decoderMarkerModel
                     delegate: Item {
                         id: channelMarker
                         required property var modelData
@@ -5313,6 +5333,21 @@ ApplicationWindow {
                         }
                         ToolTip.visible: hovered
                         ToolTip.text: "Download this platform package and verify its SHA-256 checksum"
+                    }
+                    // Only while a transfer is in flight, because there is
+                    // nothing to cancel otherwise. Without it the download
+                    // button is disabled for the whole of a stalled transfer
+                    // -- twenty seconds, then the bounded retries -- with no
+                    // way for the operator to stop waiting and no indication
+                    // that stopping is possible. Cancelling discards the
+                    // partial file; it never leaves unverified bytes behind.
+                    Button {
+                        objectName: "updateNoticeCancelDownloadButton"
+                        visible: updateChecker.downloading
+                        text: "Cancel"
+                        onClicked: updateChecker.cancelDownload()
+                        ToolTip.visible: hovered
+                        ToolTip.text: "Stop the transfer and discard the partial download"
                     }
                     Button {
                         objectName: "updateNoticeOpenAppButton"

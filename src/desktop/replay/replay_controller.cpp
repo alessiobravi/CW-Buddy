@@ -1647,6 +1647,9 @@ const QVariantList& ReplayController::decoderSessions() const noexcept {
 QAbstractItemModel* ReplayController::decoderSessionModel() noexcept {
   return &decoder_session_model_;
 }
+QAbstractItemModel* ReplayController::decoderMarkerModel() noexcept {
+  return &decoder_marker_model_;
+}
 int ReplayController::decoderSessionCount() const noexcept {
   return static_cast<int>(decoder_sessions_.size());
 }
@@ -2087,6 +2090,11 @@ void ReplayController::rebuildDecoderModels() {
     decoder_sessions_.push_back(item);
   }
   decoder_session_model_.replace(decoder_sessions_);
+  // The spectrum markers, from the same finished channel list the cards were
+  // built from and before decoderChanged() tells the rest of the view that
+  // anything moved, so a marker is never a publish behind the panel it is
+  // drawn on.
+  decoder_marker_model_.replace(decoder_channels_);
   if (monitor_mode_ == 2 && !monitored_channel_ids_.isEmpty()) {
     const QList<qulonglong> reconciled_monitor = reconcileDecoderSessionOrder(
         monitored_channel_ids_, previous_sessions, decoder_channels_);
@@ -2759,6 +2767,11 @@ void ReplayController::resetDecoder() {
   decoder_channels_.clear();
   decoder_sessions_.clear();
   decoder_session_model_.replace(decoder_sessions_);
+  // The markers have to go with the channels they were drawn from. Both
+  // presentation models hold their own copy of the rows, so clearing the
+  // lists behind them is not enough: a model left alone here would keep
+  // drawing the previous source's streams over the new one's spectrum.
+  decoder_marker_model_.replace(decoder_channels_);
   decoder_session_order_.clear();
   verification_diagnostics_.clear();
   local_character_consensus_.clear();
