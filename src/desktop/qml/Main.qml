@@ -100,15 +100,73 @@ ApplicationWindow {
         return text
     }
 
+    // Whether a character can be part of a callsign token. A token is a run of
+    // A-Z, 0-9 and '/', which is the class the [A-Z0-9/] regular expression in
+    // exactCallCount() used to describe, in one place now that it is tested
+    // rather than matched.
+    function isCallsignTokenCode(code) {
+        return (code >= 65 && code <= 90) || (code >= 48 && code <= 57)
+                || code === 47
+    }
+
+    // How many times the operator's own callsign appears in a transcript as a
+    // whole token.
+    //
+    // This used to cut every [A-Z0-9/] run out of the text with a regular
+    // expression and compare each one against the callsign, so a card that had
+    // been open for an hour paid for its whole session on every decoded
+    // character, once per visible card: one JavaScript string and one array
+    // slot per token, thousands of them, every one discarded immediately. The
+    // C++ side had exactly this shape in mentionsCallsignToken() and replaced
+    // the expression with a single pass -- 1.5 ms per 32k-character transcript
+    // became 41 us -- which is what this is, counting whole tokens instead of
+    // answering yes or no.
+    //
+    // The pass is left to indexOf() rather than written out a character at a
+    // time, because a token equal to the callsign is exactly an occurrence of
+    // the callsign with a non-token character, or nothing at all, on each side
+    // of it. Two such occurrences cannot overlap, so the boundary test counts
+    // them. That hands the search itself to the engine, and leaves this
+    // function doing work proportional to the number of times the callsign is
+    // actually present -- normally none at all, since the flash this drives
+    // exists to notice the first time somebody calls the operator.
+    //
+    // The case fold stays String.toUpperCase() over the whole text rather than
+    // a cheaper per-character ASCII fold, deliberately: toUpperCase() maps a
+    // handful of characters outside ASCII into the token alphabet (U+00DF to
+    // SS, U+0131 to I, the typographic ligatures) and an ASCII fold would read
+    // those as separators instead, which would change the answer. It costs one
+    // scan and no character copy at all when the text is already upper case,
+    // which a Morse transcript is.
     function exactCallCount(text, callsign) {
         var wanted = String(callsign).trim().toUpperCase()
-        if (wanted.length === 0)
+        var wantedLength = wanted.length
+        if (wantedLength === 0)
             return 0
-        var tokens = String(text).toUpperCase().match(/[A-Z0-9/]+/g) || []
+        // A callsign carrying anything a token cannot -- a space, a dash,
+        // anything outside ASCII -- could never equal a token, and did not
+        // match one before either.
+        for (var check = 0; check < wantedLength; ++check) {
+            if (!isCallsignTokenCode(wanted.charCodeAt(check)))
+                return 0
+        }
+        var haystack = String(text).toUpperCase()
+        var length = haystack.length
         var count = 0
-        for (var index = 0; index < tokens.length; ++index) {
-            if (tokens[index] === wanted)
+        var from = 0
+        for (;;) {
+            var at = haystack.indexOf(wanted, from)
+            if (at < 0)
+                break
+            var after = at + wantedLength
+            if ((at === 0
+                 || !isCallsignTokenCode(haystack.charCodeAt(at - 1)))
+                    && (after === length
+                        || !isCallsignTokenCode(
+                               haystack.charCodeAt(after)))) {
                 ++count
+            }
+            from = at + 1
         }
         return count
     }
@@ -1024,11 +1082,71 @@ ApplicationWindow {
                         return (mouse.modifiers & intentionalModifiers)
                                 === required
                     }
+                    // The streams a pointer can land on, reduced to the two
+                    // numbers the hit test needs.
+                    //
+                    // streamIdAtX() walked replayController.decoderChannels
+                    // and re-read that property on every iteration -- twice,
+                    // once for .length and once for [index]. Reading a
+                    // QVariantList property converts it, and each of the 64
+                    // channels it can carry is a map of 42 entries that
+                    // includes the whole transcript, the refined and
+                    // contextual text and the acoustic alternatives, so a
+                    // single pointer sample rebuilt channels it had already
+                    // built and threw away the ones it had. It is driven by
+                    // hoveredStreamId below, which runs on every pointer
+                    // sample the operator produces: a trackpad delivers those
+                    // at five times the rate the decoder model publishes at.
+                    //
+                    // Reading the list is now bound once, here, and only
+                    // while the pointer is inside the panel: with the pointer
+                    // elsewhere this expression never evaluates its right
+                    // branch, so it does not depend on decoderChannels and a
+                    // decoder publish costs it nothing. While the pointer is
+                    // inside it rebuilds on a publish -- 25 a second at the
+                    // 40 ms throttle -- instead of on a pointer sample.
+                    //
+                    // Source order is kept and the filter is the one the loop
+                    // applied, so the scan below still chooses exactly the
+                    // channel it chose before, including which of two
+                    // equidistant streams wins.
+                    function buildStreamHoverIndex(channels) {
+                        var candidates = []
+                        if (!channels)
+                            return candidates
+                        var count = channels.length
+                        for (var index = 0; index < count; ++index) {
+                            var channel = channels[index]
+                            if (!channel || (!channel.verifiedCw
+                                             && !channel.operatorSelected)) {
+                                continue
+                            }
+                            candidates.push({
+                                id: channel.id,
+                                presentationFrequencyHz:
+                                    channel.presentationFrequencyHz
+                            })
+                        }
+                        return candidates
+                    }
+                    readonly property var streamHoverIndex:
+                        containsMouse
+                        ? buildStreamHoverIndex(
+                              replayController.decoderChannels)
+                        : null
                     function streamIdAtX(positionX) {
                         if (width <= 0 || spectrumDisplay.upperFrequencyHz
                                 <= spectrumDisplay.lowerFrequencyHz) {
                             return 0
                         }
+                        // Normally the index above, already built because the
+                        // pointer is in the panel. A click can still arrive
+                        // without the hover state being set -- a synthesised
+                        // press, a touch -- so the list is read directly in
+                        // that case rather than the gesture being dropped.
+                        var candidates = streamHoverIndex
+                                || buildStreamHoverIndex(
+                                       replayController.decoderChannels)
                         var pointedHz = frequencyAtX(positionX)
                         var pixelToleranceHz = 14
                                 * (spectrumDisplay.upperFrequencyHz
@@ -1036,20 +1154,24 @@ ApplicationWindow {
                         var toleranceHz = Math.max(60, pixelToleranceHz)
                         var nearestDistance = toleranceHz
                         var nearestId = 0
-                        for (var index = 0;
-                             index < replayController.decoderChannels.length;
-                             ++index) {
-                            var channel = replayController.decoderChannels[index]
-                            if (!channel.verifiedCw
-                                    && !channel.operatorSelected) {
-                                continue
-                            }
+                        // Still a scan, and deliberately. At the decoder's
+                        // 64-track maximum this is 64 subtractions over plain
+                        // numbers, which is nothing beside the list conversion
+                        // it used to repeat, and a sorted index with a binary
+                        // search would have to reproduce the tie-break below
+                        // exactly -- the LAST channel within the tolerance
+                        // wins -- to keep pointing at the same stream. That is
+                        // a behaviour change waiting to happen for no
+                        // measurable gain.
+                        var candidateCount = candidates.length
+                        for (var index = 0; index < candidateCount; ++index) {
+                            var candidate = candidates[index]
                             var distance = Math.abs(
-                                        channel.presentationFrequencyHz
+                                        candidate.presentationFrequencyHz
                                         - pointedHz)
                             if (distance <= nearestDistance) {
                                 nearestDistance = distance
-                                nearestId = channel.id
+                                nearestId = candidate.id
                             }
                         }
                         return nearestId
@@ -1076,6 +1198,29 @@ ApplicationWindow {
                         // These are the four values the decision is actually
                         // made from, so the next report answers it instead of
                         // narrowing it.
+                        //
+                        // Kept on purpose, and the reason is not that nobody
+                        // got round to removing it. --log-file is a SINK: it
+                        // installs a Qt message handler (desktop/main.cpp) and
+                        // writes whatever the application already reports.
+                        // Nothing in this tree reports anything -- there is no
+                        // qInfo, qDebug, qWarning or qCritical call in src at
+                        // all -- so this line and the two in onReleased and
+                        // onClicked are the entire gesture record that a
+                        // session log can contain. Deleting them as superseded
+                        // by --log-file would leave the log with nothing to
+                        // say about the gesture it was added to diagnose.
+                        //
+                        // They are also not a cost. All three sit on discrete
+                        // button events -- a press, a release, a click -- so
+                        // they run a few times a second at human rates, and
+                        // onPositionChanged, which is the handler that really
+                        // does run once per pointer sample, carries none of
+                        // them. The two fields that genuinely say nothing are
+                        // wantCtrl, a compile-time constant, and enabled,
+                        // which can only be true here because a disabled
+                        // MouseArea delivers no press at all; both are printed
+                        // so the log can be read without knowing either.
                         if (mouse.button === Qt.RightButton) {
                             console.log("region-gesture press"
                                         + " modifiers=" + mouse.modifiers
@@ -1843,11 +1988,33 @@ ApplicationWindow {
                         return first.displayHz - second.displayHz
                     }
 
+                    // Measured on first use and then kept on the record.
+                    //
+                    // A record lives exactly as long as the published spot
+                    // list it was built from, and its width is a function of
+                    // its callsign and of spotLabelMetrics, whose size, weight
+                    // and letter spacing are fixed above, so the answer cannot
+                    // go stale underneath it while the record exists. Only a
+                    // change of the application's font family could, and
+                    // nothing here offers one; the expiry sweep republishes
+                    // the list every five seconds in any case.
+                    //
+                    // advanceWidth() shapes text, and at the 240-marker cap it
+                    // was the single most expensive thing the layout did --
+                    // once per marker, on every frame of a pan.
+                    function labelWidthOf(spot) {
+                        if (spot.labelWidth < 0) {
+                            var labelWidth = measuredLabelWidth(spot)
+                            spot.labelWidth = labelWidth
+                        }
+                        return spot.labelWidth
+                    }
+
                     // Reserves the horizontal room one callsign needs, or
                     // leaves it unlabelled when a stronger neighbour already
                     // holds that space.
                     function claimLabelSpace(spot, taken, plotWidth) {
-                        var labelWidth = measuredLabelWidth(spot)
+                        var labelWidth = spot.labelWidth
                         var left = Math.max(0, Math.min(
                             plotWidth - labelWidth,
                             spot.pixelX - labelWidth / 2))
@@ -1862,18 +2029,32 @@ ApplicationWindow {
                         return true
                     }
 
-                    function layoutSpots(source, lowerHz, upperHz, plotWidth) {
-                        var placed = []
-                        if (!source || plotWidth <= 0 || upperHz <= lowerHz)
-                            return placed
-                        for (var index = 0; index < source.length; ++index) {
+                    // Everything about a spot that does not depend on where
+                    // the view is pointed, in strongest-evidence order.
+                    //
+                    // All of this used to sit inside the placedSpots binding
+                    // below, which depends on the visible span and so re-ran
+                    // on every zoom step and on every pointer sample of a pan:
+                    // it re-read and re-converted replayController.dxSpots --
+                    // a list the registry will fill to 4096 entries of seven
+                    // each -- normalised every callsign, formatted every
+                    // frequency and sorted the lot, to arrive at the answer it
+                    // already had the frame before. None of it is a function
+                    // of the span. The published list moves when a report
+                    // arrives and when the five-second expiry sweep re-ages
+                    // what is held, which is what this binding depends on
+                    // instead.
+                    function normaliseSpots(source) {
+                        var normalised = []
+                        if (!source)
+                            return normalised
+                        var count = source.length
+                        for (var index = 0; index < count; ++index) {
                             var spot = source[index]
                             if (!spot)
                                 continue
                             var displayHz = Number(spot.displayFrequencyHz)
-                            if (!Number.isFinite(displayHz)
-                                    || displayHz < lowerHz
-                                    || displayHz > upperHz)
+                            if (!Number.isFinite(displayHz))
                                 continue
                             var callsign = String(spot.callsign || "")
                                            .trim().toUpperCase()
@@ -1881,7 +2062,7 @@ ApplicationWindow {
                                 continue
                             var reportedHz = Number(spot.frequencyHz)
                             var ageSeconds = Number(spot.ageSeconds)
-                            placed.push({
+                            normalised.push({
                                 callsign: callsign,
                                 reverseBeacon: spot.reverseBeacon === true,
                                 cluster: spot.cluster === true,
@@ -1898,15 +2079,57 @@ ApplicationWindow {
                                           frequencyKind: "RF"
                                       })
                                     : window.formatFrequency(displayHz),
-                                pixelX: window.hzToX(displayHz)
+                                // Not measured yet. labelWidthOf() fills this
+                                // in for the markers that are actually placed.
+                                labelWidth: -1
+                            })
+                        }
+                        // Strongest evidence first, decided once per published
+                        // list rather than once per frame. Ranking before the
+                        // span filter rather than after cannot change which
+                        // spots survive it or the order they survive in: the
+                        // filter keeps order, and the frequency tie-break
+                        // leaves two records comparing equal only when they
+                        // are reported at the same hertz with the same age,
+                        // count and sources.
+                        normalised.sort(compareSpotEvidence)
+                        return normalised
+                    }
+
+                    // Places the spots that are in view. Everything here is a
+                    // function of the span or the plot width, and nothing else
+                    // in the layout is.
+                    function layoutSpots(source, lowerHz, upperHz, plotWidth) {
+                        var placed = []
+                        if (!source || plotWidth <= 0 || upperHz <= lowerHz)
+                            return placed
+                        // The source is already in evidence order, so the
+                        // first maximumMarkers entries that are in view are
+                        // the strongest ones in view: the cap can be applied
+                        // while filtering rather than to a larger list
+                        // afterwards.
+                        var count = source.length
+                        for (var index = 0;
+                             index < count && placed.length < maximumMarkers;
+                             ++index) {
+                            var spot = source[index]
+                            if (spot.displayHz < lowerHz
+                                    || spot.displayHz > upperHz)
+                                continue
+                            placed.push({
+                                callsign: spot.callsign,
+                                reverseBeacon: spot.reverseBeacon,
+                                cluster: spot.cluster,
+                                observations: spot.observations,
+                                ageSeconds: spot.ageSeconds,
+                                displayHz: spot.displayHz,
+                                frequencyText: spot.frequencyText,
+                                labelWidth: labelWidthOf(spot),
+                                pixelX: window.hzToX(spot.displayHz)
                                         - spectrumDisplay.x,
                                 showLabel: false
                             })
                         }
-                        var ranked = placed.slice()
-                        ranked.sort(compareSpotEvidence)
-                        if (ranked.length > maximumMarkers)
-                            ranked = ranked.slice(0, maximumMarkers)
                         // Thin the labels instead of stacking them: walk the
                         // strongest evidence first and keep only the callsigns
                         // that still have room of their own. Everything that
@@ -1914,22 +2137,25 @@ ApplicationWindow {
                         // stays honest about how many stations were reported.
                         var taken = []
                         for (var rank = 0;
-                             rank < ranked.length
+                             rank < placed.length
                              && taken.length < maximumLabels;
                              ++rank) {
-                            claimLabelSpace(ranked[rank], taken, plotWidth)
+                            claimLabelSpace(placed[rank], taken, plotWidth)
                         }
                         // Left to right, so the paint order on screen matches
                         // the order on the axis.
-                        ranked.sort(function(first, second) {
+                        placed.sort(function(first, second) {
                             return first.pixelX - second.pixelX
                         })
-                        return ranked
+                        return placed
                     }
+
+                    readonly property var normalisedSpots:
+                        visible ? normaliseSpots(replayController.dxSpots) : []
 
                     readonly property var placedSpots:
                         visible
-                        ? layoutSpots(replayController.dxSpots,
+                        ? layoutSpots(normalisedSpots,
                                       spectrumDisplay.lowerFrequencyHz,
                                       spectrumDisplay.upperFrequencyHz,
                                       width)

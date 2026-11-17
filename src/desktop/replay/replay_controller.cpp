@@ -252,7 +252,14 @@ std::optional<std::string> freshCharacterRefinementCallEvidence(
 std::optional<AdvisoryCallsignPresentation> advisoryCallsignPresentation(
     const QVariantMap& channel,
     const cwassistant::core::OfflineCallsignDatabase& database,
-    QString* diagnostic_reason, const bool allow_database_correction) {
+    QString* diagnostic_reason, const bool allow_database_correction,
+    const cwassistant::core::CallsignCorroborationInput* corroboration) {
+  // Bound to an lvalue rather than copied through a conditional expression:
+  // the input carries the matched spots by value and this function is called
+  // for every stream whose evidence moved.
+  const cwassistant::core::CallsignCorroborationInput no_corroboration;
+  const cwassistant::core::CallsignCorroborationInput& corroboration_input =
+      corroboration != nullptr ? *corroboration : no_corroboration;
   const auto reject = [diagnostic_reason](const char* reason) {
     if (diagnostic_reason != nullptr)
       *diagnostic_reason = QString::fromLatin1(reason);
@@ -411,37 +418,84 @@ std::optional<AdvisoryCallsignPresentation> advisoryCallsignPresentation(
         item.relative_cost, static_cast<float>(cost - best_cost));
   }
 
-  // The acoustics choose the candidate. The directory may only annotate the
-  // acoustic winner; it cannot promote a weaker database entry over a better
-  // non-directory hypothesis. Requiring two current paths retains the prior
-  // conservative evidence floor.
-  const auto ranks_before = [](const auto& left, const auto& right) {
-    if (left.second.alternatives != right.second.alternatives) {
-      return left.second.alternatives > right.second.alternatives;
-    }
-    const float left_score = left.second.support -
-        0.20F * left.second.relative_cost;
-    const float right_score = right.second.support -
-        0.20F * right.second.relative_cost;
-    if (left_score != right_score) return left_score > right_score;
-    return left.first < right.first;
-  };
   std::vector<std::pair<std::string, CandidateEvidence>> eligible;
   for (const auto& item : evidence) {
     if (item.second.alternatives >= 2) eligible.push_back(item);
   }
   if (eligible.empty())
     return reject("insufficient-current-acoustic-agreement");
+
+  // What other receivers reported, for each candidate the acoustics have
+  // already admitted, as the core ranker weighs it. Asking the ranker rather
+  // than reading the spots here keeps every cap -- per source, per provider,
+  // and the total external budget -- in the one place that defines them, and
+  // keeps the exact-match rule there too: a spot is compared with a candidate
+  // by string equality and never by edit distance, because a spot that could
+  // match approximately could rename a decode.
+  //
+  // Only candidates are probed, so a spotted callsign that no acoustic
+  // alternative produced is not in this list and cannot become one. No
+  // provider evidence is passed: this asks what the external channel is worth
+  // on its own, and the directory's weight is applied to the presented
+  // candidate further down, where it always was.
+  //
+  // Skipped entirely when no spot is in hand, which is the ordinary case. With
+  // the map empty every weight below is zero, and adding a zero to a float is
+  // exact, so the ordering and the ambiguity margin are then bit-for-bit the
+  // ones this function applied before corroboration existed.
+  std::map<std::string, float> external_support;
+  if (!corroboration_input.spots.empty() &&
+      corroboration_input.decode_frequency_hz > 0.0) {
+    std::vector<cwassistant::core::CallsignRawHypothesis> probes;
+    probes.reserve(eligible.size());
+    for (const auto& item : eligible) {
+      probes.push_back({
+          .raw_span = *mask,
+          .candidate = item.first,
+          .acoustic_support = item.second.support,
+          .acoustic_edit_cost = item.second.relative_cost,
+      });
+    }
+    for (const auto& probed : cwassistant::core::rank_callsign_suggestions(
+             *mask, probes, {}, {.maximum_span_edit_distance = 2U},
+             corroboration_input)) {
+      if (probed.corroboration.applied_weight > 0.0F) {
+        external_support.insert_or_assign(
+            probed.candidate, probed.corroboration.applied_weight);
+      }
+    }
+  }
+
+  // The acoustics choose the candidate. The directory may only annotate the
+  // acoustic winner; it cannot promote a weaker database entry over a better
+  // non-directory hypothesis. Requiring two current paths retains the prior
+  // conservative evidence floor.
+  //
+  // External agreement is added to the score but deliberately not to the count
+  // of agreeing alternatives, so it can only decide between candidates the
+  // acoustics support equally often. A candidate heard in fewer current
+  // alternatives than another stays below it however many receivers report it.
+  const auto score = [&external_support](const auto& item) {
+    const auto found = external_support.find(item.first);
+    const float external =
+        found == external_support.end() ? 0.0F : found->second;
+    return item.second.support - 0.20F * item.second.relative_cost + external;
+  };
+  const auto ranks_before = [&score](const auto& left, const auto& right) {
+    if (left.second.alternatives != right.second.alternatives) {
+      return left.second.alternatives > right.second.alternatives;
+    }
+    const float left_score = score(left);
+    const float right_score = score(right);
+    if (left_score != right_score) return left_score > right_score;
+    return left.first < right.first;
+  };
   std::ranges::sort(eligible, ranks_before);
   const auto& winner = eligible.front();
   if (eligible.size() > 1U) {
     const auto& runner_up = eligible[1];
-    const float winner_score = winner.second.support -
-        0.20F * winner.second.relative_cost;
-    const float runner_up_score = runner_up.second.support -
-        0.20F * runner_up.second.relative_cost;
     if (winner.second.alternatives == runner_up.second.alternatives &&
-        std::abs(winner_score - runner_up_score) < 0.02F) {
+        std::abs(score(winner) - score(runner_up)) < 0.02F) {
       return reject("ambiguous-acoustic-winner");
     }
   }
@@ -488,9 +542,14 @@ std::optional<AdvisoryCallsignPresentation> advisoryCallsignPresentation(
             : "Exact local-list entry supporting the acoustic winner",
     });
   }
+  // The corroboration input reaches the ranker here as well as in the probe
+  // above, and this is the call whose answer is presented: the weight it
+  // reports is the one left after the directory has taken its share of the
+  // single external budget, so what the operator is shown is what was actually
+  // applied and not what was available.
   const auto ranked = cwassistant::core::rank_callsign_suggestions(
       *mask, hypotheses, providers,
-      {.maximum_span_edit_distance = 2U});
+      {.maximum_span_edit_distance = 2U}, corroboration_input);
   if (ranked.empty())
     return reject("bounded-ranker-rejected");
   if (diagnostic_reason != nullptr)
@@ -506,7 +565,52 @@ std::optional<AdvisoryCallsignPresentation> advisoryCallsignPresentation(
       .agreeing_alternatives = winner.second.alternatives,
       .acoustic_support = ranked.front().acoustic_support,
       .relative_cost = ranked.front().acoustic_edit_cost,
+      .corroboration = ranked.front().corroboration,
   };
+}
+
+// The external observations that may corroborate one channel's advisory
+// callsign. See the header for why `frequencyKind` decides whether there is a
+// decode frequency at all.
+cwassistant::core::CallsignCorroborationInput channelCallsignCorroboration(
+    const QVariantMap& channel,
+    const cwassistant::core::CwSpotRegistry& registry,
+    const std::uint64_t now_ns) {
+  cwassistant::core::CallsignCorroborationInput input;
+  // The two unconditional rejections at the top of
+  // advisoryCallsignPresentation(), applied before the registry is searched. A
+  // confirmed callsign and an unverified stream both mean there is no advisory
+  // suggestion for a spot to corroborate, and on a busy band most streams are
+  // one or the other -- so this is also what keeps the per-publish search off
+  // the GUI thread for the streams that could never use it.
+  if (!channel.value(QStringLiteral("verifiedCw")).toBool()) return input;
+  if (!channel.value(QStringLiteral("callsign")).toString().isEmpty())
+    return input;
+  if (channel.value(QStringLiteral("frequencyKind")).toString() !=
+      QStringLiteral("RF")) {
+    return input;
+  }
+  const double decode_frequency_hz =
+      channel.value(QStringLiteral("displayFrequencyHz")).toDouble();
+  if (!std::isfinite(decode_frequency_hz) || decode_frequency_hz <= 0.0)
+    return input;
+
+  // One reference clock for the whole derivation, quantized once here so that
+  // the spots selected, the ages they are weighed by and the cache key they
+  // are compared through all agree. A report stamped inside the current period
+  // is still ahead of this reading, which the ranker treats as a clock fault
+  // and ignores; it is weighed from the next period, a delay of at most one
+  // quantum against a 120-second window.
+  input.now_ns =
+      now_ns / kCallsignCorroborationClockQuantumNs *
+      kCallsignCorroborationClockQuantumNs;
+  input.decode_frequency_hz = decode_frequency_hz;
+  input.spots = registry.nearFrequency(decode_frequency_hz, input.now_ns);
+  // Nothing was reported near this stream. Returning the frequency with no
+  // spots would make the cache key non-empty for a stream that cannot be
+  // corroborated, so the whole input is dropped instead.
+  if (input.spots.empty()) return {};
+  return input;
 }
 
 namespace {
@@ -573,6 +677,63 @@ namespace {
   return !diverged && matched == own_callsign.size();
 }
 
+// Everything about one stream's external observations that could change what
+// is derived from them, in a single comparable value.
+//
+// Built from the already-matched spots, so it costs what is actually near this
+// stream rather than what the feed has sent. Each station contributes its
+// marks, its newest observation time and its report count, because all three
+// change what the ranker applies, and its reported frequency, because the
+// signed offset the operator is shown moves when a station is re-reported a
+// little further away. The decode frequency leads, because the same match
+// means something different once the dial has moved; the quantized clock
+// follows it, because support decays with age and an aged-out report has to
+// stop being shown without waiting for an unrelated character to arrive.
+// How the operator is told which kind of receiver agreed. The two kinds are
+// named separately rather than collapsed into "spotted" because they fail
+// differently: a skimmer mishears a callsign, a person mistypes one, and their
+// agreement is worth more than either alone -- which is also how the core
+// weighs them.
+[[nodiscard]] QString corroborationSourceLabel(
+    const cwassistant::core::CallsignCorroboration& corroboration) {
+  if (!corroboration.corroborated) return {};
+  if (corroboration.reverse_beacon && corroboration.cluster)
+    return QStringLiteral("reverse-beacon+cluster");
+  if (corroboration.reverse_beacon) return QStringLiteral("reverse-beacon");
+  if (corroboration.cluster) return QStringLiteral("cluster");
+  return {};
+}
+
+[[nodiscard]] std::string corroborationCacheKey(
+    const cwassistant::core::CallsignCorroborationInput& corroboration) {
+  if (corroboration.spots.empty() ||
+      !std::isfinite(corroboration.decode_frequency_hz) ||
+      corroboration.decode_frequency_hz <= 0.0) {
+    return {};
+  }
+  const auto rounded = [](const double value) {
+    return std::to_string(static_cast<std::int64_t>(std::llround(value)));
+  };
+  std::string key;
+  key.reserve(32U + 48U * corroboration.spots.size());
+  key.append(rounded(corroboration.decode_frequency_hz));
+  key.push_back('@');
+  key.append(std::to_string(corroboration.now_ns));
+  for (const auto& spot : corroboration.spots) {
+    key.push_back(';');
+    key.append(spot.callsign);
+    key.push_back(':');
+    key.append(rounded(spot.frequency_hz));
+    key.push_back(':');
+    key.append(std::to_string(spot.newest_observation_ns));
+    key.push_back(':');
+    key.append(std::to_string(spot.observations));
+    key.push_back(spot.reverse_beacon ? 'R' : '-');
+    key.push_back(spot.cluster ? 'C' : '-');
+  }
+  return key;
+}
+
 }  // namespace
 
 void DecoderChannelPresentationCache::setContext(
@@ -593,7 +754,8 @@ void DecoderChannelPresentationCache::invalidate() noexcept {
 const DecoderChannelPresentationCache::Derived&
 DecoderChannelPresentationCache::derive(
     const qulonglong channel_id, const QVariantMap& channel,
-    const cwassistant::core::OfflineCallsignDatabase& database) {
+    const cwassistant::core::OfflineCallsignDatabase& database,
+    const cwassistant::core::CallsignCorroborationInput* corroboration) {
   const QString text = channel.value(QStringLiteral("text")).toString();
   const QString refined_text =
       channel.value(QStringLiteral("refinedText")).toString();
@@ -601,6 +763,13 @@ DecoderChannelPresentationCache::derive(
   const QVariantList acoustic_alternatives =
       channel.value(QStringLiteral("acousticAlternatives")).toList();
   const bool verified_cw = channel.value(QStringLiteral("verifiedCw")).toBool();
+  // Empty whenever no external observation is near this stream, which is the
+  // ordinary case and every case without a cluster. The comparison below is
+  // then between two empty strings, and nothing about the retained answer or
+  // the computation count changes.
+  const std::string corroboration_key = corroboration == nullptr
+      ? std::string{}
+      : corroborationCacheKey(*corroboration);
 
   Entry& entry = entries_[channel_id];
   entry.publish = publish_;
@@ -611,9 +780,12 @@ DecoderChannelPresentationCache::derive(
   // would miss a refinement that rewrites a transcript without changing its
   // length, and would then show the operator a suggestion drawn from evidence
   // that no longer exists.
+  // The corroboration key is compared last because it is the one piece of
+  // evidence most publishes do not have at all.
   if (entry.valid && entry.text == text && entry.refined_text == refined_text &&
       entry.verified_cw == verified_cw && entry.callsign == callsign &&
-      entry.acoustic_alternatives == acoustic_alternatives) {
+      entry.acoustic_alternatives == acoustic_alternatives &&
+      entry.corroboration_key == corroboration_key) {
     return entry.derived;
   }
 
@@ -623,6 +795,7 @@ DecoderChannelPresentationCache::derive(
   entry.callsign = callsign;
   entry.acoustic_alternatives = acoustic_alternatives;
   entry.verified_cw = verified_cw;
+  entry.corroboration_key = corroboration_key;
   entry.valid = true;
   entry.derived = Derived{};
 
@@ -656,9 +829,13 @@ DecoderChannelPresentationCache::derive(
   }
   if (const auto suggestion = advisoryCallsignPresentation(
           channel, database, &entry.derived.suggestion_diagnostic,
-          allow_database_correction_)) {
+          allow_database_correction_, corroboration)) {
     entry.derived.suggestion = suggestion->callsign;
     entry.derived.suggestion_raw_span = suggestion->raw_span;
+    // The source still names where the callsign itself came from. External
+    // agreement is reported beside it rather than as a third kind of source: a
+    // spot never supplied the callsign, so it cannot be what the suggestion is
+    // drawn from.
     entry.derived.suggestion_source = suggestion->database_match
         ? QStringLiteral("offline-directory")
         : QStringLiteral("acoustic-consensus");
@@ -666,6 +843,7 @@ DecoderChannelPresentationCache::derive(
         suggestion->agreeing_alternatives;
     entry.derived.suggestion_support = suggestion->acoustic_support;
     entry.derived.suggestion_relative_cost = suggestion->relative_cost;
+    entry.derived.suggestion_corroboration = suggestion->corroboration;
   }
   return entry.derived;
 }
@@ -1756,6 +1934,14 @@ void ReplayController::rebuildDecoderModels() {
   const QVariantList previous_sessions = decoder_sessions_;
   channel_presentation_.setContext(own_callsign_,
                                    callsign_database_correction_enabled_);
+  // Whether there is any point asking the spot store anything this publish.
+  // An operator who has not joined a cluster, and one whose store is empty
+  // because nothing has been reported in the band being received, both pay
+  // nothing for this feature: no clock is read and no stream is searched.
+  const bool corroborate_suggestions =
+      dx_cluster_enabled_ && dx_spot_registry_.size() > 0U;
+  const std::uint64_t spot_now_ns =
+      corroborate_suggestions ? currentUnixTimeNs() : 0ULL;
   decoder_channels_.clear();
   QHash<qulonglong, QVariantMap> by_id;
   const bool mapped_audio_rf = radio_frequency_available_ &&
@@ -1826,8 +2012,21 @@ void ReplayController::rebuildDecoderModels() {
     // loop for up to 2.1 seconds on a busy band. The cache returns the same
     // values from the same evidence and recomputes only when the evidence
     // moves.
+    //
+    // The spot evidence is matched here, before the cache is consulted,
+    // because it is part of what the cache compares: a derivation cannot be
+    // skipped on the strength of evidence that has not been looked at. It is
+    // matched against this channel's own decode frequency, which the frequency
+    // keys above have just established, and it is matched for the streams that
+    // could carry a suggestion at all -- see channelCallsignCorroboration().
+    const cwassistant::core::CallsignCorroborationInput corroboration =
+        corroborate_suggestions
+            ? channelCallsignCorroboration(item, dx_spot_registry_,
+                                           spot_now_ns)
+            : cwassistant::core::CallsignCorroborationInput{};
     const auto& derived = channel_presentation_.derive(
-        id, item, offline_callsign_database_);
+        id, item, offline_callsign_database_,
+        corroboration.spots.empty() ? nullptr : &corroboration);
     item.insert(QStringLiteral("callsignInDatabase"),
                 derived.callsign_in_database);
     item.insert(QStringLiteral("callsignDatabaseLoaded"),
@@ -1847,6 +2046,26 @@ void ReplayController::rebuildDecoderModels() {
                 derived.suggestion_relative_cost);
     item.insert(QStringLiteral("callsignSuggestionDiagnostic"),
                 derived.suggestion_diagnostic);
+    // Corroboration, presented apart from the suggestion itself so that a
+    // presentation layer cannot accidentally show somebody else's report as
+    // part of what was decoded. Always inserted, including as false and zero,
+    // so a binding resolves on every stream.
+    const auto& corroborated = derived.suggestion_corroboration;
+    item.insert(QStringLiteral("callsignSuggestionCorroborated"),
+                corroborated.corroborated);
+    item.insert(QStringLiteral("callsignSuggestionCorroborationSource"),
+                corroborationSourceLabel(corroborated));
+    item.insert(QStringLiteral("callsignSuggestionCorroborationAgeSeconds"),
+                static_cast<int>(corroborated.age.count()));
+    item.insert(QStringLiteral("callsignSuggestionCorroborationDeltaHz"),
+                static_cast<qlonglong>(corroborated.frequency_delta_hz));
+    item.insert(QStringLiteral("callsignSuggestionCorroborationObservations"),
+                static_cast<int>(corroborated.observations));
+    // The support actually applied after every cap, not what was asked for.
+    item.insert(QStringLiteral("callsignSuggestionCorroborationWeight"),
+                static_cast<double>(corroborated.applied_weight));
+    item.insert(QStringLiteral("callsignSuggestionCorroborationRationale"),
+                QString::fromStdString(corroborated.rationale));
     decoder_channels_.push_back(item);
     by_id.insert(id, item);
   }
@@ -1922,6 +2141,22 @@ void ReplayController::publishLivePresentationDiagnostics(const bool force) {
          channel.value(QStringLiteral("callsignSuggestionRelativeCost"))},
         {QStringLiteral("callsignSuggestionDiagnostic"),
          channel.value(QStringLiteral("callsignSuggestionDiagnostic"))},
+        // Enough of the external agreement to answer, from a capture alone,
+        // whether a spot was weighed into a suggestion and by how much. The
+        // operator sentence is left out: the fields below say the same thing
+        // in a fraction of the bytes, and a capture record is written
+        // repeatedly.
+        {QStringLiteral("callsignSuggestionCorroborated"),
+         channel.value(QStringLiteral("callsignSuggestionCorroborated"))},
+        {QStringLiteral("callsignSuggestionCorroborationSource"),
+         channel.value(QStringLiteral("callsignSuggestionCorroborationSource"))},
+        {QStringLiteral("callsignSuggestionCorroborationAgeSeconds"),
+         channel.value(
+             QStringLiteral("callsignSuggestionCorroborationAgeSeconds"))},
+        {QStringLiteral("callsignSuggestionCorroborationDeltaHz"),
+         channel.value(QStringLiteral("callsignSuggestionCorroborationDeltaHz"))},
+        {QStringLiteral("callsignSuggestionCorroborationWeight"),
+         channel.value(QStringLiteral("callsignSuggestionCorroborationWeight"))},
     });
   }
   const QVariantMap presentation_diagnostics{

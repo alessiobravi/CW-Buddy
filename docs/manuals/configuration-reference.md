@@ -870,6 +870,31 @@ acoustic support win: reverse-beacon reports carry a measured error rate
 approaching two per cent per receiver, and a confidently wrong callsign is worse
 than none.
 
+Three limits on that are worth knowing, because each one is a case where you
+will see no corroboration at all and the reason is not a fault:
+
+- **It needs to know the real frequency.** A spot is reported in absolute RF, so
+  corroborating one means knowing what frequency a stream was decoded on. That
+  is available for a directly tuned receiver while it is capturing, and for a
+  sound card while capturing when a radio is reporting its dial. Replaying a
+  recording, or listening on a sound card with no radio attached, gives an audio
+  frequency and nothing that maps it to the band — so corroboration is withheld
+  rather than matched against a guess.
+- **It only settles a question the decoding left open.** How many of the current
+  acoustic readings agree on a callsign still decides first. A spot can choose
+  between candidates that are close to level, which is where it earns its place;
+  it cannot lift a callsign that fewer of those readings support over one that
+  more of them support, however many receivers report it. A station nobody here
+  copied is not offered because somebody else heard it.
+- **It shares one budget with the offline list.** External evidence of every kind
+  draws on a single capped allowance, so a suggestion already supported by the
+  local callsign list leaves a spot little or nothing left to add. This is
+  deliberate: it means no outside channel gains influence merely by arriving
+  through a different door.
+
+A corroborated suggestion is refreshed about every five seconds rather than on
+every update, which is also how a report that has aged out stops counting.
+
 ## Network
 
 A live diagnostics stream, so a station can be watched while it runs instead of

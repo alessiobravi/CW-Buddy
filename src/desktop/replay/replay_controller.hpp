@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../visualization/spectrum_frame.hpp"
+#include "cwassistant/core/callsign_evidence.hpp"
 #include "cwassistant/core/cw_channel_bank.hpp"
 #include "cwassistant/core/cw_character_decoder.hpp"
 #include "cwassistant/core/cw_spot_registry.hpp"
@@ -77,7 +78,52 @@ struct AdvisoryCallsignPresentation {
   int agreeing_alternatives{0};
   double acoustic_support{0.0};
   double relative_cost{0.0};
+  // What other receivers reported near the frequency this span was decoded on,
+  // exactly as the bounded core ranker applied it -- the core's own struct
+  // rather than a parallel set of fields here, so there is one description of
+  // external agreement in the program and no second place for it to drift.
+  //
+  // Default-constructed means no spot was in hand, which is the ordinary case
+  // and says nothing at all about the callsign: most real contacts are never
+  // spotted. It is never a statement that an outside source disagrees.
+  cwassistant::core::CallsignCorroboration corroboration;
 };
+
+// The reference clock a spot's age is measured against is quantized to this
+// period before anything is derived from it.
+//
+// Corroboration decays with the age of the observation, so its value moves
+// continuously while nothing else does, and a derivation keyed on the publish
+// clock would be recomputed on every publish for as long as any spot sat near
+// the stream -- which is the cost DecoderChannelPresentationCache exists to
+// avoid. Quantizing makes the derived answer a pure function of the evidence
+// it is keyed on: within one period the same spots produce the same
+// suggestion, and the period is small against the ranker's 120-second spot
+// window, so the age shown and the support applied are off by at most a few
+// per cent of the cap.
+inline constexpr std::uint64_t kCallsignCorroborationClockQuantumNs =
+    5'000'000'000ULL;
+
+// The external observations that may corroborate one published channel's
+// advisory callsign, read out of the spot registry.
+//
+// `channel` is a channel map as rebuildDecoderModels() has already annotated
+// it, which is where the decode frequency comes from: `displayFrequencyHz`,
+// and only when `frequencyKind` is "RF". That pair is the only authoritative
+// statement in the program of the radio frequency a span was decoded on --
+// direct IQ carries it per frame, an audio card carries it only once a radio
+// is reporting its dial, and a recording never carries it at all. Spots are
+// reported in absolute RF, so without it there is nothing to compare and the
+// returned input is empty rather than a guess: corroborating an audio
+// frequency against the spot store would weigh the wrong part of the band.
+//
+// Returns an empty input -- which disables corroboration entirely -- for a
+// stream that already has a confirmed callsign or is not verified CW, because
+// neither can carry an advisory suggestion for a spot to corroborate.
+[[nodiscard]] cwassistant::core::CallsignCorroborationInput
+channelCallsignCorroboration(
+    const QVariantMap& channel,
+    const cwassistant::core::CwSpotRegistry& registry, std::uint64_t now_ns);
 
 // Selects only the acoustically strongest callsign present in at least two
 // current bounded alternatives and within two wildcard-aware edits of the
@@ -93,12 +139,24 @@ struct AdvisoryCallsignPresentation {
 // differ by one character, so a correction can name a station that was never
 // heard; without it the acoustic winner is always what is shown, which is the
 // behaviour this application has always had.
+//
+// `corroboration`, when supplied, is what other receivers reported near the
+// frequency this span was decoded on. It may order candidates the acoustics
+// already admitted, and that is the whole of its authority: it cannot add a
+// candidate no acoustic alternative produced, cannot rewrite a character,
+// cannot confirm a callsign or verify a stream, and spends the same bounded
+// external budget as the directory rather than a second one. A null pointer,
+// or an input with no spot near this stream, leaves every decision in this
+// function exactly as it was before corroboration existed.
 [[nodiscard]] std::optional<AdvisoryCallsignPresentation>
 advisoryCallsignPresentation(const QVariantMap& channel,
                              const cwassistant::core::OfflineCallsignDatabase&
                                  database,
                              QString* diagnostic_reason = nullptr,
-                             bool allow_database_correction = false);
+                             bool allow_database_correction = false,
+                             const cwassistant::core::
+                                 CallsignCorroborationInput* corroboration =
+                                     nullptr);
 
 // The two expensive parts of a published decoder channel, kept against the
 // exact evidence they were derived from.
@@ -130,6 +188,40 @@ advisoryCallsignPresentation(const QVariantMap& channel,
 // produce: it needs 23 committed characters a second on each of 24 streams.
 // This is the memo the decoder already keeps for word-gap reconstruction
 // (word_gap_cache_input_ in cw_decoder.cpp), applied one layer up.
+//
+// Spot corroboration is evidence too, and it is the one input that does not
+// live in the channel. It cannot be added to a retained answer afterwards: an
+// external observation participates in the ranking that chooses between
+// acoustic candidates, so an answer derived without it is a different answer
+// and not the same one with a note attached.
+//
+// It is also the one input that arrives on somebody else's schedule. A cluster
+// delivers its lines in batches about a second apart and the reverse-beacon
+// feed was measured at six spots a second worldwide, so dropping every
+// retained answer whenever a batch arrived would empty this cache on exactly
+// the busy band it was added for. How often other people report a station has
+// nothing to do with whether this operator's streams moved.
+//
+// So an entry holds the relevant result rather than the arrival. The caller
+// passes the spots already matched against this stream's decode frequency,
+// and the key carries that match -- station, source marks, observation time
+// and reported frequency -- together with the frequency it was matched against
+// and the quantized clock it is aged by. Two consequences, and they are the
+// point of doing it this way:
+//
+//  - A publish that brings no spot near this stream adds nothing to the key.
+//    That is the ordinary case, and it is every case for an operator who has
+//    not joined a cluster: the comparison is the one it always was and the
+//    computation count does not move.
+//  - A stream that does have a spot near it is keyed to a clock quantum
+//    instead of the publish clock, so it is recomputed about once every five
+//    seconds rather than twenty-three times a second, and corroboration that
+//    has aged past the ranker's window lapses within one quantum of expiring
+//    instead of standing until some unrelated character arrives.
+//
+// Nothing here invalidates on a spot arrival, and nothing needs to: a changed
+// retention window, a retune to another band, a disabled cluster and an
+// expired report all change what the caller matches, which changes the key.
 class DecoderChannelPresentationCache {
  public:
   struct Derived {
@@ -142,6 +234,7 @@ class DecoderChannelPresentationCache {
     double suggestion_support{0.0};
     double suggestion_relative_cost{0.0};
     QString suggestion_diagnostic;
+    cwassistant::core::CallsignCorroboration suggestion_corroboration;
   };
 
   // Evidence that does not live in any one channel. Changing the operator's
@@ -152,9 +245,16 @@ class DecoderChannelPresentationCache {
   // caller says when they moved.
   void invalidate() noexcept;
 
+  // `corroboration` is what the caller matched out of the spot registry for
+  // this stream, or null when there is nothing to match against. Passing null
+  // and passing an input with no spots are the same thing, and both leave the
+  // derivation identical to the one this class performed before external
+  // observations reached it.
   [[nodiscard]] const Derived& derive(
       qulonglong channel_id, const QVariantMap& channel,
-      const cwassistant::core::OfflineCallsignDatabase& database);
+      const cwassistant::core::OfflineCallsignDatabase& database,
+      const cwassistant::core::CallsignCorroborationInput* corroboration =
+          nullptr);
 
   // Called once a publish has derived every live stream. A stream that has
   // gone keeps no entry: its channel id is never published again.
@@ -181,6 +281,13 @@ class DecoderChannelPresentationCache {
     QString callsign;
     QVariantList acoustic_alternatives;
     bool verified_cw{false};
+    // Everything about the external observations that could change this
+    // stream's answer, flattened into one comparable value: the decode
+    // frequency they were matched against, the clock quantum they are aged
+    // by, and each matched station's marks, observation time, frequency and
+    // report count. Empty whenever no spot is near this stream, so the usual
+    // comparison is between two empty strings.
+    std::string corroboration_key;
     bool valid{false};
     qulonglong publish{0};
     Derived derived;

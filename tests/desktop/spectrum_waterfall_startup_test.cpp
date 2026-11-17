@@ -18,6 +18,8 @@
 #include <utility>
 #include <vector>
 
+#include "cwassistant/core/callsign_evidence.hpp"
+#include "cwassistant/core/cw_spot_registry.hpp"
 #include "cwassistant/core/iq_receive.hpp"
 #include "cwassistant/core/sample_block.hpp"
 
@@ -1310,6 +1312,574 @@ int testBlockingErrorsArePublishedWhole() {
   return 0;
 }
 
+// Spot corroboration: what other receivers reported, reaching the advisory
+// suggestion through the same cache the rest of the presentation goes through.
+//
+// The ranking arithmetic itself -- the caps, the decay, the exact-match rule --
+// is covered in callsign_evidence_tests.cpp against the core ranker. What is
+// asserted here is the wiring that did not exist: that the registry's matches
+// arrive at the ranker with the frequency the span was decoded on and a clock
+// that can age them, that the boundaries hold at this layer too, and that a
+// publish with nothing reported near a stream still derives nothing.
+
+// A wall-clock reading on the registry's own scale, chosen to be an exact
+// multiple of the corroboration clock quantum so a test can state the ages it
+// expects rather than the ages that survive quantization.
+constexpr std::uint64_t kSpotNowNs = 1'763'000'000'000'000'000ULL;
+constexpr std::uint64_t kSecondNs = 1'000'000'000ULL;
+constexpr double kDecodeRfHz = 14'050'000.0;
+
+QVariantList alternativesFrom(
+    const std::vector<std::pair<QString, double>>& paths) {
+  QVariantList alternatives;
+  for (const auto& [text, confidence] : paths) {
+    alternatives.push_back(QVariantMap{
+        {QStringLiteral("text"), text},
+        // One cost for every path, so each candidate's relative cost is zero
+        // and the margin between them is the confidence margin alone.
+        {QStringLiteral("cost"), 38.0},
+        {QStringLiteral("confidence"), confidence},
+        {QStringLiteral("firstObservationId"),
+         QVariant::fromValue<qulonglong>(61)},
+        {QStringLiteral("lastObservationId"),
+         QVariant::fromValue<qulonglong>(80)}});
+  }
+  return alternatives;
+}
+
+// A verified, unconfirmed stream published on a known radio frequency. The
+// frequencyKind/displayFrequencyHz pair is what rebuildDecoderModels() writes
+// when, and only when, the decode frequency is genuinely known in RF.
+QVariantMap rfBandChannel(const qulonglong id, const QVariantList& alternatives,
+                          const double decode_rf_hz = kDecodeRfHz) {
+  QVariantMap channel = bandChannel(id, 600);
+  channel.insert(QStringLiteral("acousticAlternatives"), alternatives);
+  channel.insert(QStringLiteral("frequencyKind"), QStringLiteral("RF"));
+  channel.insert(QStringLiteral("displayFrequencyHz"),
+                 QVariant::fromValue<qulonglong>(
+                     static_cast<qulonglong>(decode_rf_hz)));
+  return channel;
+}
+
+cwassistant::core::CwSpot spotOf(const char* callsign,
+                                 const cwassistant::core::CwSpotSource source,
+                                 const double frequency_hz,
+                                 const std::uint64_t age_seconds) {
+  return cwassistant::core::CwSpot{
+      .callsign = callsign,
+      .frequency_hz = frequency_hz,
+      .observed_ns = kSpotNowNs - age_seconds * kSecondNs,
+      .spotter = "TESTER",
+      .source = source,
+  };
+}
+
+using PresentationCache =
+    cwassistant::desktop::DecoderChannelPresentationCache;
+
+bool sameSuggestion(const PresentationCache::Derived& derived,
+                    const cwassistant::desktop::AdvisoryCallsignPresentation&
+                        reference,
+                    const QString& reference_diagnostic) {
+  return derived.suggestion == reference.callsign &&
+         derived.suggestion_raw_span == reference.raw_span &&
+         derived.suggestion_agreeing_alternatives ==
+             reference.agreeing_alternatives &&
+         derived.suggestion_support == reference.acoustic_support &&
+         derived.suggestion_relative_cost == reference.relative_cost &&
+         derived.suggestion_diagnostic == reference_diagnostic;
+}
+
+bool reportsNoCorroboration(
+    const cwassistant::core::CallsignCorroboration& corroboration) {
+  return !corroboration.corroborated && !corroboration.reverse_beacon &&
+         !corroboration.cluster && corroboration.observations == 0U &&
+         corroboration.age == std::chrono::seconds{0} &&
+         corroboration.frequency_delta_hz == 0 &&
+         corroboration.applied_weight == 0.0F &&
+         corroboration.rationale.empty();
+}
+
+// With nothing reported, nothing changes: not the suggestion, and not the
+// number of times it is derived.
+//
+// This is the case every operator who has never joined a cluster is in, and
+// the one the corpus cannot speak for, so it is asserted directly rather than
+// inferred from the cases below. An empty store, a store whose spots are on
+// another part of the band, and no store at all have to be the same thing.
+int testNoSpotEvidenceChangesNothing() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  if (!database.importText("SV2HQL\n").accepted) return 170;
+
+  const QVariantMap channel = rfBandChannel(
+      1, alternativesFrom({{QStringLiteral("SV2HQL AIPX"), 0.48},
+                           {QStringLiteral("SV2HQL AIPX"), 0.48}}));
+  QString reference_diagnostic;
+  const auto reference = cwassistant::desktop::advisoryCallsignPresentation(
+      channel, database, &reference_diagnostic, false);
+  if (!reference || reference->callsign != QStringLiteral("SV2HQL") ||
+      !reportsNoCorroboration(reference->corroboration)) {
+    return 171;
+  }
+
+  // An empty registry. The matched input is empty, so there is no key, no
+  // clock and nothing for the derivation to depend on.
+  const cwassistant::core::CwSpotRegistry empty_registry;
+  const auto no_evidence = cwassistant::desktop::channelCallsignCorroboration(
+      channel, empty_registry, kSpotNowNs);
+  if (!no_evidence.spots.empty() || no_evidence.decode_frequency_hz != 0.0 ||
+      no_evidence.now_ns != 0U) {
+    return 172;
+  }
+
+  // A store with spots in it, none of them near this stream. Same answer.
+  cwassistant::core::CwSpotRegistry elsewhere;
+  if (!elsewhere.add(spotOf("SV2HQL", cwassistant::core::CwSpotSource::Cluster,
+                            kDecodeRfHz + 40'000.0, 10U),
+                     kSpotNowNs)) {
+    return 173;
+  }
+  const auto distant = cwassistant::desktop::channelCallsignCorroboration(
+      channel, elsewhere, kSpotNowNs);
+  if (!distant.spots.empty()) return 174;
+
+  // Twenty-three publishes with the spot store consulted on every one of them,
+  // against the count the cache has always claimed: one derivation.
+  cwassistant::desktop::DecoderChannelPresentationCache cache;
+  cache.setContext(QStringLiteral("IZ1ABC"), false);
+  for (int publish = 0; publish < 23; ++publish) {
+    const auto evidence = cwassistant::desktop::channelCallsignCorroboration(
+        channel, elsewhere, kSpotNowNs + static_cast<std::uint64_t>(publish) *
+                                             7ULL * kSecondNs);
+    const auto& derived = cache.derive(
+        1, channel, database,
+        evidence.spots.empty() ? nullptr : &evidence);
+    cache.endPublish();
+    if (!sameSuggestion(derived, *reference, reference_diagnostic) ||
+        derived.suggestion_source != QStringLiteral("offline-directory") ||
+        !reportsNoCorroboration(derived.suggestion_corroboration)) {
+      return 175;
+    }
+  }
+  if (cache.computations() != 1U) return 176;
+
+  // The publish clock advanced by more than two minutes across that loop. A
+  // freshness mechanism keyed on time rather than on what is actually near the
+  // stream would have recomputed; this one has nothing to recompute from.
+  return 0;
+}
+
+// A spot near the decoded frequency reaches the ranker, and reaches it through
+// the cache rather than around it.
+int testSpotEvidenceReachesTheRanker() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  const QVariantMap channel = rfBandChannel(
+      2, alternativesFrom({{QStringLiteral("SV2HQL AIPX"), 0.48},
+                           {QStringLiteral("SV2HQL AIPX"), 0.48}}));
+
+  cwassistant::core::CwSpotRegistry registry;
+  // The same station reported by a skimmer and by a person: one match carrying
+  // both marks, which is the strongest thing this registry can say.
+  if (!registry.add(spotOf("SV2HQL",
+                           cwassistant::core::CwSpotSource::ReverseBeacon,
+                           kDecodeRfHz + 40.0, 10U),
+                    kSpotNowNs) ||
+      !registry.add(spotOf("SV2HQL", cwassistant::core::CwSpotSource::Cluster,
+                           kDecodeRfHz + 40.0, 10U),
+                    kSpotNowNs)) {
+    return 180;
+  }
+
+  const auto evidence = cwassistant::desktop::channelCallsignCorroboration(
+      channel, registry, kSpotNowNs);
+  if (evidence.spots.size() != 1U ||
+      evidence.decode_frequency_hz != kDecodeRfHz ||
+      evidence.now_ns != kSpotNowNs ||
+      evidence.spots.front().callsign != "SV2HQL" ||
+      !evidence.spots.front().reverse_beacon ||
+      !evidence.spots.front().cluster ||
+      evidence.spots.front().observations != 2U) {
+    return 181;
+  }
+
+  cwassistant::desktop::DecoderChannelPresentationCache cache;
+  cache.setContext(QStringLiteral("IZ1ABC"), false);
+  const auto& derived = cache.derive(2, channel, database, &evidence);
+  cache.endPublish();
+  const auto& corroborated = derived.suggestion_corroboration;
+  if (derived.suggestion != QStringLiteral("SV2HQL") ||
+      // The callsign is still named as what it was drawn from. A spot did not
+      // supply it and must not be presented as its source.
+      derived.suggestion_source != QStringLiteral("acoustic-consensus") ||
+      !corroborated.corroborated || !corroborated.reverse_beacon ||
+      !corroborated.cluster || corroborated.observations != 2U ||
+      corroborated.age != std::chrono::seconds{10} ||
+      corroborated.frequency_delta_hz != 40 ||
+      corroborated.rationale.empty()) {
+    return 182;
+  }
+  // Applied support, after every cap. One external channel may never exceed
+  // what one provider may contribute, and the figure is read from the core
+  // configuration rather than written out again here.
+  const cwassistant::core::CallsignRankConfig limits;
+  if (!(corroborated.applied_weight > 0.0F) ||
+      corroborated.applied_weight > limits.maximum_weight_per_provider +
+                                        0.0001F) {
+    return 183;
+  }
+
+  // Twenty-two further publishes inside the same clock quantum: the spot is
+  // still being matched on every one of them and the answer is still retained.
+  for (int publish = 0; publish < 22; ++publish) {
+    const auto repeated = cwassistant::desktop::channelCallsignCorroboration(
+        channel, registry, kSpotNowNs + 4ULL * kSecondNs);
+    static_cast<void>(cache.derive(2, channel, database, &repeated));
+    cache.endPublish();
+  }
+  if (cache.computations() != 1U) return 184;
+
+  // The station is re-reported 1 kHz away, which is outside the store's match
+  // tolerance. Nothing is near this stream any more, so corroboration lapses
+  // and the suggestion is left exactly as the acoustics had it.
+  cwassistant::core::CwSpotRegistry moved;
+  if (!moved.add(spotOf("SV2HQL", cwassistant::core::CwSpotSource::Cluster,
+                        kDecodeRfHz + 1'000.0, 10U),
+                 kSpotNowNs)) {
+    return 185;
+  }
+  const auto away = cwassistant::desktop::channelCallsignCorroboration(
+      channel, moved, kSpotNowNs);
+  if (!away.spots.empty()) return 186;
+  const auto& lapsed = cache.derive(2, channel, database, nullptr);
+  cache.endPublish();
+  if (lapsed.suggestion != QStringLiteral("SV2HQL") ||
+      !reportsNoCorroboration(lapsed.suggestion_corroboration) ||
+      cache.computations() != 2U) {
+    return 187;
+  }
+  return 0;
+}
+
+// The decode frequency is the one the span was actually decoded on, or there
+// is none.
+//
+// Spots are reported in absolute RF. A stream whose frequency is only known as
+// audio -- an audio card with no radio reporting its dial, or a recording --
+// has nothing that can be compared with a spot, and comparing the audio
+// frequency instead would corroborate against a different part of the band
+// entirely. Getting this wrong is silent, so each way of not knowing is
+// asserted separately.
+int testCorroborationNeedsTheDecodeFrequencyInRf() {
+  cwassistant::core::CwSpotRegistry registry;
+  if (!registry.add(spotOf("SV2HQL", cwassistant::core::CwSpotSource::Cluster,
+                           kDecodeRfHz, 10U),
+                    kSpotNowNs)) {
+    return 190;
+  }
+  const QVariantList alternatives =
+      alternativesFrom({{QStringLiteral("SV2HQL AIPX"), 0.48},
+                        {QStringLiteral("SV2HQL AIPX"), 0.48}});
+
+  // The frequency is not read unless the channel says it is RF, and that is
+  // not a formality. A direct-IQ stream carries absolute RF in the same field
+  // the audio path carries a passband tone in, and the published kind is the
+  // only thing that says which of the two a number is: while reception is not
+  // live the mapping is withheld and the kind reverts to AF, although the
+  // number is still an RF-shaped one. Reading it anyway would corroborate
+  // against a receiver state that is no longer being reported, so this channel
+  // carries exactly the frequency a report sits on and must still match
+  // nothing.
+  QVariantMap unlabelled = rfBandChannel(3, alternatives);
+  unlabelled.insert(QStringLiteral("frequencyKind"), QStringLiteral("AF"));
+  if (!cwassistant::desktop::channelCallsignCorroboration(
+           unlabelled, registry, kSpotNowNs).spots.empty()) {
+    return 191;
+  }
+
+  // The ordinary audio case: a passband tone, honestly labelled.
+  QVariantMap audio_only = unlabelled;
+  audio_only.insert(QStringLiteral("displayFrequencyHz"), 600.0);
+  if (!cwassistant::desktop::channelCallsignCorroboration(
+           audio_only, registry, kSpotNowNs).spots.empty()) {
+    return 198;
+  }
+
+  // Claimed as RF with nothing in it. A zero is not a frequency.
+  QVariantMap unmapped = rfBandChannel(3, alternatives);
+  unmapped.insert(QStringLiteral("displayFrequencyHz"),
+                  QVariant::fromValue<qulonglong>(0));
+  if (!cwassistant::desktop::channelCallsignCorroboration(
+           unmapped, registry, kSpotNowNs).spots.empty()) {
+    return 192;
+  }
+
+  // No frequency keys at all, which is what a channel looks like before
+  // rebuildDecoderModels() has annotated it.
+  QVariantMap bare = bandChannel(3, 600);
+  if (!cwassistant::desktop::channelCallsignCorroboration(
+           bare, registry, kSpotNowNs).spots.empty()) {
+    return 193;
+  }
+
+  // A confirmed callsign, and an unverified stream. Neither can carry an
+  // advisory suggestion, so neither has anything for a spot to corroborate and
+  // neither pays for a search.
+  QVariantMap confirmed = rfBandChannel(3, alternatives);
+  confirmed.insert(QStringLiteral("callsign"), QStringLiteral("SV2HQL"));
+  if (!cwassistant::desktop::channelCallsignCorroboration(
+           confirmed, registry, kSpotNowNs).spots.empty()) {
+    return 194;
+  }
+  QVariantMap unverified = rfBandChannel(3, alternatives);
+  unverified.insert(QStringLiteral("verifiedCw"), false);
+  if (!cwassistant::desktop::channelCallsignCorroboration(
+           unverified, registry, kSpotNowNs).spots.empty()) {
+    return 195;
+  }
+
+  // The frequency that is used is the decoded one, to the hertz: the same
+  // stream placed 400 Hz away from the same report is no longer near it.
+  const QVariantMap offset = rfBandChannel(3, alternatives,
+                                           kDecodeRfHz + 400.0);
+  if (!cwassistant::desktop::channelCallsignCorroboration(
+           offset, registry, kSpotNowNs).spots.empty()) {
+    return 196;
+  }
+  const QVariantMap matched = rfBandChannel(3, alternatives, kDecodeRfHz);
+  if (cwassistant::desktop::channelCallsignCorroboration(
+          matched, registry, kSpotNowNs).spots.size() != 1U) {
+    return 197;
+  }
+  return 0;
+}
+
+// What a spot may never do, asserted at the layer that now passes them in.
+int testCorroborationCannotSupplyOrRenameACallsign() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  // Both the heard station and the spotted stranger are listed, so the
+  // directory cannot be what refuses the stranger.
+  if (!database.importText("SV2HQL\nDL1ABC\nSV2HQM\n").accepted) return 200;
+  const QVariantMap channel = rfBandChannel(
+      4, alternativesFrom({{QStringLiteral("SV2HQL AIPX"), 0.48},
+                           {QStringLiteral("SV2HQL AIPX"), 0.48}}));
+
+  // A station nobody heard, reported on the frequency being decoded. It is not
+  // a candidate, so it is not ranked, so it cannot be presented.
+  cwassistant::core::CwSpotRegistry stranger;
+  if (!stranger.add(spotOf("DL1ABC", cwassistant::core::CwSpotSource::Cluster,
+                           kDecodeRfHz, 5U),
+                    kSpotNowNs)) {
+    return 201;
+  }
+  cwassistant::desktop::DecoderChannelPresentationCache cache;
+  cache.setContext(QStringLiteral("IZ1ABC"), false);
+  const auto stranger_evidence =
+      cwassistant::desktop::channelCallsignCorroboration(channel, stranger,
+                                                         kSpotNowNs);
+  if (stranger_evidence.spots.size() != 1U) return 202;
+  const auto& unmoved = cache.derive(4, channel, database,
+                                     &stranger_evidence);
+  cache.endPublish();
+  if (unmoved.suggestion != QStringLiteral("SV2HQL") ||
+      unmoved.suggestion_raw_span != QStringLiteral("SV2?L?") ||
+      !reportsNoCorroboration(unmoved.suggestion_corroboration)) {
+    return 203;
+  }
+
+  // One character away from the station that was heard, reported on frequency.
+  // Matching is exact and never by edit distance: a spot that could match
+  // approximately could rename a decode, and a wrong callsign presented
+  // confidently is worse than an incomplete one.
+  cwassistant::core::CwSpotRegistry near_miss;
+  if (!near_miss.add(spotOf("SV2HQM", cwassistant::core::CwSpotSource::Cluster,
+                            kDecodeRfHz, 5U),
+                     kSpotNowNs)) {
+    return 204;
+  }
+  const auto near_miss_evidence =
+      cwassistant::desktop::channelCallsignCorroboration(channel, near_miss,
+                                                         kSpotNowNs);
+  const auto& unrenamed = cache.derive(4, channel, database,
+                                       &near_miss_evidence);
+  cache.endPublish();
+  if (unrenamed.suggestion != QStringLiteral("SV2HQL") ||
+      !reportsNoCorroboration(unrenamed.suggestion_corroboration)) {
+    return 205;
+  }
+
+  // A stream whose callsign is already confirmed is not reopened by a report
+  // agreeing with it, and a spot naming the operator's own callsign on the
+  // frequency being decoded does not raise the own-call alert: that alert is a
+  // statement about what was heard on this stream.
+  QVariantMap confirmed = channel;
+  confirmed.insert(QStringLiteral("callsign"), QStringLiteral("SV2HQL"));
+  cwassistant::core::CwSpotRegistry own_call;
+  if (!own_call.add(spotOf("IZ1ABC", cwassistant::core::CwSpotSource::Cluster,
+                           kDecodeRfHz, 5U),
+                    kSpotNowNs)) {
+    return 206;
+  }
+  const auto own_call_evidence =
+      cwassistant::desktop::channelCallsignCorroboration(confirmed, own_call,
+                                                         kSpotNowNs);
+  const auto& settled = cache.derive(5, confirmed, database,
+                                     &own_call_evidence);
+  cache.endPublish();
+  if (!settled.suggestion.isEmpty() ||
+      settled.suggestion_diagnostic !=
+          QStringLiteral("callsign-already-confirmed") ||
+      settled.calling_own_station ||
+      !reportsNoCorroboration(settled.suggestion_corroboration)) {
+    return 207;
+  }
+  // The spot was for a stream with a confirmed callsign, so nothing was
+  // searched for it either.
+  if (!own_call_evidence.spots.empty()) return 208;
+  return 0;
+}
+
+// Corroboration orders candidates the acoustics already admitted, and only
+// within the margin the external budget can cover.
+int testCorroborationDecidesOnlyAMarginTheAcousticsLeftOpen() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  // Two candidates heard equally often, 0.01 apart: the acoustics decline to
+  // choose, which is exactly the situation an outside report is allowed to
+  // settle.
+  const QVariantMap contested = rfBandChannel(
+      6, alternativesFrom({{QStringLiteral("SV2HQL AIPX"), 0.50},
+                           {QStringLiteral("SV2HQL AIPX"), 0.50},
+                           {QStringLiteral("SV2HQM AIPX"), 0.49},
+                           {QStringLiteral("SV2HQM AIPX"), 0.49}}));
+  QString diagnostic;
+  if (cwassistant::desktop::advisoryCallsignPresentation(
+          contested, database, &diagnostic, false) ||
+      diagnostic != QStringLiteral("ambiguous-acoustic-winner")) {
+    return 210;
+  }
+
+  cwassistant::core::CwSpotRegistry registry;
+  if (!registry.add(spotOf("SV2HQM",
+                           cwassistant::core::CwSpotSource::ReverseBeacon,
+                           kDecodeRfHz + 40.0, 10U),
+                    kSpotNowNs) ||
+      !registry.add(spotOf("SV2HQM", cwassistant::core::CwSpotSource::Cluster,
+                           kDecodeRfHz + 40.0, 10U),
+                    kSpotNowNs)) {
+    return 211;
+  }
+  const auto evidence = cwassistant::desktop::channelCallsignCorroboration(
+      contested, registry, kSpotNowNs);
+  const auto decided = cwassistant::desktop::advisoryCallsignPresentation(
+      contested, database, &diagnostic, false, &evidence);
+  if (!decided || decided->callsign != QStringLiteral("SV2HQM") ||
+      !decided->corroboration.corroborated ||
+      diagnostic != QStringLiteral("suggested-acoustic")) {
+    return 212;
+  }
+  // The margin it overturned is smaller than what it was allowed to spend.
+  const cwassistant::core::CallsignRankConfig limits;
+  if (decided->corroboration.applied_weight >
+      limits.maximum_total_provider_weight + 0.0001F) {
+    return 213;
+  }
+
+  // Acoustic agreement is not for sale. The same report cannot lift a
+  // candidate that fewer current alternatives agree on, however many receivers
+  // name it: corroboration is added to the score and never to the count of
+  // agreeing paths.
+  const QVariantMap outnumbered = rfBandChannel(
+      7, alternativesFrom({{QStringLiteral("SV2HQL AIPX"), 0.50},
+                           {QStringLiteral("SV2HQL AIPX"), 0.50},
+                           {QStringLiteral("SV2HQL AIPX"), 0.50},
+                           {QStringLiteral("SV2HQM AIPX"), 0.49},
+                           {QStringLiteral("SV2HQM AIPX"), 0.49}}));
+  const auto outnumbered_evidence =
+      cwassistant::desktop::channelCallsignCorroboration(outnumbered, registry,
+                                                         kSpotNowNs);
+  const auto held = cwassistant::desktop::advisoryCallsignPresentation(
+      outnumbered, database, &diagnostic, false, &outnumbered_evidence);
+  if (!held || held->callsign != QStringLiteral("SV2HQL") ||
+      held->agreeing_alternatives != 3 ||
+      !reportsNoCorroboration(held->corroboration)) {
+    return 214;
+  }
+  return 0;
+}
+
+// A corroborated stream refreshes on its own clock quantum, and corroboration
+// that has aged out stops being shown without waiting for the acoustics to
+// move.
+//
+// This is the other half of the freshness bargain. Keying on the matched spots
+// alone would leave a stale report standing for as long as nothing else about
+// the stream changed -- which on a station that has stopped transmitting is
+// indefinitely -- and keying on the publish clock would recompute twenty-three
+// times a second. The quantum bounds both.
+int testCorroborationRefreshesOnItsClockQuantum() {
+  cwassistant::core::OfflineCallsignDatabase database;
+  const QVariantMap channel = rfBandChannel(
+      8, alternativesFrom({{QStringLiteral("SV2HQL AIPX"), 0.48},
+                           {QStringLiteral("SV2HQL AIPX"), 0.48}}));
+  cwassistant::core::CwSpotRegistry registry;
+  if (!registry.add(spotOf("SV2HQL", cwassistant::core::CwSpotSource::Cluster,
+                           kDecodeRfHz, 10U),
+                    kSpotNowNs)) {
+    return 220;
+  }
+  const auto evidence_at = [&channel, &registry](const std::uint64_t now_ns) {
+    return cwassistant::desktop::channelCallsignCorroboration(channel, registry,
+                                                              now_ns);
+  };
+
+  cwassistant::desktop::DecoderChannelPresentationCache cache;
+  cache.setContext(QStringLiteral("IZ1ABC"), false);
+  const auto first = evidence_at(kSpotNowNs);
+  const auto& fresh = cache.derive(8, channel, database, &first);
+  cache.endPublish();
+  const float fresh_weight = fresh.suggestion_corroboration.applied_weight;
+  if (!fresh.suggestion_corroboration.corroborated || !(fresh_weight > 0.0F) ||
+      cache.computations() != 1U) {
+    return 221;
+  }
+
+  // Every publish inside the quantum returns the retained answer, whatever the
+  // publish clock says.
+  for (std::uint64_t offset_ns = 0;
+       offset_ns < cwassistant::desktop::kCallsignCorroborationClockQuantumNs;
+       offset_ns += cwassistant::desktop::
+                        kCallsignCorroborationClockQuantumNs / 8ULL) {
+    const auto repeated = evidence_at(kSpotNowNs + offset_ns);
+    static_cast<void>(cache.derive(8, channel, database, &repeated));
+    cache.endPublish();
+  }
+  if (cache.computations() != 1U) return 222;
+
+  // The quantum rolls over. Exactly one derivation, and the support has
+  // decayed with the observation's age rather than standing still.
+  const auto next = evidence_at(
+      kSpotNowNs + cwassistant::desktop::kCallsignCorroborationClockQuantumNs);
+  const auto& aged = cache.derive(8, channel, database, &next);
+  cache.endPublish();
+  if (!aged.suggestion_corroboration.corroborated ||
+      !(aged.suggestion_corroboration.applied_weight < fresh_weight) ||
+      cache.computations() != 2U) {
+    return 223;
+  }
+
+  // Past the ranker's spot window, with the report still inside the store's
+  // much longer retention. The suggestion is untouched and the corroboration
+  // is gone.
+  const auto expired = evidence_at(kSpotNowNs + 115ULL * kSecondNs);
+  if (expired.spots.size() != 1U) return 224;
+  const auto& lapsed = cache.derive(8, channel, database, &expired);
+  cache.endPublish();
+  if (lapsed.suggestion != QStringLiteral("SV2HQL") ||
+      !reportsNoCorroboration(lapsed.suggestion_corroboration) ||
+      cache.computations() != 3U) {
+    return 225;
+  }
+  return 0;
+}
 
 }  // namespace
 
@@ -1372,6 +1942,34 @@ int main(int argc, char* argv[]) {
     if (const int blocking_failure = testBlockingErrorsArePublishedWhole();
       blocking_failure != 0) {
     return blocking_failure;
+  }
+  if (const int no_spot_failure = testNoSpotEvidenceChangesNothing();
+      no_spot_failure != 0) {
+    return no_spot_failure;
+  }
+  if (const int spot_reach_failure = testSpotEvidenceReachesTheRanker();
+      spot_reach_failure != 0) {
+    return spot_reach_failure;
+  }
+  if (const int spot_frequency_failure =
+          testCorroborationNeedsTheDecodeFrequencyInRf();
+      spot_frequency_failure != 0) {
+    return spot_frequency_failure;
+  }
+  if (const int spot_authority_failure =
+          testCorroborationCannotSupplyOrRenameACallsign();
+      spot_authority_failure != 0) {
+    return spot_authority_failure;
+  }
+  if (const int spot_margin_failure =
+          testCorroborationDecidesOnlyAMarginTheAcousticsLeftOpen();
+      spot_margin_failure != 0) {
+    return spot_margin_failure;
+  }
+  if (const int spot_clock_failure =
+          testCorroborationRefreshesOnItsClockQuantum();
+      spot_clock_failure != 0) {
+    return spot_clock_failure;
   }
   cwassistant::desktop::ReplayController frequency_mapping;
   frequency_mapping.setSourceMode(0);

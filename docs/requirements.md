@@ -441,7 +441,11 @@ carries are a different mechanism and do not implement these modes.
 - Preserve the complete acquired passband for an operator overview while a
   separately tunable, anti-aliased and decimated 6–96 kHz window bounds carrier
   detection and per-stream decoding. Overview frame production must remain
-  bounded at multi-megasample input rates.
+  bounded at multi-megasample input rates. **Not met:** the implemented window
+  is bounded to 2–24 kHz. The ceiling follows from the selected-region monitor
+  being 48 kHz mono audio, which carries 24 kHz of bandwidth and no more, so
+  widening the window past 24 kHz requires either a higher monitor rate or a
+  decode window that the operator cannot listen to. Tracked as `SDR-006`.
 - Support zoom and pan as presentation-only viewport operations. Display zoom
   must not silently change acquisition bandwidth or decoder workload; the
   selected decoder window remains visibly identified.

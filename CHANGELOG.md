@@ -6,6 +6,49 @@ All notable changes to CW Buddy are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- What other receivers report hearing is now actually weighed when a callsign is
+  suggested, which it was not. The evidence path existed, was unit-tested, and
+  was unreachable: the one place that ranks a suggestion called the overload
+  without it, so cluster and reverse-beacon reports were drawn on the separator
+  bar and never consulted. What weighing means is deliberately narrow. A report
+  can only reorder callsigns the acoustics already produced, and only inside a
+  margin the acoustics left open -- how many of the current readings agree still
+  decides first, so a callsign fewer of them support is never lifted over one
+  more of them support, however many receivers report it. Matching is exact and
+  never by edit distance, because a near match would let a report rename a
+  decode. Its influence draws on the same capped allowance as the offline
+  callsign list, so no outside channel gains weight by arriving through a
+  different door. It needs a known absolute frequency, which means a directly
+  tuned receiver while capturing, or a sound card while capturing with a radio
+  reporting its dial; replaying a recording, or a sound card with no radio,
+  withholds corroboration rather than matching against a guess. The suggestion
+  is refreshed on a five-second clock rather than on every update, which is both
+  what keeps the presentation cache from being defeated by busy-band traffic and
+  what lets a report stop counting once it ages out. The evidence is published
+  for the operator interface but is not drawn on a decoder card yet.
+
+- The presentation path costs materially less with many signals decoding, which
+  is where the reported loss of fluidity actually was once the decoder side was
+  measured and found to be inside its budget. Three faults: the spectrum hover
+  hit test re-read a list-valued property on every iteration of its loop, so one
+  pointer sample converted up to sixty-four channel maps of forty-two keys each
+  -- about a hundred and twenty-five times a second from a trackpad, five times
+  the rate the decoder publishes at -- and it now scans a lean index rebuilt once
+  per publish, and only while the pointer is over the panel. Counting how often
+  the operator's own callsign appears ran a regular expression and a case fold
+  over four accumulated transcripts, per card, per character: 167.7 microseconds
+  on a 32,768-character transcript, now 2.5 when the callsign is absent, which is
+  the ordinary case because the alert exists to notice the first call. And the DX
+  spot layout ran a filter, two sorts and a quadratic collision pass inside a
+  binding, re-evaluating on every zoom and pan frame together with the conversion
+  of thousands of spot records and up to two hundred and forty text measurements;
+  it is now split so that only the part that depends on the view recomputes with
+  the view, 324 to 31 microseconds a frame. Each rewrite was accepted only after
+  an exhaustive differential against the original -- 372,196 cases for the
+  occurrence count, 24,000 layouts for the spot pass, both at zero mismatches.
+
 ### Fixed
 
 - A tracked signal no longer drifts in measured level the longer a direct-SDR

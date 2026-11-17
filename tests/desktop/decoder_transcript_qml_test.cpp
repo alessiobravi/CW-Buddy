@@ -616,5 +616,83 @@ int main() {
           ".value(storageKey(QStringLiteral(\"keying/directValidated\"))")) {
     return 20;
   }
+
+  // PERF-002, the presentation path. Each of these replaced work that was
+  // repeated per pointer sample or per rendered frame with the same work done
+  // once per change of its inputs, so each assertion names both the shape that
+  // shipped and the shape that must not come back.
+
+  // streamIdAtX() re-read replayController.decoderChannels on every iteration
+  // of its own loop, converting a list of up to 64 channel maps of 42 entries
+  // each -- transcripts and acoustic alternatives included -- once per channel
+  // examined, driven by hoveredStreamId on every pointer sample. The list is
+  // read once now, reduced to the two numbers the hit test uses, and only
+  // while the pointer is inside the panel, so a decoder publish costs the
+  // hover path nothing when nobody is pointing at the spectrum.
+  if (!contains(manual, "function buildStreamHoverIndex(channels)") ||
+      !contains(manual, "readonly property var streamHoverIndex:") ||
+      !contains(manual, "candidate.presentationFrequencyHz") ||
+      // The per-iteration property reads, in both of their forms.
+      contains(manual, "index < replayController.decoderChannels.length") ||
+      contains(manual, "replayController.decoderChannels[index]")) {
+    return 21;
+  }
+
+  // exactCallCount() ran a regular expression over the concatenation of four
+  // accumulated transcripts and built one string per token, per visible card,
+  // on every decoded character -- the shape mentionsCallsignToken() was fixed
+  // for on the C++ side. A whole-token match is an occurrence bounded by
+  // non-token characters, so the search is left to indexOf() and the boundary
+  // is tested. The case fold stays, because toUpperCase() maps characters
+  // outside ASCII into the token alphabet and an ASCII fold would not.
+  if (!contains(qml, "function isCallsignTokenCode(code)") ||
+      !contains(qml, "function exactCallCount(text, callsign)") ||
+      !contains(qml, "haystack.indexOf(wanted, from)") ||
+      !contains(qml, "String(text).toUpperCase()") ||
+      contains(qml, "match(/[A-Z0-9/]+/g)")) {
+    return 22;
+  }
+
+  // The DX spot layout ran entirely inside the placedSpots binding, so it
+  // re-converted the published spot list, re-normalised every callsign,
+  // re-formatted every frequency, re-measured every label against the font and
+  // re-sorted the lot on every zoom step and every frame of a pan. Only the
+  // span filter, the pixel positions and the collision pass are functions of
+  // the view; the rest is a function of the published list and is computed
+  // when that list changes.
+  const std::size_t claim_space_start =
+      qml.find("function claimLabelSpace(spot, taken, plotWidth)");
+  const std::size_t claim_space_end =
+      qml.find("function normaliseSpots(source)", claim_space_start);
+  if (!contains(qml, "function normaliseSpots(source)") ||
+      !contains(qml, "readonly property var normalisedSpots:") ||
+      !contains(qml, "? layoutSpots(normalisedSpots,") ||
+      !contains(qml, "function labelWidthOf(spot)") ||
+      !contains(qml, "labelWidth: labelWidthOf(spot)") ||
+      claim_space_start == std::string::npos ||
+      claim_space_end == std::string::npos ||
+      // The collision pass runs once per marker on every frame of a pan, so
+      // the font measurement must not be inside it. labelWidthOf() takes it
+      // once per spot instead, and keeps it on the record.
+      contains(qml.substr(claim_space_start,
+                          claim_space_end - claim_space_start),
+               "measuredLabelWidth") ||
+      // The whole layout driven straight off the published list.
+      contains(qml, "? layoutSpots(replayController.dxSpots,")) {
+    return 23;
+  }
+
+  // The gesture log is the only gesture record a session log can hold.
+  // --log-file installs a Qt message handler and writes what the application
+  // reports; nothing else in this tree reports anything, so removing these
+  // three lines as superseded by --log-file would leave an operator's log
+  // silent about the gesture it was added to diagnose. They are not a cost:
+  // all three sit on discrete button events, and onPositionChanged -- the
+  // handler that does run once per pointer sample -- carries none of them.
+  if (!contains(manual, "console.log(\"region-gesture press\"") ||
+      !contains(manual, "console.log(\"region-gesture release\"") ||
+      !contains(manual, "console.log(\"region-gesture repoint\"")) {
+    return 24;
+  }
   return 0;
 }

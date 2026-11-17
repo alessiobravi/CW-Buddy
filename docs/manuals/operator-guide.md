@@ -64,8 +64,11 @@ holds the spectrum and waterfall on one side and the open decoder cards on the
 other; the application opens maximized so both remain usable. Every tracked
 signal appears as a marker on the spectrum carrying its
 callsign once one is decoded; clicking a marker opens that stream as a decoder
-card, which is where the transcript, the callsign and its corroboration badge,
-the speed, the signal-to-noise ratio and the confidence are shown. The status
+card, which is where the transcript, the callsign and the badge saying whether
+the offline callsign list corroborates it, the speed, the signal-to-noise ratio
+and the confidence are shown. Corroboration from DX-cluster and reverse-beacon
+reports is weighed when ranking a suggested callsign, but it is not yet shown on
+the card; until it is, the badge is about the local list only. The status
 line reports the source and its sample rate, the running input-overrun count,
 and the configured frame and waterfall line rates. The linked radio's frequency
 is on the Radio Control faceplate rather than the status line, and debug-capture
@@ -470,6 +473,17 @@ of the session. Every line is flushed as it is written, because a log that
 loses its last buffer is silent about the one moment worth reading. It is
 off unless asked for: a log nobody requested is a file that grows on your
 machine forever.
+
+What that file will contain today is the spectrum region gestures and nothing
+else — for each one, the modifier keys that arrived, which of them counted as
+deliberate, the button, the source mode, and on release both pointer positions
+with the width and centre actually applied. The option is a destination rather
+than a source: it records what the application reports, and the region gestures
+are currently the only thing that reports anything. So a log from a session in
+which you did not touch the spectrum is expected to be empty, and that is not a
+sign the option failed. It exists because a gesture that misbehaves on one
+machine and nowhere else cannot be diagnosed by reasoning about it from
+somewhere else.
 
 One caution when reading a stall in the operating system's task manager: a
 total that looks modest can still mean one thread is saturated while the rest
