@@ -749,6 +749,14 @@ class CwChannelBank {
     std::uint16_t verification_pass_samples{0};
     std::uint16_t verification_fail_samples{0};
     std::uint16_t decoder_rejection_samples{0};
+    // Bumped every time `recoverRejectedDecoder` reacquires the timing
+    // decoder. The track keeps its id, colour and marker across that, so the
+    // presentation layer cannot see the reacquisition in any of the fields it
+    // normally watches -- but the transcript restarts, and whatever station
+    // name the decoded text had earned was earned by a decode that has just
+    // been thrown away. This counter is how the observation that owns the
+    // marker learns to freeze the one and give up the other.
+    std::uint32_t decoder_generation{0};
     bool ever_verified{false};
     // The strongest level this track has reached. The decode gate reads this
     // rather than the level of the moment, because a signal is weak while it
@@ -910,6 +918,13 @@ class CwChannelBank {
     // genuine predecessor is replaced, so composed UI text is never fed back
     // through callsign scoring or appended again on the next refresh.
     std::uint64_t source_track_id{0};
+    // Which decode of that source track owns the live suffix. A track that
+    // reacquires its timing decoder in place is the same track by every
+    // identity rule -- same id, same colour, same marker -- but a different
+    // decode, and treating it as the same one would append the new suffix to a
+    // transcript the new decoder never produced and leave the stream wearing
+    // a name the discarded decode had earned.
+    std::uint32_t source_generation{0};
     std::string inherited_text_prefix;
     // The station name this observation earned, latched for as long as one
     // source track owns the slot, together with the evidence that earned it

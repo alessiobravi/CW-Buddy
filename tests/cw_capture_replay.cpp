@@ -33,12 +33,25 @@ struct TextPoint {
   double frequency_hz{0.0};
 };
 
+// The refined transcript is retained on its own timeline rather than as a
+// fourth field of `TextPoint`. A track emits a refined append at sample
+// positions where the literal transcript, the provisional transcript and the
+// presentation frequency are all unchanged, so folding it into the literal
+// timeline would insert extra points there and silently move the latency and
+// revision figures that timeline already reports. Two timelines keep the
+// literal measurements bit-identical to what this tool has always printed.
+struct RefinedTextPoint {
+  std::uint64_t sample{0};
+  std::string text;
+};
+
 struct ObservedTrack {
   std::uint64_t id{0};
   double frequency_hz{0.0};
   std::uint64_t first_sample{0};
   std::uint64_t last_sample{0};
   std::vector<TextPoint> points;
+  std::vector<RefinedTextPoint> refined_points;
   std::vector<cwassistant::test::TimestampedPublication> publication_points;
   std::string published_callsign;
   bool published{false};
@@ -50,6 +63,31 @@ std::string textAt(const ObservedTrack& track, const std::uint64_t sample,
   for (const auto& point : track.points) {
     if (point.sample > sample) break;
     result = provisional ? point.provisional_text : point.text;
+  }
+  return result;
+}
+
+std::string refinedTextAt(const ObservedTrack& track,
+                          const std::uint64_t sample) {
+  std::string result;
+  for (const auto& point : track.refined_points) {
+    if (point.sample > sample) break;
+    result = point.text;
+  }
+  return result;
+}
+
+// Callsigns a transcript carries, by the same extraction the annotation
+// scorer already applies to the literal path: the QSO participants plus the
+// single best complete call. The trailing space terminates a token that the
+// recording ended in the middle of.
+std::vector<std::string> transcriptCallsigns(const std::string& text) {
+  std::vector<std::string> result =
+      cwassistant::core::CallsignPolicy::qso_participants_in_text(text + " ");
+  if (const auto call =
+          cwassistant::core::CallsignPolicy::best_complete_in_text(text + " ");
+      call) {
+    result.push_back(*call);
   }
   return result;
 }
@@ -132,8 +170,24 @@ void evaluateAnnotations(
   constexpr double kMaximumFrequencyDeltaHz = 120.0;
   ErrorRate total_cer;
   ErrorRate total_wer;
+  // The second published transcript, scored beside the first rather than
+  // instead of it. Nothing here changes what the decoder does or what the
+  // application publishes; the refined path has simply never been measured.
+  ErrorRate total_refined_cer;
+  ErrorRate total_refined_wer;
+  ErrorRate total_refined_deferred_cer;
   CallsignCounts total_callsigns;
   CallsignCounts total_transcript_callsigns;
+  CallsignCounts total_refined_transcript_callsigns;
+  std::size_t refined_better_events = 0;
+  std::size_t refined_worse_events = 0;
+  std::size_t refined_equal_events = 0;
+  std::size_t refined_deferred_better_events = 0;
+  std::size_t refined_deferred_worse_events = 0;
+  std::size_t refined_deferred_equal_events = 0;
+  std::size_t refined_prefix_breaks = 0;
+  double refined_lag_character_sum = 0.0;
+  std::size_t refined_lag_character_count = 0;
   std::size_t scored_events = 0;
   std::size_t missed_events = 0;
   std::size_t revisions = 0;
@@ -149,7 +203,20 @@ void evaluateAnnotations(
     reviewed_coverage.push_back({0U, total_samples});
   }
 
-  for (const auto& event : manifest.events) {
+  for (std::size_t event_index = 0; event_index < manifest.events.size();
+       ++event_index) {
+    const auto& event = manifest.events[event_index];
+    // The refined transcript is append-only and fixed-lag: a character it
+    // agrees on can be committed after the event that produced it has ended.
+    // A window closed on the event boundary therefore drops that credit
+    // entirely when the next event is far away. The deferred window runs to
+    // the next annotated event instead, so the pair of figures separates
+    // "refined decoded it wrong" from "refined decoded it late".
+    const std::uint64_t deferred_end_sample =
+        event_index + 1U < manifest.events.size()
+            ? std::max(event.end_sample,
+                       manifest.events[event_index + 1U].start_sample)
+            : std::max(event.end_sample, total_samples);
     const ObservedTrack* selected = nullptr;
     double best_delta = std::numeric_limits<double>::infinity();
     for (const auto& [id, track] : observations) {
@@ -167,9 +234,34 @@ void evaluateAnnotations(
         event.end_sample - event.start_sample) / manifest.sample_rate_hz;
     scored_seconds += event_seconds;
     std::string actual;
+    std::string refined_actual;
+    std::string refined_deferred_actual;
+    // How far behind the literal transcript the refined one stands when the
+    // event opens, in characters. Any window-based comparison of the two is
+    // only as meaningful as this number is small: a refined path that is a
+    // whole callsign behind is scored on the previous event's text.
+    std::ptrdiff_t refined_lag_characters = 0;
     if (selected == nullptr) {
       ++missed_events;
     } else {
+      const std::uint64_t before_sample =
+          event.start_sample == 0U ? 0U : event.start_sample - 1U;
+      const std::string refined_before =
+          refinedTextAt(*selected, before_sample);
+      const std::string refined_after =
+          refinedTextAt(*selected, event.end_sample - 1U);
+      if (!refined_before.empty() && !refined_after.starts_with(refined_before))
+        ++refined_prefix_breaks;
+      refined_actual = textDelta(refined_before, refined_after);
+      refined_deferred_actual = textDelta(
+          refined_before,
+          refinedTextAt(*selected, deferred_end_sample - 1U));
+      refined_lag_characters =
+          static_cast<std::ptrdiff_t>(
+              normalizedText(textAt(*selected, before_sample, false)).size()) -
+          static_cast<std::ptrdiff_t>(normalizedText(refined_before).size());
+      refined_lag_character_sum += static_cast<double>(refined_lag_characters);
+      ++refined_lag_character_count;
       const std::string before = textAt(
           *selected, event.start_sample == 0U ? 0U : event.start_sample - 1U,
           false);
@@ -214,12 +306,39 @@ void evaluateAnnotations(
     total_cer.references += cer.references;
     total_wer.edits += wer.edits;
     total_wer.references += wer.references;
-    std::vector<std::string> transcript_callsigns =
-        cwassistant::core::CallsignPolicy::qso_participants_in_text(actual + " ");
-    if (const auto call = cwassistant::core::CallsignPolicy::best_complete_in_text(
-            actual + " "); call) {
-      transcript_callsigns.push_back(*call);
+    const auto refined_cer =
+        characterErrorRate(event.normalized_text, refined_actual);
+    const auto refined_wer =
+        wordErrorRate(event.normalized_text, refined_actual);
+    const auto refined_deferred_cer =
+        characterErrorRate(event.normalized_text, refined_deferred_actual);
+    total_refined_cer.edits += refined_cer.edits;
+    total_refined_cer.references += refined_cer.references;
+    total_refined_wer.edits += refined_wer.edits;
+    total_refined_wer.references += refined_wer.references;
+    total_refined_deferred_cer.edits += refined_deferred_cer.edits;
+    total_refined_deferred_cer.references += refined_deferred_cer.references;
+    // Paired on edit counts rather than rates: both paths are scored against
+    // the same reference, so the reference count divides out and an integer
+    // comparison cannot be decided by a rounding difference.
+    if (refined_cer.edits < cer.edits) {
+      ++refined_better_events;
+    } else if (refined_cer.edits > cer.edits) {
+      ++refined_worse_events;
+    } else {
+      ++refined_equal_events;
     }
+    if (refined_deferred_cer.edits < cer.edits) {
+      ++refined_deferred_better_events;
+    } else if (refined_deferred_cer.edits > cer.edits) {
+      ++refined_deferred_worse_events;
+    } else {
+      ++refined_deferred_equal_events;
+    }
+    const std::vector<std::string> transcript_callsigns =
+        transcriptCallsigns(actual);
+    const std::vector<std::string> refined_transcript_callsigns =
+        transcriptCallsigns(refined_actual);
     const auto published_callsigns = selected == nullptr
         ? std::vector<std::string>{}
         : callsignsAtOrBefore(selected->publication_points,
@@ -236,6 +355,14 @@ void evaluateAnnotations(
         transcript_calls.false_positives;
     total_transcript_callsigns.false_negatives +=
         transcript_calls.false_negatives;
+    const auto refined_transcript_calls = callsignCounts(
+        event.callsigns, refined_transcript_callsigns);
+    total_refined_transcript_callsigns.true_positives +=
+        refined_transcript_calls.true_positives;
+    total_refined_transcript_callsigns.false_positives +=
+        refined_transcript_calls.false_positives;
+    total_refined_transcript_callsigns.false_negatives +=
+        refined_transcript_calls.false_negatives;
     std::cout << "annotation start_sample=" << event.start_sample
               << " end_sample=" << event.end_sample
               << " frequency_hz=" << event.frequency_hz
@@ -247,6 +374,16 @@ void evaluateAnnotations(
               << joinedCallsigns(published_callsigns)
               << "\" transcript_callsigns=\""
               << joinedCallsigns(transcript_callsigns) << '"'
+              << " refined_actual=\"" << normalizedText(refined_actual)
+              << "\" refined_cer=" << refined_cer.rate()
+              << " refined_wer=" << refined_wer.rate()
+              << " refined_transcript_callsigns=\""
+              << joinedCallsigns(refined_transcript_callsigns) << '"'
+              << " refined_lag_characters=" << refined_lag_characters
+              << " refined_deferred_end_sample=" << deferred_end_sample
+              << " refined_deferred_actual=\""
+              << normalizedText(refined_deferred_actual)
+              << "\" refined_deferred_cer=" << refined_deferred_cer.rate()
               << '\n';
   }
 
@@ -292,6 +429,104 @@ void evaluateAnnotations(
       if (!protected_by_event) ++unmatched_callsigns;
     }
   }
+
+  // A capture with no scored events -- the reviewed hard negative -- produces
+  // no per-event figures at all, so a refined transcript that invented text
+  // there would be invisible above. These counts are taken over every track
+  // the replay saw, published or not, and ask the one question that decides
+  // whether the refined path is safe to promote: does it put more characters,
+  // and more extractable callsigns, into a transcript than the literal path
+  // does, and are those callsigns ones the reviewer wrote down?
+  // A window closed on an event boundary scores the refined path for when it
+  // committed a character as much as for which character it committed, and
+  // the refined path is fixed-lag by construction. This count is free of both
+  // the window and the alignment: how many times each scored event's exact
+  // reference string occurs anywhere in a track's final transcript, against
+  // how many times the reviewer said it was sent.
+  std::vector<std::pair<std::string, std::size_t>> reference_counts;
+  for (const auto& event : manifest.events) {
+    if (event.uncertain) continue;
+    const std::string reference = normalizedText(event.normalized_text);
+    if (reference.empty()) continue;
+    const auto existing = std::find_if(
+        reference_counts.begin(), reference_counts.end(),
+        [&reference](const auto& entry) { return entry.first == reference; });
+    if (existing == reference_counts.end()) {
+      reference_counts.emplace_back(reference, 1U);
+    } else {
+      ++existing->second;
+    }
+  }
+  const auto occurrences = [](const std::string& haystack,
+                              const std::string& needle) {
+    std::size_t count = 0;
+    for (std::size_t at = haystack.find(needle); at != std::string::npos;
+         at = haystack.find(needle, at + needle.size())) {
+      ++count;
+    }
+    return count;
+  };
+  std::size_t expected_occurrences = 0;
+  std::size_t literal_occurrences = 0;
+  std::size_t refined_occurrences = 0;
+  for (const auto& [reference, required] : reference_counts) {
+    std::size_t literal_found = 0;
+    std::size_t refined_found = 0;
+    for (const auto& [id, track] : observations) {
+      static_cast<void>(id);
+      if (!track.points.empty()) {
+        literal_found += occurrences(
+            normalizedText(track.points.back().text), reference);
+      }
+      if (!track.refined_points.empty()) {
+        refined_found += occurrences(
+            normalizedText(track.refined_points.back().text), reference);
+      }
+    }
+    expected_occurrences += required;
+    literal_occurrences += literal_found;
+    refined_occurrences += refined_found;
+    std::cout << "annotation_reference text=\"" << reference
+              << "\" scored_events=" << required
+              << " track_text_occurrences=" << literal_found
+              << " refined_track_text_occurrences=" << refined_found << '\n';
+  }
+
+  std::size_t literal_characters = 0;
+  std::size_t refined_characters = 0;
+  std::unordered_set<std::string> literal_track_callsigns;
+  std::unordered_set<std::string> refined_track_callsigns;
+  std::size_t unmatched_literal_track_callsigns = 0;
+  std::size_t unmatched_refined_track_callsigns = 0;
+  const auto annotatedCallsign = [&manifest](const std::string& callsign) {
+    return std::any_of(manifest.events.cbegin(), manifest.events.cend(),
+                       [&callsign](const auto& event) {
+      return std::find(event.callsigns.cbegin(), event.callsigns.cend(),
+                       callsign) != event.callsigns.cend();
+    });
+  };
+  for (const auto& [id, track] : observations) {
+    static_cast<void>(id);
+    const std::string literal_final =
+        track.points.empty() ? std::string{} : track.points.back().text;
+    const std::string refined_final = track.refined_points.empty()
+        ? std::string{} : track.refined_points.back().text;
+    literal_characters += normalizedText(literal_final).size();
+    refined_characters += normalizedText(refined_final).size();
+    for (const auto& callsign : transcriptCallsigns(literal_final)) {
+      if (literal_track_callsigns.insert(normalizedText(callsign)).second &&
+          !annotatedCallsign(callsign)) {
+        ++unmatched_literal_track_callsigns;
+      }
+    }
+    for (const auto& callsign : transcriptCallsigns(refined_final)) {
+      if (refined_track_callsigns.insert(normalizedText(callsign)).second &&
+          !annotatedCallsign(callsign)) {
+        ++unmatched_refined_track_callsigns;
+      }
+    }
+  }
+
   const double reviewed_minutes =
       static_cast<double>(reviewedCoverageSamples(reviewed_coverage)) /
       manifest.sample_rate_hz / 60.0;
@@ -322,7 +557,49 @@ void evaluateAnnotations(
                 unmatched_publications / reviewed_minutes)
             << " unmatched_callsigns_per_minute="
             << (reviewed_minutes <= 0.0 ? 0.0 :
-                unmatched_callsigns / reviewed_minutes) << '\n';
+                unmatched_callsigns / reviewed_minutes)
+            // The edits and the reference count behind every pooled rate
+            // above and below, so several captures can be pooled correctly
+            // instead of having their per-capture rates averaged.
+            << " cer_edits=" << total_cer.edits
+            << " cer_references=" << total_cer.references
+            << " refined_cer=" << total_refined_cer.rate()
+            << " refined_wer=" << total_refined_wer.rate()
+            << " refined_cer_edits=" << total_refined_cer.edits
+            << " refined_cer_references=" << total_refined_cer.references
+            << " refined_transcript_callsign_precision="
+            << total_refined_transcript_callsigns.precision()
+            << " refined_transcript_callsign_recall="
+            << total_refined_transcript_callsigns.recall()
+            << " refined_better_events=" << refined_better_events
+            << " refined_worse_events=" << refined_worse_events
+            << " refined_equal_events=" << refined_equal_events
+            << " refined_prefix_breaks=" << refined_prefix_breaks
+            << " mean_refined_lag_characters="
+            << (refined_lag_character_count == 0U ? 0.0 :
+                refined_lag_character_sum / refined_lag_character_count)
+            << " refined_deferred_cer=" << total_refined_deferred_cer.rate()
+            << " refined_deferred_cer_edits="
+            << total_refined_deferred_cer.edits
+            << " refined_deferred_better_events="
+            << refined_deferred_better_events
+            << " refined_deferred_worse_events="
+            << refined_deferred_worse_events
+            << " refined_deferred_equal_events="
+            << refined_deferred_equal_events
+            << " track_text_characters=" << literal_characters
+            << " refined_track_text_characters=" << refined_characters
+            << " track_text_callsigns=" << literal_track_callsigns.size()
+            << " refined_track_text_callsigns="
+            << refined_track_callsigns.size()
+            << " unmatched_track_text_callsigns="
+            << unmatched_literal_track_callsigns
+            << " unmatched_refined_track_text_callsigns="
+            << unmatched_refined_track_callsigns
+            << " expected_event_occurrences=" << expected_occurrences
+            << " track_text_event_occurrences=" << literal_occurrences
+            << " refined_track_text_event_occurrences="
+            << refined_occurrences << '\n';
 }
 
 // Everything a replay accumulates about the decode, independent of which kind
@@ -363,6 +640,11 @@ void observeBlock(
       observed.points.push_back({current_sample, diagnostic.text,
                                  diagnostic.provisional_text,
                                  diagnostic.presentation_frequency_hz});
+    }
+    if (observed.refined_points.empty() ||
+        observed.refined_points.back().text != diagnostic.refined_text) {
+      observed.refined_points.push_back(
+          {current_sample, diagnostic.refined_text});
     }
   }
   state.maximum_tracks = std::max(state.maximum_tracks, diagnostics.size());

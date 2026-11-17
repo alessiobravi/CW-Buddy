@@ -842,7 +842,14 @@ void test_cw_channel_bank() {
                                   .verification_enter_seconds = 0.0,
                                   .verification_exit_seconds = 0.0});
       replacement_step(true);
-      replacement_now += 1'000'000'000;
+      // Long enough for the predecessor track itself to expire. A track that
+      // has been verified is held for the decoder-recovery window after it is
+      // demoted rather than for a candidate's fraction of a second, so a
+      // one-second silence no longer ends it and no replacement would be
+      // offered to inherit from. Four seconds is still well inside the ten
+      // second retained-observation lifetime this fixture configures, which
+      // is what the replacement has to find.
+      replacement_now += 4'000'000'000;
       replacement_bins.assign(replacement_bins.size(), -110.0F);
       static_cast<void>(replacement_bank.updateSpectrum(
           replacement_now, 0.0, 1'000.0, replacement_bins));
@@ -1436,6 +1443,19 @@ void test_established_cw_track_reserves_its_carrier_ridge() {
       .minimum_narrowband_coherence = 0.0F,
       .maximum_verification_unknown_fraction = 1.0F,
       .verification_enter_seconds = 0.0,
+      // The plausibility gate demotes on sustained failure like every other
+      // gate, so a fixture that wants the demotion to land at a known point
+      // has to say so. What this test is about is what happens to the ridge
+      // reservation across a demotion, not how long the demotion takes.
+      .verification_exit_seconds = 0.0,
+      // And this fixture wants the track to stay demoted while it checks what
+      // the reservation does. A demoted track that has been verified is now
+      // eligible for decoder recovery, which would reacquire the timing
+      // decoder part way through the implausible feed below and -- with this
+      // fixture's zero symbol requirement -- verify it again immediately, so
+      // the demotion it is examining would no longer be in effect by the time
+      // it looked. Recovery has its own tests.
+      .decoder_recovery_seconds = 1'000.0,
   });
   constexpr double sample_rate_hz = 8'000.0;
   constexpr double carrier_hz = 500.0;

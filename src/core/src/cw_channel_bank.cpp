@@ -1229,16 +1229,44 @@ const std::vector<CwChannelSnapshot>& CwChannelBank::updateSpectrum(
     if (timestamp_ns < last_activity_ns) return false;
     const double age_seconds =
         static_cast<double>(timestamp_ns - last_activity_ns) / 1'000'000'000.0;
+    const double candidate_retention =
+        !track.update.text.empty() ||
+                !track.update.provisional_text.empty() ||
+                track.verification_state == CwTrackState::MorseLikely
+            ? std::max(config_.unverified_track_retention_seconds,
+                       config_.empty_track_retention_seconds)
+            : config_.unverified_track_retention_seconds;
+    // A track that has been verified and has since been demoted is held for
+    // at least as long as the one path that can rescue it needs to act.
+    //
+    // The candidate retentions are for carriers the bank is not yet convinced
+    // are stations: they are short so a bounded bank is not filled with them.
+    // A demoted track is not one of those, and giving it a candidate's hold
+    // collapsed the advertised thirty seconds to two at the moment it was
+    // needed. `recoverRejectedDecoder` below needs `decoder_recovery_seconds`
+    // of sustained rejection before it may reacquire the timing decoder, so a
+    // shorter hold destroys the track before its own rescue can run and the
+    // whole path is unreachable. Measured across the capture corpus, that is
+    // what the operator sees: the demoted track died at the first word gap, a
+    // new track took the colour slot it was holding, and the same station came
+    // back renamed with its transcript frozen behind it.
+    //
+    // It is deliberately the recovery window and not the full decoded
+    // retention. A demoted track still occupies a frequency cell that a
+    // genuinely new station has to be able to take over, and holding one for
+    // thirty seconds measured worse on every coverage figure: the corpus lost
+    // 45 of 143 verified streams and 150 carrier-seconds of live copy, because
+    // dead tracks sat on carriers that new stations had arrived on. Three
+    // seconds is where the measured curve turns -- every spurious handover on
+    // the annotated carriers is gone, and carrier coverage is still better
+    // than before the change.
     const double retention =
-        unverified_manual ? config_.decoded_track_retention_seconds
-        : track.verification_state != CwTrackState::Verified
-            ? (!track.update.text.empty() ||
-                       !track.update.provisional_text.empty() ||
-                       track.verification_state == CwTrackState::MorseLikely
-                   ? std::max(config_.unverified_track_retention_seconds,
-                              config_.empty_track_retention_seconds)
-                   : config_.unverified_track_retention_seconds)
-            : config_.decoded_track_retention_seconds;
+        unverified_manual ||
+                track.verification_state == CwTrackState::Verified
+            ? config_.decoded_track_retention_seconds
+        : track.ever_verified
+            ? std::max(config_.decoder_recovery_seconds, candidate_retention)
+            : candidate_retention;
     return age_seconds > retention;
   };
   for (auto& track : tracks_) {
@@ -2344,6 +2372,13 @@ void CwChannelBank::updateKeyerResolution(
 void CwChannelBank::updateVerification(Track& track,
                                        const std::uint64_t timestamp_ns) {
   const bool was_verified = track.verification_state == CwTrackState::Verified;
+  const auto enter_samples = static_cast<std::uint16_t>(std::clamp(
+      std::lround(config_.verification_enter_seconds *
+                  config_.evidence_rate_hz),
+      1L, static_cast<long>(std::numeric_limits<std::uint16_t>::max())));
+  const auto exit_samples = static_cast<std::uint16_t>(std::clamp(
+      std::lround(config_.verification_exit_seconds * config_.evidence_rate_hz),
+      1L, static_cast<long>(std::numeric_limits<std::uint16_t>::max())));
   const std::size_t plausibility_window = std::max<std::size_t>(
       64,
       static_cast<std::size_t>(config_.minimum_plausibility_check_characters) *
@@ -2363,14 +2398,43 @@ void CwChannelBank::updateVerification(Track& track,
   // key-state occupancy from precisely the signal the operator is trying to
   // see -- measured, it removes the published channel outright -- and it would
   // protect nobody, because the text is withheld either way.
+  //
+  // The same argument settles how fast this gate may act on a track that has
+  // already verified, and it is the one every neighbouring gate already
+  // follows. A momentary run of E and T in the recent window is a statement
+  // about a few seconds of copy, not about whether the carrier is a station,
+  // and a verified track has independent evidence -- persistence, keyed edges,
+  // cadence, coherence -- that this measure cannot contradict in one frame.
+  // Acting instantly made this the only gate that bypassed
+  // `verification_exit_seconds`, and measured across the capture corpus it
+  // became the single largest cause of a published stream disappearing: 67 of
+  // 114 demotions, 59%, 4.5 times the next cause, and the demoted track then
+  // died at the first word gap because retention collapses once a track is no
+  // longer verified. What the operator saw was a coloured marker row freezing
+  // and a different track taking it over, losing the station name with it.
+  //
+  // So the demotion is kept and delayed. A verified track holds its state, its
+  // marker, its frequency and its key-state occupancy while the implausible
+  // reading is sustained, and reports `ImplausibleCharacterDistribution` as
+  // its reason, which withholds its text and its station name downstream
+  // exactly as an unresolved keyer overlap does. Only sustained failure
+  // demotes, which is what every other gate below already requires. A track
+  // that has never verified is still refused immediately: that is the
+  // population the gate was calibrated against, where noise would otherwise be
+  // verified into a transcript of E and T, and nothing here relaxes it.
   if (!track.keyer_overlap_unresolved &&
       isCharacterDistributionImplausible(
           recent_text, config_.minimum_plausibility_check_characters,
           config_.maximum_simple_character_fraction)) {
-    track.verification_state = CwTrackState::Candidate;
+    track.verification_pass_samples = 0;
     track.verification_reason =
         CwVerificationReason::ImplausibleCharacterDistribution;
-    track.verification_pass_samples = 0;
+    if (was_verified) {
+      if (track.verification_fail_samples < exit_samples)
+        ++track.verification_fail_samples;
+      if (track.verification_fail_samples < exit_samples) return;
+    }
+    track.verification_state = CwTrackState::Candidate;
     track.verification_fail_samples = 0;
     return;
   }
@@ -2501,14 +2565,6 @@ void CwChannelBank::updateVerification(Track& track,
                ? CwVerificationReason::UnresolvedKeyerOverlap
                : CwVerificationReason::Verified;
   };
-
-  const auto enter_samples = static_cast<std::uint16_t>(std::clamp(
-      std::lround(config_.verification_enter_seconds *
-                  config_.evidence_rate_hz),
-      1L, static_cast<long>(std::numeric_limits<std::uint16_t>::max())));
-  const auto exit_samples = static_cast<std::uint16_t>(std::clamp(
-      std::lround(config_.verification_exit_seconds * config_.evidence_rate_hz),
-      1L, static_cast<long>(std::numeric_limits<std::uint16_t>::max())));
 
   if (!passes) {
     track.verification_pass_samples = 0;
@@ -2826,8 +2882,23 @@ void CwChannelBank::assignOrRefreshColor(
 }
 
 void CwChannelBank::recoverRejectedDecoder(Track& track) {
+  // Recovery used to exclude any track that had ever verified, which excluded
+  // exactly the population this path is for. A track whose timing hypothesis
+  // has been poisoned is not easier to rescue for having once decoded well,
+  // and on the capture corpus the restriction made the whole path unreachable:
+  // it fired zero times across all twenty-two recordings. Lifting it fires it
+  // thirteen times, and those are the carriers where a station was transmitting
+  // into a decoder that could no longer read it.
+  //
+  // What it costs is the presentation identity of the station that was there
+  // before, and that is settled the same way a replacement settles it: the
+  // transcript so far is frozen as a prefix rather than discarded, so the
+  // operator's session is continuous, and the station name is given up,
+  // because the transmission this reacquisition exists to admit may well be a
+  // different station and must establish its own identity from its own
+  // acoustic suffix. The track id, the colour and the marker survive, so
+  // nothing the operator is watching moves.
   const bool quality_rejection =
-      !track.ever_verified &&
       track.verification_state != CwTrackState::Verified &&
       track.verification_reason ==
           CwVerificationReason::ImplausibleCharacterDistribution &&
@@ -2848,10 +2919,11 @@ void CwChannelBank::recoverRejectedDecoder(Track& track) {
   // The carrier/noise filters remain valid; only timing/text state is
   // reacquired. This lets a real transmission take over a frequency that was
   // previously occupied by a persistent noise-derived timing hypothesis.
-  // No verified text is rewritten because recovery is restricted to tracks
-  // that have never reached verification.
+  // Bumping the generation tells the presentation layer that the live suffix
+  // restarts here, so it freezes what came before instead of losing it.
   track.decoder.reset();
   track.update = {};
+  ++track.decoder_generation;
   track.decoder_rejection_samples = 0;
   track.verification_pass_samples = 0;
   track.verification_fail_samples = 0;
@@ -3052,17 +3124,33 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
     // survives untouched, and only the text and the station name it would have
     // carried are held back.
     const bool withhold_text = track.keyer_overlap_unresolved;
+    // A verified track whose recent text has turned implausible is the same
+    // question asked of the station's name rather than of its carrier. The
+    // channel keeps its marker and its transcript while the lifecycle decides
+    // whether the reading is a transient, because taking either away and
+    // giving it back seconds later is worse than leaving both alone -- but a
+    // window of copy that reads as timing noise is not evidence about who is
+    // transmitting, so it contributes no name reading. The name already
+    // earned stands; an empty reading leaves it exactly as it was. Measured
+    // on the capture corpus: without this, three recordings that named nobody
+    // began asserting a callsign out of the degraded window. Only the grace
+    // window of the plausibility gate can leave a verified track reporting
+    // this reason, so the test is exact.
+    const bool withhold_name =
+        withhold_text ||
+        track.verification_reason ==
+            CwVerificationReason::ImplausibleCharacterDistribution;
     std::string callsign;
     // Reconcile the independent literal and append-only refined paths. Shared
     // evidence settles disagreement; refinement remains usable when the
     // literal path's timing gate fails, but degluing a prosign cannot create a
     // stream label without an exact refined token.
     const std::string_view primary_for_callsign =
-        !withhold_text && track.update.timing_quality >=
+        !withhold_name && track.update.timing_quality >=
                               config_.minimum_verification_timing_quality
             ? std::string_view(track.update.text)
             : std::string_view{};
-    callsign = withhold_text
+    callsign = withhold_name
                    ? std::string{}
                    : CallsignPolicy::best_complete_in_parallel_texts(
                          primary_for_callsign, track.update.refined_text,
@@ -3155,7 +3243,7 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
             withhold_text ? std::string{} : track.update.contextual_text,
         .callsign = callsign,
         .qso_participants =
-            withhold_text
+            withhold_name
                 ? std::vector<std::string>{}
                 : allocatedParticipants(
                       CallsignPolicy::qso_participants_in_text(
@@ -3206,6 +3294,7 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
         retained = std::prev(retained_observations_.end());
       }
       retained->source_track_id = track.id;
+      retained->source_generation = track.decoder_generation;
       retained->inherited_text_prefix.clear();
       retained->label = {};
       retained->confirmed_qso_participants.clear();
@@ -3217,6 +3306,7 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
       retained->inherited_text_prefix = retained->snapshot.text;
       trimPresentationText(retained->inherited_text_prefix);
       retained->source_track_id = track.id;
+      retained->source_generation = track.decoder_generation;
       // A color/frequency lease preserves visual session continuity, not
       // acoustic station identity. The replacement decoder must establish a
       // callsign from its own suffix; otherwise a different station appearing
@@ -3224,6 +3314,23 @@ void CwChannelBank::rebuildSnapshots(const std::uint64_t timestamp_ns) {
       // The corroboration behind the old name goes with it: a successor must
       // not have to out-argue evidence that was never about it.
       retained->label = {};
+    } else if (retained->source_generation != track.decoder_generation) {
+      // The same track reacquired its timing decoder in place. Nothing the
+      // operator watches has moved -- same id, same colour, same marker, same
+      // frequency -- but the live suffix restarts from nothing, so this is a
+      // replacement of the decode rather than of the stream. It is given
+      // exactly the replacement's terms: the transcript so far is frozen as a
+      // prefix so the session stays continuous, and the station name and its
+      // corroboration are given up, because the transmission the reacquisition
+      // exists to admit may be a different station and must say who it is
+      // itself. Keeping the name here would be the one way an in-place
+      // recovery could put a predecessor's callsign on a successor, which is
+      // precisely what the replacement rule above exists to prevent.
+      retained->inherited_text_prefix = retained->snapshot.text;
+      trimPresentationText(retained->inherited_text_prefix);
+      retained->source_generation = track.decoder_generation;
+      retained->label = {};
+      retained->confirmed_qso_participants.clear();
     }
     // Hysteresis, not a fresh verdict every frame. The reading above is
     // recomputed from whatever text the window holds at this instant, so on

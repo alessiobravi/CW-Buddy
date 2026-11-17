@@ -31,6 +31,20 @@ add_test(NAME cwa_transmit_scheduler_tests COMMAND cwa_transmit_scheduler_tests)
 # deliberate one-LSB asymmetry between what WavWriter emits at full scale and
 # what WavReplaySource decodes, so that the next reader to notice it finds the
 # reasoning rather than repeating the attempt to "correct" it.
+# The plausibility gate's exit hysteresis, and what a demoted stream keeps.
+# Measured on the capture corpus, this one gate caused 59% of all demotions of
+# verified streams and was the only gate that demoted on a single frame rather
+# than on sustained failure, which is how an operator came to spend a quarter
+# of the time looking at a frozen marker on a carrier that was still keying.
+# The cases that must keep passing are as important as the ones that change:
+# sustained implausible copy still demotes, a carrier that never verified is
+# still refused on the first frame, and a demoted stream still names nobody.
+add_executable(cwa_verification_hysteresis_tests
+  cw_verification_hysteresis_tests.cpp)
+target_link_libraries(cwa_verification_hysteresis_tests PRIVATE cwa_core)
+add_test(NAME cwa_verification_hysteresis_tests
+  COMMAND cwa_verification_hysteresis_tests)
+
 # The robust keying-level anchor, which nothing tested directly before: that it
 # engages on a clean keyed carrier across the speed range, that band noise
 # publishes no channel and asserts no callsign, and that its enable flag is
